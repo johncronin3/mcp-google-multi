@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import type { ToolRegistry } from '../registry.js';
 import { ACCOUNTS, ACCOUNT_CONFIG } from '../accounts.js';
 import { getAdminAccounts, resolveScopesForAccount } from '../auth.js';
+import { allowedAccounts, isGrantEnforced } from '../session-grant.js';
 import { hasToken, readToken } from '../token-store.js';
 
 export interface AccountHealthDeps {
@@ -96,13 +97,34 @@ export function registerAccountTools(registry: ToolRegistry, deps: AccountHealth
         'Use this to see which account aliases are available and healthy.',
       inputSchema: {},
     },
-    async () => ({
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify({ accounts: ACCOUNTS.map((alias) => deriveAccountHealth(alias, deps)) }),
-        },
-      ],
-    }),
+    async () => {
+      try {
+        const aliases = isGrantEnforced() ? allowedAccounts() : [...ACCOUNTS];
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                accounts: aliases.map((alias) => deriveAccountHealth(alias, deps)),
+                grant_filtered: isGrantEnforced(),
+              }),
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                error: 'grant_required',
+                message: e instanceof Error ? e.message : String(e),
+              }),
+            },
+          ],
+          isError: true as const,
+        };
+      }
+    },
   );
 }

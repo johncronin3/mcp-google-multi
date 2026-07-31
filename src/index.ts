@@ -12,6 +12,7 @@ import { ToolRegistry } from './registry.js';
 import { registerDiscoverTools } from './discover.js';
 import { registerEscapeTools } from './tools/google-api.js';
 import { registerAccountTools } from './tools/accounts-tool.js';
+import { registerGrantTools } from './tools/grant-tools.js';
 import { getToolsets, toolsetEnabled } from './toolsets.js';
 import { resolvePolicy, isAllowed, describePolicy, type Policy } from './write-control.js';
 
@@ -63,6 +64,7 @@ function buildRegistry(server: McpServer, policy: Policy): ToolRegistry {
   registerDiscoverTools(registry, policy);
   registerEscapeTools(registry, policy);
   registerAccountTools(registry);
+  registerGrantTools(registry);
   return registry;
 }
 

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "grants": [
+    {
+      "name": "Personal Brain Grant 3",
+      "code": "REPLACE_WITH_HOST_LOCAL_CODE",
+      "accounts": ["personal", "stromback", "opcenter", "buildcoin"]
+    },
+    {
+      "name": "StrombackBrain2",
+      "code": "REPLACE_WITH_HOST_LOCAL_CODE",
+      "accounts": ["stromback"]
+    }
+  ]
+}

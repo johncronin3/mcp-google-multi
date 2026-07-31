@@ -3,3 +3,5 @@ process.env.GOOGLE_ACCOUNTS ||= 'test:test@example.com';
 // ToolRegistry reads GOOGLE_TRIM at construction — pin it so an ambient
 // GOOGLE_TRIM=off in a developer shell can't redden the compaction tests.
 process.env.GOOGLE_TRIM = '';
+// Do not pick up a developer host grants.json during unit tests.
+process.env.GOOGLE_GRANTS_ENFORCE ||= 'false';

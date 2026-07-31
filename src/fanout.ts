@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ACCOUNTS } from './accounts.js';
+import { allowedAccounts, isGrantEnforced } from './session-grant.js';
 
 export const CSV_RE = /^[a-zA-Z0-9_-]+(\s*,\s*[a-zA-Z0-9_-]+)+$/;
 
@@ -14,35 +15,97 @@ export function fanoutAccountField(description: string): z.ZodType {
 
 export type AccountSelector =
   | { ok: true; fanout: boolean; aliases: string[] }
-  | { ok: false; invalid: string[] };
+  | { ok: false; invalid: string[]; reason?: 'no_grant' | 'unknown' };
 
-export function parseAccountSelector(value: string, accounts: readonly string[] = ACCOUNTS): AccountSelector {
-  if (value === '*') return { ok: true, fanout: true, aliases: [...accounts] };
-  if (!value.includes(',')) return { ok: true, fanout: false, aliases: [value] };
+/** Resolve the account universe for this call (grant-scoped when enforced). */
+export function selectableAccounts(): string[] | { error: string } {
+  try {
+    return allowedAccounts();
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export function parseAccountSelector(
+  value: string,
+  accounts: readonly string[] = ACCOUNTS,
+): AccountSelector {
+  // When grants enforce, ignore caller-supplied universe and use session allowlist.
+  let universe: readonly string[] = accounts;
+  if (isGrantEnforced()) {
+    const sel = selectableAccounts();
+    if (!Array.isArray(sel)) {
+      return { ok: false, invalid: [], reason: 'no_grant' };
+    }
+    universe = sel;
+  }
+
+  if (value === '*') return { ok: true, fanout: true, aliases: [...universe] };
+  if (!value.includes(',')) {
+    if (!universe.includes(value)) {
+      // Distinguish unknown configured alias vs out of grant
+      if (ACCOUNTS.includes(value) && isGrantEnforced()) {
+        return { ok: false, invalid: [value], reason: 'unknown' };
+      }
+      return { ok: false, invalid: [value], reason: 'unknown' };
+    }
+    return { ok: true, fanout: false, aliases: [value] };
+  }
   const seen = new Set<string>();
   const aliases: string[] = [];
   const invalid: string[] = [];
   for (const token of value.split(',').map((t) => t.trim()).filter(Boolean)) {
-    if (!accounts.includes(token)) {
+    if (!universe.includes(token)) {
       invalid.push(token);
     } else if (!seen.has(token)) {
       seen.add(token);
       aliases.push(token);
     }
   }
-  if (invalid.length > 0) return { ok: false, invalid };
+  if (invalid.length > 0) return { ok: false, invalid, reason: 'unknown' };
   return { ok: true, fanout: aliases.length > 1, aliases };
 }
 
-export function invalidAccountsResult(invalid: string[], accounts: readonly string[] = ACCOUNTS) {
+export function invalidAccountsResult(
+  invalid: string[],
+  accounts: readonly string[] = ACCOUNTS,
+  reason?: 'no_grant' | 'unknown',
+) {
+  if (reason === 'no_grant' || (invalid.length === 0 && isGrantEnforced())) {
+    try {
+      allowedAccounts();
+    } catch (e) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              error: 'grant_required',
+              message: e instanceof Error ? e.message : String(e),
+              retriable: false,
+            }),
+          },
+        ],
+        isError: true as const,
+      };
+    }
+  }
+  let universe = accounts;
+  if (isGrantEnforced()) {
+    try {
+      universe = allowedAccounts();
+    } catch {
+      /* fall through */
+    }
+  }
   return {
     content: [
       {
         type: 'text' as const,
         text: JSON.stringify({
           error: 'validation_error',
-          message: `Unknown account alias(es): ${invalid.join(', ')}.`,
-          hint: `Valid aliases: ${accounts.join(', ')}; or "*" for all accounts.`,
+          message: `Unknown or out-of-grant account alias(es): ${invalid.join(', ')}.`,
+          hint: `Allowed aliases for this session: ${universe.join(', ')}; or "*" for all granted accounts.`,
           retriable: false,
         }),
       },

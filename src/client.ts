@@ -1,9 +1,11 @@
 import { OAuth2Client } from 'googleapis-common';
 import { ACCOUNT_CONFIG } from './accounts.js';
 import type { Account } from './accounts.js';
+import { assertAccountAllowed } from './session-grant.js';
 import { readToken, updateToken } from './token-store.js';
 
 export async function getClient(account: Account) {
+  assertAccountAllowed(account);
   const config = ACCOUNT_CONFIG[account];
 
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {

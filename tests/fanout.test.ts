@@ -40,7 +40,11 @@ describe('parseAccountSelector', () => {
   });
 
   it('rejects unknown aliases with the bad tokens listed', () => {
-    expect(parseAccountSelector('alpha,bogus,nope', ACCOUNTS)).toEqual({ ok: false, invalid: ['bogus', 'nope'] });
+    expect(parseAccountSelector('alpha,bogus,nope', ACCOUNTS)).toEqual({
+      ok: false,
+      invalid: ['bogus', 'nope'],
+      reason: 'unknown',
+    });
   });
 });
 

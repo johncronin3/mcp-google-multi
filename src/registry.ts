@@ -96,7 +96,7 @@ export class ToolRegistry {
         baseHandler = async (...args: unknown[]) => {
           const first = args[0] as { account?: string } | undefined;
           const parsed = parseAccountSelector(typeof first?.account === 'string' ? first.account : '');
-          if (!parsed.ok) return invalidAccountsResult(parsed.invalid);
+          if (!parsed.ok) return invalidAccountsResult(parsed.invalid, undefined, parsed.reason);
           if (!parsed.fanout) return handler({ ...first, account: parsed.aliases[0] }, ...args.slice(1));
           return runFanout(handler, args, parsed.aliases);
         };
