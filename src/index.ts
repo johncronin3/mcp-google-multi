@@ -104,8 +104,16 @@ async function main() {
       disabledLine = `${disabled.length} write tools (${summary}) — enable via GOOGLE_PROFILE / GOOGLE_WRITE_ALLOW`;
     }
     console.log(`Disabled: ${disabledLine}`);
+    const bootRevealed = registry.revealAtBootFromEnv();
+    const afterBoot = registry.visibleCount();
     console.log(`Services: ${registry.services().join(', ')}`);
     console.log(`Tool surface: ${counts.eager} eager (discover + escape hatch), ${counts.hidden} deferred until discovery`);
+    if (bootRevealed.length > 0) {
+      console.log(
+        `GOOGLE_REVEAL_AT_BOOT: ${bootRevealed.join(', ')} → listable now ` +
+          `(${afterBoot.revealed} operational visible, ${afterBoot.hidden} still deferred)`,
+      );
+    }
     console.log(`Escape hatch: google_api_call CUD verdicts follow profile=${policy.profile} and your allow/deny globs`);
     return;
   }
@@ -116,6 +124,13 @@ async function main() {
     version: pkg.version,
   });
   const registry = buildRegistry(server, policy);
+  // Pre-reveal before installListHandler so the first tools/list includes these
+  // services (Claude Desktop/Cowork cannot select tools that only appear after
+  // discover + tools/list_changed).
+  const bootRevealed = registry.revealAtBootFromEnv();
+  if (bootRevealed.length > 0) {
+    process.stderr.write(`GOOGLE_REVEAL_AT_BOOT: listing ${bootRevealed.join(', ')}\n`);
+  }
   registry.installListHandler();
 
   const transport = new StdioServerTransport();

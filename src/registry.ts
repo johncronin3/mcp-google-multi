@@ -152,11 +152,42 @@ export class ToolRegistry {
       }));
   }
 
-  reveal(service: string): boolean {
+  /**
+   * Mark a service's operational tools as listable.
+   * @param notify when true (default), emit tools/list_changed for clients that
+   *   re-fetch after discover. Pass false at boot so the first tools/list already
+   *   includes the service (needed for Claude Desktop/Cowork, which does not treat
+   *   list_changed + progressive reveal as selectable deferred tools).
+   */
+  reveal(service: string, opts?: { notify?: boolean }): boolean {
     if (this.revealed.has(service)) return false;
     this.revealed.add(service);
-    this.server.sendToolListChanged();
+    if (opts?.notify !== false) this.server.sendToolListChanged();
     return true;
+  }
+
+  /**
+   * Pre-reveal services from GOOGLE_REVEAL_AT_BOOT (CSV of service names, or
+   * `all`/`*`). Used so clients that cannot select deferred tools still see
+   * high-value surfaces (especially `drive`) on the initial tools/list.
+   */
+  revealAtBootFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+    const raw = (env.GOOGLE_REVEAL_AT_BOOT || '').trim();
+    if (!raw) return [];
+    const known = new Set(this.services());
+    const wanted =
+      raw === '*' || raw.toLowerCase() === 'all'
+        ? [...known]
+        : raw.split(',').map((s) => s.trim()).filter(Boolean);
+    const revealed: string[] = [];
+    for (const service of wanted) {
+      if (!known.has(service)) {
+        process.stderr.write(`GOOGLE_REVEAL_AT_BOOT: unknown service "${service}" ignored\n`);
+        continue;
+      }
+      if (this.reveal(service, { notify: false })) revealed.push(service);
+    }
+    return revealed;
   }
 
   isVisible(tool: ToolEntry): boolean {

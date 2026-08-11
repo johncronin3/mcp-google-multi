@@ -15,6 +15,7 @@ Everything is configured through environment variables (a `.env` in the working 
 | `GOOGLE_OPTIONAL_SCOPES` | — | opt-in scope bundles, CSV — see [bundles](#optional-scope-bundles) |
 | `GOOGLE_ADMIN_ACCOUNTS` | — | aliases granted Workspace-admin scopes (the account's own super-admin OAuth) |
 | `GOOGLE_TOOLSETS` | — | `all` (default) or a CSV filter of service names — see [services](#services) |
+| `GOOGLE_REVEAL_AT_BOOT` | — | CSV of service names (or `all`/`*`) to list on the **first** `tools/list` without calling `{service}_discover`. Use for clients (notably Claude Desktop/Cowork) that cannot select deferred tools after `tools/list_changed`. Example: `drive` so `drive_upload` is callable for deck posts. |
 | `TOKEN_STORE_PATH` | — | override the encrypted token dir (default: `$XDG_CONFIG_HOME/mcp-google-multi/tokens`, falling back to `~/.config/mcp-google-multi/tokens`) |
 | `DISCOVERY_CACHE_PATH` | — | override the Discovery-doc cache dir (default: `$XDG_CONFIG_HOME/mcp-google-multi/discovery`, falling back to `~/.config/mcp-google-multi/discovery`) |
 | `GOOGLE_TRIM` | — | `off` (or `0`/`false`/`no`) disables compact JSON serialization of tool responses |

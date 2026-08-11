@@ -169,6 +169,30 @@ describe('ToolRegistry', () => {
     expect(server.sendToolListChanged).toHaveBeenCalledTimes(1);
   });
 
+  it('reveal({ notify: false }) flips visibility without tools/list_changed', () => {
+    const { server } = fakeServer();
+    const reg = new ToolRegistry(server as never, FULL_WRITES);
+    reg.registerTool('drive_search', { description: 'x' }, () => {});
+    expect(reg.reveal('drive', { notify: false })).toBe(true);
+    expect(reg.isVisible(reg.tools[0])).toBe(true);
+    expect(server.sendToolListChanged).not.toHaveBeenCalled();
+  });
+
+  it('revealAtBootFromEnv pre-lists CSV services without notify', async () => {
+    const { server, getListHandler } = fakeServer();
+    const reg = new ToolRegistry(server as never, FULL_WRITES);
+    reg.registerTool('drive_upload', { description: 'Upload', inputSchema: { account: z.string() } }, () => {});
+    reg.registerTool('gmail_search', { description: 'Search mail', inputSchema: { account: z.string() } }, () => {});
+    reg.registerMeta('drive_discover', { description: 'meta', inputSchema: {} }, () => {});
+    expect(reg.revealAtBootFromEnv({ GOOGLE_REVEAL_AT_BOOT: 'drive' })).toEqual(['drive']);
+    reg.installListHandler();
+    const listed = (await getListHandler()!()).tools.map((t) => (t as { name: string }).name);
+    expect(listed).toContain('drive_upload');
+    expect(listed).toContain('drive_discover');
+    expect(listed).not.toContain('gmail_search');
+    expect(server.sendToolListChanged).not.toHaveBeenCalled();
+  });
+
   it('list handler exposes meta tools at boot, operational tools after reveal', async () => {
     const { server, getListHandler } = fakeServer();
     const reg = new ToolRegistry(server as never, FULL_WRITES);
