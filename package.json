@@ -54,6 +54,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "vitest run",
+    "test:http": "vitest run tests/http-mcp.test.ts",
+    "start:http": "node dist/http.js",
     "test:watch": "vitest",
     "gen:discovery": "tsx scripts/fetch-discovery.ts",
     "gen:tools": "tsx scripts/gen-tools.ts",

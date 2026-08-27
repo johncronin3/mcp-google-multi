@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+tokens
+.env
+*.enc
+grants.json
+coverage
+tests
+docs
+scripts
+*.md
+!docker/entrypoint.sh

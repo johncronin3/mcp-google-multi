@@ -118,6 +118,13 @@ async function main() {
     return;
   }
 
+  const server = buildGoogleMcpServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+/** MCP server with the same tools as stdio. Does not bind a transport. */
+export function buildGoogleMcpServer(): McpServer {
   const policy = resolvePolicy();
   const server = new McpServer({
     name: 'mcp-google-multi',
@@ -132,12 +139,16 @@ async function main() {
     process.stderr.write(`GOOGLE_REVEAL_AT_BOOT: listing ${bootRevealed.join(', ')}\n`);
   }
   registry.installListHandler();
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal error: ${err.message}\n`);
-  process.exit(1);
-});
+const startedAsCli =
+  typeof process.argv[1] === 'string' &&
+  (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('index.ts'));
+
+if (startedAsCli) {
+  main().catch((err) => {
+    process.stderr.write(`Fatal error: ${err.message}\n`);
+    process.exit(1);
+  });
+}
