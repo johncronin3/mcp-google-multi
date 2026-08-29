@@ -4,6 +4,7 @@ import { URL } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import open from 'open';
 import { ACCOUNTS, ACCOUNT_CONFIG } from './accounts.js';
+import { deskMintMessage, isHostedHttp } from './hosted.js';
 import { writeToken } from './token-store.js';
 
 // Personal (non-Workspace) accounts 403 on admin scopes; ADMIN_SCOPES stays per-account opt-in, never granted by default.
@@ -119,6 +120,14 @@ export function resolveScopesForAccount(alias: string): string[] {
 
 
 export async function runAuthFlow(args: string[]): Promise<void> {
+  // Layer 1 only: singular Google OAuth per alias, desk-local.
+  // Hosted MCP never remints provider tokens (no mega-OAuth, no browser, no :4242).
+  if (isHostedHttp()) {
+    console.error(deskMintMessage('<alias>'));
+    console.error('Hosted mode refuses provider remint. Mint each alias on a desk, then mount *.enc.');
+    process.exit(1);
+  }
+
   const accountIdx = args.indexOf('--account');
   if (accountIdx === -1 || !args[accountIdx + 1]) {
     console.error('Usage: mcp-google-multi auth --account <alias>');

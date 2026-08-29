@@ -20,9 +20,10 @@ export function registerGrantTools(registry: ToolRegistry): void {
     'set_grant',
     {
       description:
-        'Authenticate this MCP session with a host-local Google account grant (My Flow–style). ' +
-        'REQUIRED before Gmail/Drive/Calendar tools when grants are enforced. ' +
-        'Call once at session start with the grant code for this brain/profile. ' +
+        'Set the session grant (layer 3): a slice of already-minted Google aliases. ' +
+        'Not Google login and not the MCP HTTP token. REQUIRED before data tools when grants are enforced. ' +
+        'Hosted Grok: prefer entering the grant code on /oauth/authorize so it is bound into the access token ' +
+        '(works across Cloud Run replicas). CLI/stdio: call this once at session start. ' +
         'Codes live only in grants.json on the host — never commit them.',
       inputSchema: {
         grant_code: z.string().describe('Secret grant code from host-local grants.json'),
@@ -45,7 +46,7 @@ export function registerGrantTools(registry: ToolRegistry): void {
           accounts: state.accounts,
           source: st.source,
           code_prefix: st.code_prefix,
-          hint: 'Google tools may only use these account aliases until clear_grant.',
+          hint: 'Google tools may only use these account aliases until clear_grant. On hosted Grok, a grant bound into the access token survives across Cloud Run replicas; in-process set_grant does not.',
         });
       } catch (e) {
         return jsonResult(
