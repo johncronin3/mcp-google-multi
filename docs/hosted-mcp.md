@@ -50,14 +50,20 @@ In-process `set_grant` is for stdio/CLI; it does **not** survive another Cloud R
 
 - Bind **8000 / 8787 / 4242** or open a browser (`K_SERVICE` / `MCP_HOSTED=1`).
 - Run provider OAuth (`auth --account`) on Cloud Run.
-- Redirect Grok through `localhost:8787` as the only finish URL — offer
-  `https://grok.com/connectors-oauth-exchange-code/`.
+- Steal a loopback `redirect_uri` with HTML-200 + meta-refresh to grok.com. Grok Bot
+  Plugins **Reopen** uses `http://localhost:8787/callback` and the desk process holds
+  the PKCE verifier — **302 to that URI**. grok.com Custom still 302s to
+  `https://grok.com/connectors-oauth-exchange-code/` because that is what it requested.
 - List hundreds of tools at boot (`GOOGLE_REVEAL_AT_BOOT=all`) unless the client requires it;
   a huge `tools/list` plus Grok retries contributes to 429s. Prefer deferred discover.
 
 Missing layer-1 tokens: **desk-mint error** (mint on a desk, mount `*.enc`).
 
 ## Grok Custom connector fields
+
+House operator runbook (catalog vs Custom, `localhost:8787` Retry → `connectors-oauth-error`, what to paste): AIC `docs/grok-custom-connector-oauth.md`.
+
+On grok.com this MCP is **not** a catalog tile. **New Connector** → **Custom** → Name + Server URL only (finish URL grok.com). Grok Bot Plugins **Reopen** uses `localhost:8787` on purpose — the desktop app is listening; 302 there.
 
 | Field | Value |
 | --- | --- |

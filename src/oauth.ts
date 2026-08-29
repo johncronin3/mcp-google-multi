@@ -107,14 +107,6 @@ function normalizeUri(uri: string): string {
   return (uri || '').trim().replace(/\/+$/, '');
 }
 
-function isLoopback(uri: string): boolean {
-  try {
-    return ['localhost', '127.0.0.1', '::1'].includes(new URL(uri).hostname.toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
 function redirectsMatch(left: string, right: string): boolean {
   if (normalizeUri(left) === normalizeUri(right)) return true;
   // Grok in-chat Retry often starts OAuth with localhost:8787, then exchanges from grok.com.
@@ -222,7 +214,7 @@ function authorizeForm(params: Record<string, string>, res: ServerResponse, erro
 Each Google alias was minted on a desk with <code>auth --account</code> and stored encrypted (layer 1).
 This form does not remint provider tokens and does not pick a Google account.</p>
 <p class="muted">After authorize, the browser returns to <code>${escapeHtml(dest)}</code>.
-Hosted mode never uses localhost:8787 as the finish URL — use the grok.com link if Retry pointed at loopback.</p>
+Grok Bot Plugins Reopen uses localhost:8787 (the desk app is listening). grok.com Custom uses grok.com. Both are 302s to that URI — this form does not steal the code.</p>
 ${err}
 <form method="post" action="/oauth/authorize">
 ${hidden}
@@ -243,23 +235,12 @@ Codes stay host-local. Bound into the access token as the grant <em>name</em> so
 function finishAuthorize(code: string, state: string, requested: string, res: ServerResponse): void {
   const params: Record<string, string> = { code };
   if (state) params.state = state;
-  const primary = callbackUrl(requested, params);
-  if (!isLoopback(requested)) {
-    res.writeHead(302, { location: primary });
-    res.end();
-    return;
-  }
-  const grokUrl = callbackUrl(GROK_REDIRECT, params);
-  htmlPage(
-    'Authorization complete',
-    `<h1>Authorization complete</h1>
-<p>Grok Bot: <a href="${escapeHtml(grokUrl)}">Finish connecting on grok.com</a></p>
-<p class="muted">Cursor / local: <a href="${escapeHtml(primary)}">${escapeHtml(requested)}</a></p>
-<p class="muted">If localhost shows <code>Not Found</code>, use the grok.com link. Hosted MCP never binds :8787.</p>
-<meta http-equiv="refresh" content="0;url=${escapeHtml(grokUrl)}">`,
-    200,
-    res,
-  );
+  // Always 302 to the client's redirect_uri. Cloud Run does not bind :8787, but
+  // Grok Bot on the desk does — and that process holds the PKCE verifier.
+  // HTML-200 + meta-refresh to grok.com steals the code; grok.com has no verifier
+  // and Grok Bot never sees localhost:8787/callback → connectors-oauth-error.
+  res.writeHead(302, { location: callbackUrl(requested, params) });
+  res.end();
 }
 
 function readBody(req: IncomingMessage): Promise<string> {

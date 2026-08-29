@@ -193,7 +193,7 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     expect(text).not.toContain('mega-OAuth');
   });
 
-  it('loopback redirect finishes on grok.com, not only localhost:8787', async () => {
+  it('loopback redirect 302s to localhost:8787 so Grok Bot can exchange PKCE', async () => {
     const { verifier, challenge } = pkce();
     const form = {
       client_id: 'grok',
@@ -205,16 +205,19 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
       password: TOKEN,
       grant_code: GRANT_CODE,
     };
-    const { status, text } = await request({
+    const { status, headers } = await request({
       method: 'POST',
       path: '/oauth/authorize',
       skipAuth: true,
       token: null,
       form,
     });
-    expect(status).toBe(200);
-    expect(text).toContain('https://grok.com/connectors-oauth-exchange-code/');
-    expect(text).toContain('code=');
+    expect(status).toBe(302);
+    const loc = String(headers.location || '');
+    expect(loc.startsWith('http://localhost:8787/callback')).toBe(true);
+    expect(loc).toContain('code=');
+    expect(loc).toContain('state=retry');
+    expect(loc).not.toContain('grok.com/connectors-oauth-exchange-code');
     expect(verifier.length).toBeGreaterThan(10);
   });
 
