@@ -1,12 +1,21 @@
 import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
-import { coerceArray, coerceBoolean } from './_coerce.js';
+import { coerceArray, coerceBoolean, coerceJson } from './_coerce.js';
 import { gmail as gmailClient } from '@googleapis/gmail';
+import { drive as driveClient } from '@googleapis/drive';
 import { ACCOUNTS } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
-import { buildMultipartAlternative, buildReplyHeaders, encodeAddressHeader, encodeHeaderValue, htmlToText, normalizeBodyLineEndings } from './gmail-mime.js';
+import { isHostedHttp } from '../hosted.js';
+import {
+  buildRfc822Message,
+  buildReplyHeaders,
+  htmlToText,
+  localPathUnavailableMessage,
+  type MimeAttachment,
+} from './gmail-mime.js';
+import mime from 'mime-types';
 import { sliceClean } from '../trim.js';
 import type { GmailMessageHeader, GmailMessageFull, GmailAttachment } from '../types.js';
 import * as path from 'path';
@@ -130,6 +139,206 @@ export function parseMessage(
     ...(msg.internalDate ? { internalDate: msg.internalDate } : {}),
     attachments: getAttachments(msg.payload),
   };
+}
+
+type AttachmentSpec = {
+  driveFileId?: string;
+  messageId?: string;
+  attachmentId?: string;
+  path?: string;
+  filename?: string;
+  mimeType?: string;
+};
+
+const attachmentSpecSchema = z.object({
+  driveFileId: z.string().optional()
+    .describe('Drive file ID — hosted-safe; Cloud Run fetches bytes via Drive API on this account'),
+  messageId: z.string().optional()
+    .describe('Gmail message ID to copy an attachment from (requires attachmentId)'),
+  attachmentId: z.string().optional()
+    .describe('Gmail attachment ID from gmail_read (requires messageId)'),
+  path: z.string().optional()
+    .describe('Absolute path on the MCP host disk. Desktop-only; hosted Cloud Run cannot see laptop paths'),
+  filename: z.string().optional().describe('Override filename on the MIME part'),
+  mimeType: z.string().optional().describe('Override MIME type'),
+}).superRefine((val, ctx) => {
+  const hasDrive = Boolean(val.driveFileId);
+  const hasPath = Boolean(val.path);
+  const hasGmail = Boolean(val.messageId) || Boolean(val.attachmentId);
+  const n = Number(hasDrive) + Number(hasPath) + Number(hasGmail);
+  if (n !== 1) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Each attachment needs exactly one source: driveFileId, path, or messageId+attachmentId',
+    });
+    return;
+  }
+  if (hasGmail && (!val.messageId || !val.attachmentId)) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Gmail copy attachments require both messageId and attachmentId',
+    });
+  }
+});
+
+const attachmentsField = coerceJson(z.array(attachmentSpecSchema)).optional()
+  .describe(
+    'Optional attachments. Hosted: pass driveFileId (Drive is the hosted path) or messageId+attachmentId. ' +
+    'path is desktop-only; hosted Cloud Run cannot see laptop paths.',
+  );
+
+function asBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (typeof data === 'string') return Buffer.from(data, 'binary');
+  throw new Error('Drive files.get alt=media returned no binary data');
+}
+
+function findAttachmentMeta(
+  payload: any,
+  attachmentId: string,
+): { filename: string; mimeType: string } | undefined {
+  if (payload?.body?.attachmentId === attachmentId) {
+    return {
+      filename: payload.filename || 'attachment',
+      mimeType: payload.mimeType || 'application/octet-stream',
+    };
+  }
+  for (const part of payload?.parts ?? []) {
+    const found = findAttachmentMeta(part, attachmentId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+async function resolveOneAttachment(
+  gmail: any,
+  drive: any,
+  spec: AttachmentSpec,
+): Promise<MimeAttachment> {
+  if (spec.path) {
+    if (isHostedHttp()) {
+      throw new Error(localPathUnavailableMessage(spec.path));
+    }
+    try {
+      await fs.promises.access(spec.path, fs.constants.R_OK);
+    } catch {
+      throw new Error(localPathUnavailableMessage(spec.path));
+    }
+    const data = await fs.promises.readFile(spec.path);
+    const filename = spec.filename || path.basename(spec.path);
+    const looked = mime.lookup(spec.path);
+    const mimeType = spec.mimeType || (looked || 'application/octet-stream');
+    return { filename, mimeType, data };
+  }
+
+  if (spec.driveFileId) {
+    const meta = await drive.files.get({
+      fileId: spec.driveFileId,
+      fields: 'id,name,mimeType',
+      supportsAllDrives: true,
+    });
+    const name = meta.data.name ?? 'attachment';
+    const mimeType = meta.data.mimeType ?? 'application/octet-stream';
+    if (typeof mimeType === 'string' && mimeType.startsWith('application/vnd.google-apps.')) {
+      throw new Error(
+        `Drive file "${name}" is a Google Workspace native type (${mimeType}); ` +
+          'files.get alt=media cannot download it. Export a binary (drive_export) and attach that file id instead.',
+      );
+    }
+    const res = await drive.files.get(
+      { fileId: spec.driveFileId, alt: 'media', supportsAllDrives: true },
+      { responseType: 'arraybuffer' },
+    );
+    return {
+      filename: spec.filename || name,
+      mimeType: spec.mimeType || mimeType,
+      data: asBuffer(res.data),
+    };
+  }
+
+  if (spec.messageId && spec.attachmentId) {
+    let filename = spec.filename;
+    let mimeType = spec.mimeType;
+    if (!filename || !mimeType) {
+      const msg = await gmail.users.messages.get({
+        userId: 'me',
+        id: spec.messageId,
+        format: 'full',
+      });
+      const meta = findAttachmentMeta(msg.data.payload, spec.attachmentId);
+      filename = filename || meta?.filename || 'attachment';
+      mimeType = mimeType || meta?.mimeType || 'application/octet-stream';
+    }
+    const res = await gmail.users.messages.attachments.get({
+      userId: 'me',
+      messageId: spec.messageId,
+      id: spec.attachmentId,
+    });
+    const raw = res.data.data;
+    if (!raw) throw new Error('No attachment data returned');
+    return {
+      filename,
+      mimeType,
+      data: Buffer.from(raw, 'base64url'),
+    };
+  }
+
+  throw new Error('Each attachment needs exactly one source: driveFileId, path, or messageId+attachmentId');
+}
+
+async function resolveAttachments(
+  gmail: any,
+  auth: any,
+  specs: AttachmentSpec[] | undefined,
+): Promise<MimeAttachment[]> {
+  if (!specs?.length) return [];
+  const drive = driveClient({ version: 'v3', auth });
+  const out: MimeAttachment[] = [];
+  for (const spec of specs) {
+    out.push(await resolveOneAttachment(gmail, drive, spec));
+  }
+  return out;
+}
+
+async function composeEncodedRaw(
+  account: Account,
+  gmail: any,
+  auth: any,
+  args: {
+    to: string;
+    subject: string;
+    body: string;
+    htmlBody?: string;
+    cc?: string;
+    replyToMessageId?: string;
+    attachments?: AttachmentSpec[];
+  },
+): Promise<string> {
+  const config = (await import('../accounts.js')).ACCOUNT_CONFIG[account];
+  let inReplyTo: string | undefined;
+  let references: string | undefined;
+  if (args.replyToMessageId) {
+    const h = await resolveReplyHeaders(gmail, args.replyToMessageId);
+    inReplyTo = h.inReplyTo;
+    references = h.references;
+  }
+  const attachments = await resolveAttachments(gmail, auth, args.attachments);
+  const rawMessage = buildRfc822Message({
+    from: config.email,
+    to: args.to,
+    subject: args.subject,
+    body: args.body,
+    htmlBody: args.htmlBody,
+    cc: args.cc,
+    inReplyTo,
+    references,
+    attachments,
+  });
+  return Buffer.from(rawMessage, 'utf-8').toString('base64url');
 }
 
 export function registerGmailTools(server: ToolRegistry): void {
@@ -282,7 +491,7 @@ export function registerGmailTools(server: ToolRegistry): void {
   server.registerTool(
     'gmail_send',
     {
-      description: 'Send an email from a Gmail account',
+      description: 'Send an email from a Gmail account, optionally with attachments',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         to: z.string().describe('Recipient(s), comma-separated'),
@@ -295,41 +504,16 @@ export function registerGmailTools(server: ToolRegistry): void {
           .describe('Message ID to reply to (sets In-Reply-To and References headers)'),
         replyToThreadId: z.string().optional()
           .describe('Thread ID to send the message in'),
+        attachments: attachmentsField,
       },
     },
-    async ({ account, to, subject, body, htmlBody, cc, replyToMessageId, replyToThreadId }) => {
+    async ({ account, to, subject, body, htmlBody, cc, replyToMessageId, replyToThreadId, attachments }) => {
       try {
         const auth = await getClient(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
-        const config = (await import('../accounts.js')).ACCOUNT_CONFIG[account as Account];
-
-        const headers = [
-          `From: ${encodeAddressHeader(config.email)}`,
-          `To: ${encodeAddressHeader(to)}`,
-          `Subject: ${encodeHeaderValue(subject)}`,
-          'MIME-Version: 1.0',
-        ];
-
-        let bodyText: string;
-        if (htmlBody) {
-          const { contentType, body: mp } = buildMultipartAlternative(body, htmlBody);
-          headers.push(`Content-Type: ${contentType}`);
-          bodyText = mp;
-        } else {
-          headers.push('Content-Type: text/plain; charset="UTF-8"');
-          headers.push('Content-Transfer-Encoding: 8bit');
-          bodyText = normalizeBodyLineEndings(body);
-        }
-
-        if (cc) headers.push(`Cc: ${encodeAddressHeader(cc)}`);
-        if (replyToMessageId) {
-          const { inReplyTo, references } = await resolveReplyHeaders(gmail, replyToMessageId);
-          headers.push(`In-Reply-To: ${inReplyTo}`);
-          headers.push(`References: ${references}`);
-        }
-
-        const rawMessage = [...headers, '', bodyText].join('\r\n');
-        const encoded = Buffer.from(rawMessage, 'utf-8').toString('base64url');
+        const encoded = await composeEncodedRaw(account as Account, gmail, auth, {
+          to, subject, body, htmlBody, cc, replyToMessageId, attachments,
+        });
 
         const sendParams: any = {
           userId: 'me',
@@ -395,7 +579,7 @@ export function registerGmailTools(server: ToolRegistry): void {
   server.registerTool(
     'gmail_create_draft',
     {
-      description: 'Create a Gmail draft without sending',
+      description: 'Create a Gmail draft without sending, optionally with attachments',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         to: z.string().describe('Recipient(s), comma-separated'),
@@ -408,41 +592,16 @@ export function registerGmailTools(server: ToolRegistry): void {
           .describe('Message ID to reply to (sets In-Reply-To and References headers)'),
         replyToThreadId: z.string().optional()
           .describe('Thread ID to associate the draft with'),
+        attachments: attachmentsField,
       },
     },
-    async ({ account, to, subject, body, htmlBody, cc, replyToMessageId, replyToThreadId }) => {
+    async ({ account, to, subject, body, htmlBody, cc, replyToMessageId, replyToThreadId, attachments }) => {
       try {
         const auth = await getClient(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
-        const config = (await import('../accounts.js')).ACCOUNT_CONFIG[account as Account];
-
-        const headers = [
-          `From: ${encodeAddressHeader(config.email)}`,
-          `To: ${encodeAddressHeader(to)}`,
-          `Subject: ${encodeHeaderValue(subject)}`,
-          'MIME-Version: 1.0',
-        ];
-
-        let bodyText: string;
-        if (htmlBody) {
-          const { contentType, body: mp } = buildMultipartAlternative(body, htmlBody);
-          headers.push(`Content-Type: ${contentType}`);
-          bodyText = mp;
-        } else {
-          headers.push('Content-Type: text/plain; charset="UTF-8"');
-          headers.push('Content-Transfer-Encoding: 8bit');
-          bodyText = normalizeBodyLineEndings(body);
-        }
-
-        if (cc) headers.push(`Cc: ${encodeAddressHeader(cc)}`);
-        if (replyToMessageId) {
-          const { inReplyTo, references } = await resolveReplyHeaders(gmail, replyToMessageId);
-          headers.push(`In-Reply-To: ${inReplyTo}`);
-          headers.push(`References: ${references}`);
-        }
-
-        const rawMessage = [...headers, '', bodyText].join('\r\n');
-        const encoded = Buffer.from(rawMessage, 'utf-8').toString('base64url');
+        const encoded = await composeEncodedRaw(account as Account, gmail, auth, {
+          to, subject, body, htmlBody, cc, replyToMessageId, attachments,
+        });
 
         const draftParams: any = {
           userId: 'me',
