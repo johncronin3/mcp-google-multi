@@ -54,7 +54,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "vitest run",
-    "test:http": "vitest run tests/http-mcp.test.ts",
+    "test:http": "vitest run tests/http-mcp.test.ts tests/oauth-as.test.ts tests/hosted.test.ts",
     "start:http": "node dist/http.js",
     "test:watch": "vitest",
     "gen:discovery": "tsx scripts/fetch-discovery.ts",

@@ -2,10 +2,16 @@
  * Session-scoped account grants (My Flow–style).
  *
  * Host-local grants.json maps opaque codes → allowed Google account aliases.
- * Agents call set_grant at session start; without a grant (when enforcement is
- * on), data tools refuse. Codes never appear in repo examples as real values.
+ * This is layer 3 (session grant): a slice of already-minted layer-1 aliases.
+ * It is not Google login and not the MCP HTTP token.
+ *
+ * Hosted HTTP restores the slice from the Grok access JWT (`gname`) via
+ * AsyncLocalStorage so Cloud Run replicas need no sticky sessions.
+ * Stdio / static Bearer still use in-process set_grant.
+ * Codes never appear in repo examples as real values.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -30,10 +36,19 @@ export interface SessionGrantState {
   name: string;
   accounts: string[];
   label?: string;
+  /** How this slice was activated. `token` = HMAC access JWT (multi-instance). */
+  source?: 'session' | 'env' | 'token';
 }
 
 let session: SessionGrantState | null = null;
 let cachedFile: GrantsFile | null | undefined;
+
+/** Request-scoped grant for hosted HTTP (one Cloud Run replica, many concurrent chats). */
+const als = new AsyncLocalStorage<{ grant: SessionGrantState | null }>();
+
+export function runWithGrant<T>(grant: SessionGrantState | null, fn: () => T): T {
+  return als.run({ grant }, fn);
+}
 
 export function getGrantsPath(): string {
   if (process.env.GOOGLE_GRANTS_PATH?.trim()) {
@@ -84,18 +99,63 @@ export function isGrantEnforced(): boolean {
 }
 
 export function getSessionGrant(): SessionGrantState | null {
+  const store = als.getStore();
+  if (store) return store.grant;
   return session;
 }
 
 export function clearSessionGrant(): void {
+  const store = als.getStore();
+  if (store) {
+    store.grant = null;
+    return;
+  }
   session = null;
 }
 
-function findGrantByCode(code: string): GrantRecord | null {
+function accountsForRecord(rec: GrantRecord): string[] {
+  const known = new Set(ACCOUNTS);
+  return rec.accounts.map((a) => a.trim()).filter((a) => a && known.has(a));
+}
+
+/** Lookup by secret code. Does not activate. Used by OAuth authorize (layer 3). */
+export function resolveGrantByCode(code: string): GrantRecord | null {
   const file = loadGrantsFile(true);
   if (!file) return null;
   const c = code.trim();
+  if (!c) return null;
   return file.grants.find((g) => g.code === c) ?? null;
+}
+
+/**
+ * Restore a slice from an access-token grant *name* (never the code).
+ * Re-resolves aliases from grants.json so replica state stays current.
+ * Fail closed (null) if the name is unknown or has no matching aliases.
+ */
+export function resolveGrantByName(name: string): SessionGrantState | null {
+  const file = loadGrantsFile();
+  if (!file) return null;
+  const n = name.trim();
+  if (!n) return null;
+  const rec = file.grants.find((g) => g.name === n);
+  if (!rec) return null;
+  const accounts = accountsForRecord(rec);
+  if (accounts.length === 0) return null;
+  return { code: '', name: rec.name, accounts, label: 'token', source: 'token' };
+}
+
+function findGrantByCode(code: string): GrantRecord | null {
+  return resolveGrantByCode(code);
+}
+
+function persistGrant(state: SessionGrantState): SessionGrantState {
+  const store = als.getStore();
+  if (store) {
+    store.grant = state;
+    return state;
+  }
+  session = state;
+  return session;
 }
 
 /**
@@ -132,13 +192,13 @@ export function setSessionGrant(code: string, label?: string): SessionGrantState
     );
   }
 
-  session = {
+  return persistGrant({
     code: trimmed,
     name: rec.name,
     accounts,
     label: (label || '').trim() || undefined,
-  };
-  return session;
+    source: 'session',
+  });
 }
 
 /** Env fallback GOOGLE_GRANT_CODE (legacy process-wide); session wins. */
@@ -155,13 +215,15 @@ export function grantFromEnvFallback(): SessionGrantState | null {
     const known = new Set(ACCOUNTS);
     const accounts = rec.accounts.map((a) => a.trim()).filter((a) => known.has(a));
     if (accounts.length === 0) return null;
-    return { code, name: rec.name, accounts, label: 'env' };
+    return { code, name: rec.name, accounts, label: 'env', source: 'env' };
   } catch {
     return null;
   }
 }
 
 export function activeGrant(): SessionGrantState | null {
+  const store = als.getStore();
+  if (store) return store.grant;
   return session ?? grantFromEnvFallback();
 }
 
@@ -175,8 +237,9 @@ export function allowedAccounts(): string[] {
   const g = activeGrant();
   if (!g) {
     throw new Error(
-      'No session grant. Call set_grant(grant_code=..., label=...) before Google tools. ' +
-        'Fail-closed: without a grant, no accounts are visible.',
+      'No session grant. Fail-closed: without a grant, no accounts are visible. ' +
+        'Hosted Grok: enter the session grant code on /oauth/authorize (bound into the access token). ' +
+        'CLI/stdio: call set_grant(grant_code=..., label=...).',
     );
   }
   return [...g.accounts];
@@ -195,7 +258,7 @@ export function assertAccountAllowed(alias: string): void {
 export function grantStatusSummary(): {
   enforced: boolean;
   authenticated: boolean;
-  source: 'session' | 'env' | null;
+  source: 'session' | 'env' | 'token' | null;
   name: string | null;
   label: string | null;
   code_prefix: string | null;
@@ -205,14 +268,20 @@ export function grantStatusSummary(): {
 } {
   const file = loadGrantsFile();
   const enforced = isGrantEnforced();
-  const sess = session;
-  const envG = !sess ? grantFromEnvFallback() : null;
+  const store = als.getStore();
+  const sess = store ? store.grant : session;
+  const envG = !sess && !store ? grantFromEnvFallback() : null;
   const g = sess ?? envG;
   const code = g?.code;
+  const source: 'session' | 'env' | 'token' | null = sess
+    ? (sess.source === 'token' ? 'token' : 'session')
+    : envG
+      ? 'env'
+      : null;
   return {
     enforced,
     authenticated: Boolean(g),
-    source: sess ? 'session' : envG ? 'env' : null,
+    source,
     name: g?.name ?? null,
     label: g?.label ?? null,
     code_prefix: code ? (code.length > 12 ? `${code.slice(0, 12)}…` : code) : null,

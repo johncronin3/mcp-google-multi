@@ -46,6 +46,8 @@ You don't need to know anything about MCP or OAuth — five steps, all copy-past
 
 Restart your client and the tools appear. Check everything with `mcp-google-multi config check`.
 
+**Hosted / Grok Bot:** [Hosted MCP pattern](./docs/hosted-mcp.md) — three layers (desk-minted Google aliases, MCP HTTP token, session grant). Not a mega-OAuth.
+
 **Go deeper:** [Configuration reference](./docs/configuration.md) · [What's covered](./COVERAGE.md) · [Features tour](./docs/features.md) · [Secrets in a vault](./docs/secrets.md) · [Upgrading from v4](./docs/upgrading-v4.md) · [Security policy](./SECURITY.md) · [Roadmap](https://github.com/bakissation/mcp-google-multi/milestones)
 
 ## Maintainer & credits

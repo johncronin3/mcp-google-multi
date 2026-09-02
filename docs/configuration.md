@@ -21,17 +21,23 @@ Everything is configured through environment variables (a `.env` in the working 
 | `GOOGLE_TRIM` | — | `off` (or `0`/`false`/`no`) disables compact JSON serialization of tool responses |
 | `GOOGLE_GRANTS_PATH` | — | host-local grants file (default: `~/.config/mcp-google-multi/grants.json`) — see [Session grants](#session-grants-my-flowstyle) |
 | `GOOGLE_GRANTS_ENFORCE` | — | `true` force fail-closed grants; `false` disable even if grants file exists; default = enforce when file has ≥1 grant |
-| `GOOGLE_GRANT_CODE` | — | optional process-wide fallback code (prefer session tool `set_grant`) |
+| `GOOGLE_GRANT_CODE` | — | optional process-wide fallback code (prefer session tool `set_grant` or Grok OAuth-bound grant) |
+| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for `POST /mcp` (Secret Manager). Grok OAuth wraps this token only. |
+| `MCP_PUBLIC_HOST` | hosted | Public hostname (Cloud Run). Never `localhost:8787`. |
+| `MCP_HOSTED` | — | `1` force hosted (no browser, no 8000/8787/4242); `0` force desk. Cloud Run sets `K_SERVICE`. |
+
+Hosted / Grok Bot: see [hosted-mcp.md](./hosted-mcp.md) (three layers: provider credentials, MCP HTTP token, session grant).
 
 Inspect the resolved setup any time: `mcp-google-multi config check`.
 
 ## Session grants (My Flow–style)
 
-Without a session grant, multi-account tools can reach **every** alias in `GOOGLE_ACCOUNTS`. Session grants close that gap the same way My Flow MCP does for orgs:
+Without a session grant, multi-account tools can reach **every** alias in `GOOGLE_ACCOUNTS`. Session grants (layer 3) close that gap the same way My Flow MCP does for orgs. They do **not** log into Google — each alias is still minted with singular desk OAuth (layer 1).
 
 1. Host-local file `grants.json` (see `grants.example.json`) maps **name + code → account aliases**.
-2. Agent calls MCP tools `set_grant` / `clear_grant` / `grant_status` at session start.
-3. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant.
+2. **Stdio / CLI:** call `set_grant` / `clear_grant` / `grant_status` at session start (in-process).
+3. **Hosted Grok:** enter the grant code on `/oauth/authorize`; the access JWT carries the grant *name* so every Cloud Run replica restores the same slice (no sticky sessions). In-process `set_grant` alone does not survive another instance.
+4. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant.
 
 **Codes stay host-local** — never commit real codes. You may reuse the **same secret** as a My Flow grant code so operators keep one code per brain; Google only looks up its own `grants.json`.
 
