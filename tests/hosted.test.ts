@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertHostedListenPort,
   deskMintMessage,
+  deskSavePathRequiredMessage,
+  hostedBytesPayload,
   isHostedHttp,
+  mcpJsonResult,
 } from '../src/hosted.js';
 
 describe('hosted mode (layer 1 desk-mint vs Cloud Run)', () => {
@@ -41,5 +44,47 @@ describe('hosted mode (layer 1 desk-mint vs Cloud Run)', () => {
     expect(() => assertHostedListenPort(8787, env)).toThrow(/8787/);
     expect(() => assertHostedListenPort(4242, env)).toThrow(/4242/);
     expect(() => assertHostedListenPort(8787, { MCP_HOSTED: '0' })).not.toThrow();
+  });
+});
+
+describe('hosted download bytes payload', () => {
+  it('returns base64 payload with filename/mime/size', () => {
+    const data = Buffer.from('hello-bytes');
+    const payload = hostedBytesPayload({
+      filename: 'report.pdf',
+      mimeType: 'application/pdf',
+      data,
+    });
+    expect(payload).toEqual({
+      filename: 'report.pdf',
+      mimeType: 'application/pdf',
+      size: data.length,
+      encoding: 'base64',
+      data: data.toString('base64'),
+    });
+    expect(Buffer.from(payload.data, 'base64').toString('utf8')).toBe('hello-bytes');
+  });
+
+  it('basename-sanitizes filename and notes ignored savePath', () => {
+    const payload = hostedBytesPayload({
+      filename: '../../etc/passwd',
+      mimeType: 'text/plain',
+      data: Buffer.from('x'),
+      savePathProvided: true,
+    });
+    expect(payload.filename).toBe('passwd');
+    expect(payload.note).toMatch(/savePath is not applicable/);
+  });
+
+  it('mcpJsonResult wraps JSON text content', () => {
+    const res = mcpJsonResult({ ok: true });
+    expect(res.content[0].type).toBe('text');
+    expect(JSON.parse(res.content[0].text)).toEqual({ ok: true });
+  });
+
+  it('deskSavePathRequiredMessage mentions hosted omit', () => {
+    const msg = deskSavePathRequiredMessage();
+    expect(msg).toMatch(/savePath is required on desk/);
+    expect(msg).toMatch(/omit savePath/);
   });
 });

@@ -102,3 +102,14 @@ Grant **codes** stay in host-local `grants.json`. Names `Personal Brain Grant 3`
 
 Reference implementation (working Grok OAuth): `billing-integ/mcp-server/oauth.py`.
 This repo: `src/oauth.ts`, `src/hosted.ts`, `src/session-grant.ts`, `src/http.ts`.
+
+## Hosted downloads (return-bytes)
+
+On Cloud Run (`MCP_HOSTED` / `K_SERVICE`), these tools return file bytes in the MCP result instead of writing `savePath` on the container:
+
+- `gmail_download_attachment`
+- `drive_download`
+- `drive_export`
+
+Shape: `{ filename, mimeType, size, encoding: "base64", data }`. Desk/stdio still requires `savePath` and writes locally. If a caller passes `savePath` while hosted, it is ignored (optional `note` in the payload).
+
