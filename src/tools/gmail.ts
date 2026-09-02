@@ -7,7 +7,12 @@ import { ACCOUNTS } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
-import { isHostedHttp } from '../hosted.js';
+import {
+  deskSavePathRequiredMessage,
+  hostedBytesPayload,
+  isHostedHttp,
+  mcpJsonResult,
+} from '../hosted.js';
 import {
   buildRfc822Message,
   buildReplyHeaders,
@@ -540,13 +545,19 @@ export function registerGmailTools(server: ToolRegistry): void {
   server.registerTool(
     'gmail_download_attachment',
     {
-      description: 'Download an email attachment to local disk. Use gmail_read first to get the attachmentId.',
+      description:
+        'Download an email attachment. Desk/stdio: writes to savePath on local disk. ' +
+        'Hosted Cloud Run: returns base64 bytes in the MCP result (savePath ignored). ' +
+        'Use gmail_read first to get the attachmentId.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         messageId: z.string().describe('The Gmail message ID'),
         attachmentId: z.string().describe('The attachment ID from gmail_read response'),
         filename: z.string().describe('Filename to save as (e.g. report.xlsx)'),
-        savePath: z.string().describe('Absolute directory path to save into, e.g. /home/user/Downloads'),
+        savePath: z.string().optional().describe(
+          'Desk only: absolute directory path to save into (e.g. /home/user/Downloads). ' +
+          'Ignored on hosted Cloud Run — bytes are returned in the tool result.',
+        ),
       },
     },
     async ({ account, messageId, attachmentId, filename, savePath }) => {
@@ -564,8 +575,30 @@ export function registerGmailTools(server: ToolRegistry): void {
         if (!data) throw new Error('No attachment data returned');
 
         const buffer = Buffer.from(data, 'base64url');
+        const safeName = path.basename(filename);
+        const looked = mime.lookup(safeName);
+        const mimeType = (looked || 'application/octet-stream') as string;
+
+        if (isHostedHttp()) {
+          return mcpJsonResult(
+            hostedBytesPayload({
+              filename: safeName,
+              mimeType,
+              data: buffer,
+              savePathProvided: Boolean(savePath),
+            }),
+          );
+        }
+
+        if (!savePath) {
+          return {
+            isError: true as const,
+            content: [{ type: 'text' as const, text: deskSavePathRequiredMessage() }],
+          };
+        }
+
         // Strip path components so callers can't escape savePath via "../".
-        const fullPath = path.join(savePath, path.basename(filename));
+        const fullPath = path.join(savePath, safeName);
         await fs.promises.writeFile(fullPath, buffer, { mode: 0o600 });
 
         return {

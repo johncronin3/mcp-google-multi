@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 /**
  * Hosted MCP (Cloud Run / public HTTPS) vs desk-local provider minting.
  *
@@ -77,3 +78,54 @@ export function assertHostedListenPort(port: number, env: NodeJS.ProcessEnv = pr
     );
   }
 }
+
+/** Payload shape returned by download tools on hosted MCP (no desk filesystem). */
+export type HostedBytesPayload = {
+  filename: string;
+  mimeType: string;
+  size: number;
+  encoding: 'base64';
+  data: string;
+  note?: string;
+};
+
+/**
+ * Build the MCP JSON payload for a file download on hosted Cloud Run.
+ * savePath is ignored when provided — desk filesystem is not available to agents.
+ */
+export function hostedBytesPayload(opts: {
+  filename: string;
+  mimeType: string;
+  data: Buffer;
+  savePathProvided?: boolean;
+}): HostedBytesPayload {
+  // Basename only — never echo a caller path component into the result.
+  const filename = path.basename(opts.filename);
+  const payload: HostedBytesPayload = {
+    filename,
+    mimeType: opts.mimeType || 'application/octet-stream',
+    size: opts.data.length,
+    encoding: 'base64',
+    data: opts.data.toString('base64'),
+  };
+  if (opts.savePathProvided) {
+    payload.note = 'savePath is not applicable on hosted MCP; file bytes returned in data';
+  }
+  return payload;
+}
+
+/** Wrap a JSON-serializable value as an MCP text content result. */
+export function mcpJsonResult(value: unknown): { content: [{ type: 'text'; text: string }] } {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+  };
+}
+
+/** Desk/stdio requires savePath; hosted returns bytes instead. */
+export function deskSavePathRequiredMessage(): string {
+  return (
+    'savePath is required on desk/stdio MCP (local filesystem). ' +
+    'On hosted Cloud Run, omit savePath — the tool returns base64 bytes in the result.'
+  );
+}
+
