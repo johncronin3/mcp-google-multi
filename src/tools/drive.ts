@@ -9,10 +9,11 @@ import { handleGoogleApiError } from './_errors.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
 import { capText } from '../trim.js';
 import {
+  decodeContentBase64,
   deskSavePathRequiredMessage,
   deskUploadNeedsLocalPathMessage,
   hostedBytesPayload,
-  hostedUploadNeedsBase64Message,
+  hostedUploadRequiresBase64Message,
   isHostedHttp,
   mcpJsonResult,
 } from '../hosted.js';
@@ -20,6 +21,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import mime from 'mime-types';
 
@@ -50,9 +52,10 @@ export type DriveUploadMediaSource =
 /**
  * Resolve drive_upload media for desk (localPath) vs hosted (contentBase64).
  * Pure helper for unit tests — no Google API calls.
- * Hosted prefers contentBase64 when both are provided; desk prefers localPath.
+ * Prefer contentBase64 whenever provided (decode + validate); else hosted requires
+ * contentBase64; else desk requires localPath.
  */
-export function resolveDriveUploadMedia(opts: {
+export function resolveDriveUploadSource(opts: {
   hosted: boolean;
   localPath?: string;
   contentBase64?: string;
@@ -63,25 +66,24 @@ export function resolveDriveUploadMedia(opts: {
   const contentBase64 = opts.contentBase64?.trim() || undefined;
   const safeName = path.basename(opts.filename);
 
+  if (contentBase64) {
+    let buffer: Buffer;
+    try {
+      buffer = decodeContentBase64(contentBase64);
+    } catch (err: any) {
+      return { ok: false, message: err?.message || String(err) };
+    }
+    const looked = mime.lookup(safeName);
+    const mimeType =
+      opts.mimeTypeArg ?? (looked || 'application/octet-stream');
+    return { ok: true, media: { kind: 'bytes', buffer, mimeType: String(mimeType) } };
+  }
+
   if (opts.hosted) {
-    if (contentBase64) {
-      const buffer = Buffer.from(contentBase64, 'base64');
-      if (buffer.length === 0) {
-        return {
-          ok: false,
-          message:
-            'contentBase64 decoded to empty bytes. Pass standard base64 of the file contents.',
-        };
-      }
-      const looked = mime.lookup(safeName);
-      const mimeType =
-        opts.mimeTypeArg ?? (looked || 'application/octet-stream');
-      return { ok: true, media: { kind: 'bytes', buffer, mimeType: String(mimeType) } };
-    }
-    if (localPath) {
-      return { ok: false, message: hostedUploadNeedsBase64Message(true) };
-    }
-    return { ok: false, message: hostedUploadNeedsBase64Message(false) };
+    return {
+      ok: false,
+      message: hostedUploadRequiresBase64Message(Boolean(localPath)),
+    };
   }
 
   if (localPath) {
@@ -93,6 +95,9 @@ export function resolveDriveUploadMedia(opts: {
 
   return { ok: false, message: deskUploadNeedsLocalPathMessage() };
 }
+
+/** @deprecated Prefer resolveDriveUploadSource */
+export const resolveDriveUploadMedia = resolveDriveUploadSource;
 
 function asDownloadBuffer(data: unknown): Buffer {
   if (Buffer.isBuffer(data)) return data;
@@ -343,7 +348,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, localPath, contentBase64, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
       try {
-        const resolved = resolveDriveUploadMedia({
+        const resolved = resolveDriveUploadSource({
           hosted: isHostedHttp(),
           localPath,
           contentBase64,
@@ -363,7 +368,7 @@ export function registerDriveTools(server: ToolRegistry): void {
         const body =
           resolved.media.kind === 'path'
             ? fs.createReadStream(resolved.media.localPath)
-            : resolved.media.buffer;
+            : Readable.from(resolved.media.buffer);
 
         const res = await drive.files.create({
           requestBody: {

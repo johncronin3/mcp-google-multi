@@ -121,5 +121,5 @@ Shape: `{ filename, mimeType, size, encoding: "base64", data }`. Desk/stdio stil
 - `filename` — Drive display name
 - optional `mimeType`, `parentFolderId`, `convertTo`, `account`
 
-If only `localPath` is sent while hosted, the tool returns a clear error asking for `contentBase64`. When both are provided on hosted, `contentBase64` wins. Desk/stdio still requires `localPath`.
+If only `localPath` is sent while hosted, the tool returns a clear error asking for `contentBase64`. Prefer `contentBase64` whenever provided (hosted or desk). Desk/stdio still accepts `localPath` when base64 is omitted.
 

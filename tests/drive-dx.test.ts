@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { prepareLocalDest, resolveDriveUploadMedia, resolveShareNotification } from '../src/tools/drive.js';
+import { prepareLocalDest, resolveDriveUploadSource, resolveShareNotification } from '../src/tools/drive.js';
 import { executeApiMethod, type ApiMethodRef } from '../src/executor.js';
 
 describe('prepareLocalDest', () => {
@@ -88,12 +88,12 @@ describe('executeApiMethod binary/export steering', () => {
   });
 });
 
-describe('resolveDriveUploadMedia (hosted vs desk)', () => {
+describe('resolveDriveUploadSource (hosted vs desk)', () => {
   const sample = Buffer.from('hello-upload');
   const b64 = sample.toString('base64');
 
   it('hosted prefers contentBase64 when both provided', () => {
-    const res = resolveDriveUploadMedia({
+    const res = resolveDriveUploadSource({
       hosted: true,
       localPath: '/home/user/secret.pdf',
       contentBase64: b64,
@@ -109,7 +109,7 @@ describe('resolveDriveUploadMedia (hosted vs desk)', () => {
   });
 
   it('hosted with only localPath returns clear base64 error (no pretend read)', () => {
-    const res = resolveDriveUploadMedia({
+    const res = resolveDriveUploadSource({
       hosted: true,
       localPath: '/home/johncronin3/Git_Projects/foo.bin',
       filename: 'foo.bin',
@@ -122,7 +122,7 @@ describe('resolveDriveUploadMedia (hosted vs desk)', () => {
   });
 
   it('hosted with neither source asks for contentBase64', () => {
-    const res = resolveDriveUploadMedia({
+    const res = resolveDriveUploadSource({
       hosted: true,
       filename: 'x.txt',
     });
@@ -132,7 +132,7 @@ describe('resolveDriveUploadMedia (hosted vs desk)', () => {
   });
 
   it('hosted infers mime from filename when contentBase64 given', () => {
-    const res = resolveDriveUploadMedia({
+    const res = resolveDriveUploadSource({
       hosted: true,
       contentBase64: b64,
       filename: 'notes.txt',
@@ -145,7 +145,7 @@ describe('resolveDriveUploadMedia (hosted vs desk)', () => {
   });
 
   it('hosted rejects empty decoded contentBase64', () => {
-    const res = resolveDriveUploadMedia({
+    const res = resolveDriveUploadSource({
       hosted: true,
       contentBase64: '',
       filename: 'empty.bin',
@@ -153,11 +153,47 @@ describe('resolveDriveUploadMedia (hosted vs desk)', () => {
     expect(res.ok).toBe(false);
   });
 
-  it('desk keeps localPath behavior and prefers path when both given', () => {
-    const res = resolveDriveUploadMedia({
+  it('prefers contentBase64 on desk when both given', () => {
+    const res = resolveDriveUploadSource({
       hosted: false,
       localPath: '/tmp/desk-file.docx',
       contentBase64: b64,
+      filename: 'report.pdf',
+      mimeTypeArg: 'application/pdf',
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.media.kind).toBe('bytes');
+    if (res.media.kind !== 'bytes') return;
+    expect(res.media.buffer.equals(sample)).toBe(true);
+    expect(res.media.mimeType).toBe('application/pdf');
+  });
+
+  it('desk accepts contentBase64 alone', () => {
+    const res = resolveDriveUploadSource({
+      hosted: false,
+      contentBase64: b64,
+      filename: 'only-b64.txt',
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.media.kind).toBe('bytes');
+  });
+
+  it('desk without either source requires localPath', () => {
+    const res = resolveDriveUploadSource({
+      hosted: false,
+      filename: 'missing.txt',
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.message).toMatch(/localPath is required on desk/);
+  });
+
+  it('desk localPath-only keeps createReadStream path source', () => {
+    const res = resolveDriveUploadSource({
+      hosted: false,
+      localPath: '/tmp/desk-file.docx',
       filename: 'ignored-for-mime.docx',
     });
     expect(res.ok).toBe(true);
@@ -166,17 +202,6 @@ describe('resolveDriveUploadMedia (hosted vs desk)', () => {
     if (res.media.kind !== 'path') return;
     expect(res.media.localPath).toBe('/tmp/desk-file.docx');
     expect(res.media.mimeType).toMatch(/wordprocessingml|msword|octet-stream/i);
-  });
-
-  it('desk without localPath errors even if contentBase64 present', () => {
-    const res = resolveDriveUploadMedia({
-      hosted: false,
-      contentBase64: b64,
-      filename: 'only-b64.txt',
-    });
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.message).toMatch(/localPath is required on desk/);
   });
 });
 
