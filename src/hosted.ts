@@ -129,3 +129,55 @@ export function deskSavePathRequiredMessage(): string {
   );
 }
 
+/** Hosted upload cannot use desk localPath — callers must send base64 bytes. */
+export function hostedUploadRequiresBase64Message(localPathProvided = false): string {
+  const pathNote = localPathProvided
+    ? 'localPath was provided but is not readable on Cloud Run. '
+    : '';
+  return (
+    pathNote +
+    'Hosted Cloud Run cannot see laptop/box filesystem paths. ' +
+    'Pass contentBase64 (standard base64 file bytes) plus filename. ' +
+    'Desk/stdio still uses localPath.'
+  );
+}
+
+/** @deprecated Prefer hostedUploadRequiresBase64Message */
+export const hostedUploadNeedsBase64Message = hostedUploadRequiresBase64Message;
+
+/** Desk/stdio upload requires localPath when contentBase64 is omitted. */
+export function deskUploadNeedsLocalPathMessage(): string {
+  return (
+    'localPath is required on desk/stdio MCP (local filesystem). ' +
+    'On hosted Cloud Run, pass contentBase64 instead of localPath.'
+  );
+}
+
+/**
+ * Decode standard base64 file bytes for hosted (and optional desk) uploads.
+ * Rejects empty / whitespace-only and non-base64 alphabet input.
+ */
+export function decodeContentBase64(s: string): Buffer {
+  const trimmed = (s || '').trim();
+  if (!trimmed) {
+    throw new Error(
+      'contentBase64 is empty. Pass standard base64 of the file contents.',
+    );
+  }
+  const compact = trimmed.replace(/\s+/g, '');
+  // Allow standard and URL-safe alphabet with optional padding.
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) {
+    throw new Error(
+      'contentBase64 is not valid base64. Pass standard base64 of the file contents.',
+    );
+  }
+  const normalized = compact.replace(/-/g, '+').replace(/_/g, '/');
+  const buffer = Buffer.from(normalized, 'base64');
+  if (buffer.length === 0) {
+    throw new Error(
+      'contentBase64 decoded to empty bytes. Pass standard base64 of the file contents.',
+    );
+  }
+  return buffer;
+}
+

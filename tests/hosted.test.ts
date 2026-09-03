@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertHostedListenPort,
+  decodeContentBase64,
   deskMintMessage,
   deskSavePathRequiredMessage,
+  deskUploadNeedsLocalPathMessage,
   hostedBytesPayload,
+  hostedUploadRequiresBase64Message,
   isHostedHttp,
   mcpJsonResult,
 } from '../src/hosted.js';
@@ -88,3 +91,33 @@ describe('hosted download bytes payload', () => {
     expect(msg).toMatch(/omit savePath/);
   });
 });
+
+describe('hosted upload base64 messages + decode', () => {
+  it('hostedUploadRequiresBase64Message tells caller to pass contentBase64', () => {
+    const withPath = hostedUploadRequiresBase64Message(true);
+    expect(withPath).toMatch(/localPath was provided/);
+    expect(withPath).toMatch(/contentBase64/);
+    expect(withPath).toMatch(/Cloud Run/);
+    const bare = hostedUploadRequiresBase64Message(false);
+    expect(bare).not.toMatch(/localPath was provided/);
+    expect(bare).toMatch(/contentBase64/);
+  });
+
+  it('deskUploadNeedsLocalPathMessage mentions hosted contentBase64', () => {
+    const msg = deskUploadNeedsLocalPathMessage();
+    expect(msg).toMatch(/localPath is required on desk/);
+    expect(msg).toMatch(/contentBase64/);
+  });
+
+  it('decodeContentBase64 validates and decodes standard base64', () => {
+    const buf = decodeContentBase64(Buffer.from('hello-upload').toString('base64'));
+    expect(buf.toString('utf8')).toBe('hello-upload');
+  });
+
+  it('decodeContentBase64 rejects empty and invalid alphabet', () => {
+    expect(() => decodeContentBase64('')).toThrow(/empty/i);
+    expect(() => decodeContentBase64('   ')).toThrow(/empty/i);
+    expect(() => decodeContentBase64('!!!not-base64!!!')).toThrow(/not valid base64/i);
+  });
+});
+
