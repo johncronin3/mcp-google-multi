@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { prepareLocalDest, resolveShareNotification } from '../src/tools/drive.js';
+import { prepareLocalDest, resolveDriveUploadMedia, resolveShareNotification } from '../src/tools/drive.js';
 import { executeApiMethod, type ApiMethodRef } from '../src/executor.js';
 
 describe('prepareLocalDest', () => {
@@ -87,3 +87,96 @@ describe('executeApiMethod binary/export steering', () => {
     expect(p.hint).toContain('drive_download');
   });
 });
+
+describe('resolveDriveUploadMedia (hosted vs desk)', () => {
+  const sample = Buffer.from('hello-upload');
+  const b64 = sample.toString('base64');
+
+  it('hosted prefers contentBase64 when both provided', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: true,
+      localPath: '/home/user/secret.pdf',
+      contentBase64: b64,
+      filename: 'report.pdf',
+      mimeTypeArg: 'application/pdf',
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.media.kind).toBe('bytes');
+    if (res.media.kind !== 'bytes') return;
+    expect(res.media.buffer.equals(sample)).toBe(true);
+    expect(res.media.mimeType).toBe('application/pdf');
+  });
+
+  it('hosted with only localPath returns clear base64 error (no pretend read)', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: true,
+      localPath: '/home/johncronin3/Git_Projects/foo.bin',
+      filename: 'foo.bin',
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.message).toMatch(/contentBase64/);
+    expect(res.message).toMatch(/localPath was provided|cannot see/i);
+    expect(res.message).not.toMatch(/ENOENT|createReadStream/);
+  });
+
+  it('hosted with neither source asks for contentBase64', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: true,
+      filename: 'x.txt',
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.message).toMatch(/contentBase64/);
+  });
+
+  it('hosted infers mime from filename when contentBase64 given', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: true,
+      contentBase64: b64,
+      filename: 'notes.txt',
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.media.kind).toBe('bytes');
+    if (res.media.kind !== 'bytes') return;
+    expect(res.media.mimeType).toMatch(/text\/plain/);
+  });
+
+  it('hosted rejects empty decoded contentBase64', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: true,
+      contentBase64: '',
+      filename: 'empty.bin',
+    });
+    expect(res.ok).toBe(false);
+  });
+
+  it('desk keeps localPath behavior and prefers path when both given', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: false,
+      localPath: '/tmp/desk-file.docx',
+      contentBase64: b64,
+      filename: 'ignored-for-mime.docx',
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.media.kind).toBe('path');
+    if (res.media.kind !== 'path') return;
+    expect(res.media.localPath).toBe('/tmp/desk-file.docx');
+    expect(res.media.mimeType).toMatch(/wordprocessingml|msword|octet-stream/i);
+  });
+
+  it('desk without localPath errors even if contentBase64 present', () => {
+    const res = resolveDriveUploadMedia({
+      hosted: false,
+      contentBase64: b64,
+      filename: 'only-b64.txt',
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.message).toMatch(/localPath is required on desk/);
+  });
+});
+

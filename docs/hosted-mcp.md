@@ -113,3 +113,13 @@ On Cloud Run (`MCP_HOSTED` / `K_SERVICE`), these tools return file bytes in the 
 
 Shape: `{ filename, mimeType, size, encoding: "base64", data }`. Desk/stdio still requires `savePath` and writes locally. If a caller passes `savePath` while hosted, it is ignored (optional `note` in the payload).
 
+## Hosted uploads (contentBase64)
+
+`drive_upload` on Cloud Run cannot read `localPath` (no laptop/box filesystem). Pass:
+
+- `contentBase64` — standard base64 file bytes (same encoding as the `data` field from hosted downloads)
+- `filename` — Drive display name
+- optional `mimeType`, `parentFolderId`, `convertTo`, `account`
+
+If only `localPath` is sent while hosted, the tool returns a clear error asking for `contentBase64`. When both are provided on hosted, `contentBase64` wins. Desk/stdio still requires `localPath`.
+

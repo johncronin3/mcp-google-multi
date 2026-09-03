@@ -1,3 +1,12 @@
+# Hosted drive_upload base64 (feat/hosted-drive-upload-base64)
+
+- **Hosted Cloud Run** (`isHostedHttp`): `drive_upload` accepts `contentBase64` + `filename` (+ optional mimeType, parentFolderId, convertTo, account). Bytes go straight to Drive `files.create` — no desk filesystem.
+- **Desk/stdio**: unchanged — still uses `localPath` / `createReadStream`.
+- **Hosted + only localPath**: clear error to pass `contentBase64` (does not pretend to read a laptop/box path).
+- **Hosted + both**: prefer `contentBase64`.
+- Shared: `resolveDriveUploadMedia`, `hostedUploadNeedsBase64Message`, `deskUploadNeedsLocalPathMessage`.
+- No Cloud Run deploy in this take. HAL rebuilds after merge.
+
 # Hosted return-bytes for downloads (fix/hosted-return-bytes)
 
 - **Hosted Cloud Run** (`isHostedHttp`: `MCP_HOSTED=1` / `K_SERVICE`): `gmail_download_attachment`, `drive_download`, `drive_export` return `{ filename, mimeType, size, encoding: "base64", data }` in the MCP tool result. Writing `savePath` on the container is useless to Grok Bot agents.

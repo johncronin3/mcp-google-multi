@@ -10,7 +10,9 @@ import { isAllowed, writeDisabledResult } from '../write-control.js';
 import { capText } from '../trim.js';
 import {
   deskSavePathRequiredMessage,
+  deskUploadNeedsLocalPathMessage,
   hostedBytesPayload,
+  hostedUploadNeedsBase64Message,
   isHostedHttp,
   mcpJsonResult,
 } from '../hosted.js';
@@ -41,6 +43,56 @@ const COMMENT_LIST_FIELDS = `nextPageToken,comments(${COMMENT_BASE_FIELDS},repli
 const REPLY_FIELDS = `kind,htmlContent,${REPLY_SUBFIELDS}`;
 const REPLY_LIST_FIELDS = `nextPageToken,replies(${REPLY_FIELDS})`;
 
+export type DriveUploadMediaSource =
+  | { kind: 'path'; localPath: string; mimeType: string }
+  | { kind: 'bytes'; buffer: Buffer; mimeType: string };
+
+/**
+ * Resolve drive_upload media for desk (localPath) vs hosted (contentBase64).
+ * Pure helper for unit tests — no Google API calls.
+ * Hosted prefers contentBase64 when both are provided; desk prefers localPath.
+ */
+export function resolveDriveUploadMedia(opts: {
+  hosted: boolean;
+  localPath?: string;
+  contentBase64?: string;
+  filename: string;
+  mimeTypeArg?: string;
+}): { ok: true; media: DriveUploadMediaSource } | { ok: false; message: string } {
+  const localPath = opts.localPath?.trim() || undefined;
+  const contentBase64 = opts.contentBase64?.trim() || undefined;
+  const safeName = path.basename(opts.filename);
+
+  if (opts.hosted) {
+    if (contentBase64) {
+      const buffer = Buffer.from(contentBase64, 'base64');
+      if (buffer.length === 0) {
+        return {
+          ok: false,
+          message:
+            'contentBase64 decoded to empty bytes. Pass standard base64 of the file contents.',
+        };
+      }
+      const looked = mime.lookup(safeName);
+      const mimeType =
+        opts.mimeTypeArg ?? (looked || 'application/octet-stream');
+      return { ok: true, media: { kind: 'bytes', buffer, mimeType: String(mimeType) } };
+    }
+    if (localPath) {
+      return { ok: false, message: hostedUploadNeedsBase64Message(true) };
+    }
+    return { ok: false, message: hostedUploadNeedsBase64Message(false) };
+  }
+
+  if (localPath) {
+    const looked = mime.lookup(localPath) || mime.lookup(safeName);
+    const mimeType =
+      opts.mimeTypeArg ?? (looked || 'application/octet-stream');
+    return { ok: true, media: { kind: 'path', localPath, mimeType: String(mimeType) } };
+  }
+
+  return { ok: false, message: deskUploadNeedsLocalPathMessage() };
+}
 
 function asDownloadBuffer(data: unknown): Buffer {
   if (Buffer.isBuffer(data)) return data;
@@ -265,12 +317,21 @@ export function registerDriveTools(server: ToolRegistry): void {
   server.registerTool(
     'drive_upload',
     {
-      description: 'Upload a local file to Google Drive. Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
+      description:
+        'Upload a file to Google Drive. Desk/stdio: pass localPath on local disk. ' +
+        'Hosted Cloud Run: pass contentBase64 (standard base64 bytes) — localPath is not readable on the container. ' +
+        'When both are provided on hosted, contentBase64 is preferred. ' +
+        'Pass `convertTo` to import as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        localPath: z.string().describe('Absolute path to file on disk'),
+        localPath: z.string().optional().describe(
+          'Desk only: absolute path to file on disk. On hosted Cloud Run this path is not readable — pass contentBase64 instead.',
+        ),
+        contentBase64: z.string().optional().describe(
+          'Hosted (and optional elsewhere): standard base64 encoding of the file bytes. Preferred over localPath when hosted. Matches the `data` field returned by hosted download tools.',
+        ),
         filename: z.string().describe('Name as it appears in Drive'),
-        mimeType: z.string().optional().describe('Source MIME type of the local file (inferred from extension if omitted). With `convertTo`, this is the format Drive imports from.'),
+        mimeType: z.string().optional().describe('Source MIME type (inferred from filename/localPath extension if omitted). With `convertTo`, this is the format Drive imports from.'),
         convertTo: z.enum([
           'application/vnd.google-apps.document',
           'application/vnd.google-apps.spreadsheet',
@@ -280,13 +341,29 @@ export function registerDriveTools(server: ToolRegistry): void {
         parentFolderId: z.string().optional().describe('Parent folder ID (defaults to My Drive root)'),
       },
     },
-    async ({ account, localPath, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
+    async ({ account, localPath, contentBase64, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
       try {
+        const resolved = resolveDriveUploadMedia({
+          hosted: isHostedHttp(),
+          localPath,
+          contentBase64,
+          filename,
+          mimeTypeArg,
+        });
+        if (!resolved.ok) {
+          return {
+            isError: true as const,
+            content: [{ type: 'text' as const, text: resolved.message }],
+          };
+        }
+
         const auth = await getClient(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
-        const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
-        const fileStream = fs.createReadStream(localPath);
+        const body =
+          resolved.media.kind === 'path'
+            ? fs.createReadStream(resolved.media.localPath)
+            : resolved.media.buffer;
 
         const res = await drive.files.create({
           requestBody: {
@@ -296,8 +373,8 @@ export function registerDriveTools(server: ToolRegistry): void {
             ...(convertTo ? { mimeType: convertTo } : {}),
           },
           media: {
-            mimeType: resolvedMime,
-            body: fileStream,
+            mimeType: resolved.media.mimeType,
+            body,
           },
           fields: 'id,name,mimeType,webViewLink,size',
           supportsAllDrives: true,

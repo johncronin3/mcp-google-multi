@@ -129,3 +129,24 @@ export function deskSavePathRequiredMessage(): string {
   );
 }
 
+/** Hosted upload cannot use desk localPath — callers must send base64 bytes. */
+export function hostedUploadNeedsBase64Message(localPathProvided = false): string {
+  const pathNote = localPathProvided
+    ? 'localPath was provided but is not readable on Cloud Run. '
+    : '';
+  return (
+    pathNote +
+    'Hosted Cloud Run cannot see laptop/box filesystem paths. ' +
+    'Pass contentBase64 (standard base64 file bytes) plus filename. ' +
+    'Desk/stdio still uses localPath.'
+  );
+}
+
+/** Desk/stdio upload requires localPath; hosted accepts contentBase64. */
+export function deskUploadNeedsLocalPathMessage(): string {
+  return (
+    'localPath is required on desk/stdio MCP (local filesystem). ' +
+    'On hosted Cloud Run, pass contentBase64 instead of localPath.'
+  );
+}
+
