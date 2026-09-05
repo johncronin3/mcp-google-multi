@@ -36,6 +36,7 @@ interface ToolConfig {
 const CUD_OVERRIDES: Record<string, Cud> = {
   drive_untrash: 'update',
   drive_transfer: 'create',
+  calendar_events_rsvp: 'update',
 };
 
 const SERVICE_OVERRIDES: Record<string, string> = {

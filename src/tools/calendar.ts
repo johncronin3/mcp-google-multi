@@ -7,6 +7,7 @@ import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
 import { sliceClean } from '../trim.js';
+import { registerCalendarRsvpTool } from './calendar-rsvp.js';
 
 const accountEnum = z.enum(ACCOUNTS);
 
@@ -433,6 +434,8 @@ export function registerCalendarTools(server: ToolRegistry): void {
       }
     },
   );
+
+  registerCalendarRsvpTool(server);
 }
 
 const LIST_DESCRIPTION_CAP = 300;
