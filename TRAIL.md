@@ -1,14 +1,8 @@
-# Hosted return-bytes for downloads (fix/hosted-return-bytes)
+# Calendar guest RSVP (feat/calendar-events-rsvp)
 
-- **Hosted Cloud Run** (`isHostedHttp`: `MCP_HOSTED=1` / `K_SERVICE`): `gmail_download_attachment`, `drive_download`, `drive_export` return `{ filename, mimeType, size, encoding: "base64", data }` in the MCP tool result. Writing `savePath` on the container is useless to Grok Bot agents.
-- **Desk/stdio**: unchanged — require `savePath`, write file, return path (gmail text / drive JSON).
-- **Hosted + savePath**: still return bytes; optional `note` that savePath is not applicable. Do not fail.
-- Shared helpers: `hostedBytesPayload`, `mcpJsonResult`, `deskSavePathRequiredMessage` in `src/hosted.ts`.
-- No Cloud Run deploy in this take. HAL rebuilds after merge.
-
-# Gmail attachments (feat/gmail-attachments)
-
-- **Drive `driveFileId` is the hosted path.** Cloud Run fetches bytes with Drive `files.get alt=media` on the same Google account. Upload on the desk (`drive_upload`), then pass the file id to `gmail_send` / `gmail_create_draft`.
-- **Local `path` is desktop-only.** Hosted Cloud Run cannot see laptop filesystems. A missing path returns a clear error that hosted Cloud Run cannot see laptop paths. Use `driveFileId` or `messageId`+`attachmentId` instead of `/home/...` on the hosted server.
-- **Downloads on hosted now return base64** (see above). Desk `savePath` unchanged.
-- **Do not send the Taddeo rental PDF.**
+- **Problem:** Guest Accept via `calendar_events_update` (PUT) fails — missing end time / shared properties only organizer.
+- **Fix:** New curated tool `calendar_events_rsvp` — GET event, resolve self email from `GOOGLE_ACCOUNTS`, refuse if organizer or not an attendee, then `events.patch` with `attendeesOmitted: true` + only own `{email, responseStatus}`. No start/end/summary in the body.
+- **Args:** `account`, `eventId`, `responseStatus` (`accepted|declined|tentative`), optional `calendarId` (default `primary`), optional `sendUpdates` (default `all`).
+- **Discover:** Appears under `calendar_discover` like other calendar tools (CUD override `update`).
+- **Stromback Accept:** `calendar_events_rsvp` with `account: "stromback"`, `eventId`, `responseStatus: "accepted"`.
+- No Cloud Run deploy in this take.
