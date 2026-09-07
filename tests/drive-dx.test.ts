@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { prepareLocalDest, resolveShareNotification } from '../src/tools/drive.js';
+import { Readable } from 'node:stream';
+import { prepareLocalDest, resolveShareNotification, driveFilesCreateMediaParams, driveFilesMediaGetParams } from '../src/tools/drive.js';
 import { executeApiMethod, type ApiMethodRef } from '../src/executor.js';
 
 describe('prepareLocalDest', () => {
@@ -85,5 +86,71 @@ describe('executeApiMethod binary/export steering', () => {
     const p = await payload(getMethod, { account: 'test', queryParams: { alt: 'media' } });
     expect(p.error).toBe('binary_unsupported');
     expect(p.hint).toContain('drive_download');
+  });
+});
+
+describe('Drive v22 files.create / files.get media contract', () => {
+  const created: string[] = [];
+  afterEach(() => {
+    for (const p of created.splice(0)) fs.rmSync(p, { recursive: true, force: true });
+  });
+
+  it('desk upload: createReadStream body + supportsAllDrives + convertTo on resource mimeType', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-gm-upload-'));
+    created.push(tmp);
+    const localPath = path.join(tmp, 'notes.md');
+    fs.writeFileSync(localPath, '# hello\n');
+    const body = fs.createReadStream(localPath);
+    const params = driveFilesCreateMediaParams({
+      name: 'notes',
+      mimeType: 'text/markdown',
+      body,
+      parents: ['folder-1'],
+      convertTo: 'application/vnd.google-apps.document',
+    });
+    expect(params.supportsAllDrives).toBe(true);
+    expect(params.fields).toBe('id,name,mimeType,webViewLink,size');
+    expect(params.requestBody?.name).toBe('notes');
+    expect(params.requestBody?.mimeType).toBe('application/vnd.google-apps.document');
+    expect(params.requestBody?.parents).toEqual(['folder-1']);
+    expect(params.media?.mimeType).toBe('text/markdown');
+    expect(params.media?.body).toBe(body);
+    expect(typeof (params.media?.body as NodeJS.ReadableStream).pipe).toBe('function');
+    body.destroy();
+  });
+
+  it('hosted-style upload: base64 → Buffer → Readable.from as media.body', async () => {
+    const bytes = Buffer.from('hosted-upload-bytes');
+    const contentBase64 = bytes.toString('base64');
+    const decoded = Buffer.from(contentBase64, 'base64');
+    expect(decoded.equals(bytes)).toBe(true);
+    const body = Readable.from(decoded);
+    const params = driveFilesCreateMediaParams({
+      name: 'blob.bin',
+      mimeType: 'application/octet-stream',
+      body,
+    });
+    expect(params.supportsAllDrives).toBe(true);
+    expect(params.requestBody?.mimeType).toBeUndefined();
+    expect(params.media?.body).toBe(body);
+    const chunks: Buffer[] = [];
+    for await (const chunk of body) chunks.push(Buffer.from(chunk));
+    expect(Buffer.concat(chunks).equals(bytes)).toBe(true);
+  });
+
+  it('accepts a Buffer media.body (hosted contentBase64 without wrapping)', () => {
+    const body = Buffer.from('direct-buffer');
+    const params = driveFilesCreateMediaParams({
+      name: 'direct.bin',
+      mimeType: 'application/octet-stream',
+      body,
+    });
+    expect(Buffer.isBuffer(params.media?.body)).toBe(true);
+    expect((params.media?.body as Buffer).equals(body)).toBe(true);
+  });
+
+  it('download/export get params keep alt=media and supportsAllDrives', () => {
+    const params = driveFilesMediaGetParams('file-abc');
+    expect(params).toEqual({ fileId: 'file-abc', alt: 'media', supportsAllDrives: true });
   });
 });

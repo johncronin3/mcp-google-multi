@@ -181,3 +181,13 @@ export function buildMultipartAlternative(
     body: parts.join('\r\n'),
   };
 }
+
+/** Gmail `messages.send` / `drafts.create` `raw` field: RFC822 as URL-safe unpadded base64. */
+export function encodeGmailRaw(rfc822: string): string {
+  return Buffer.from(rfc822, 'utf-8').toString('base64url');
+}
+
+/** Gmail attachment `body.data` is base64url. */
+export function decodeGmailAttachmentData(data: string): Buffer {
+  return Buffer.from(data, 'base64url');
+}

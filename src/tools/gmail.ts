@@ -6,7 +6,7 @@ import { ACCOUNTS } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
-import { buildMultipartAlternative, buildReplyHeaders, encodeAddressHeader, encodeHeaderValue, htmlToText, normalizeBodyLineEndings } from './gmail-mime.js';
+import { buildMultipartAlternative, buildReplyHeaders, decodeGmailAttachmentData, encodeAddressHeader, encodeGmailRaw, encodeHeaderValue, htmlToText, normalizeBodyLineEndings } from './gmail-mime.js';
 import { sliceClean } from '../trim.js';
 import type { GmailMessageHeader, GmailMessageFull, GmailAttachment } from '../types.js';
 import * as path from 'path';
@@ -329,7 +329,7 @@ export function registerGmailTools(server: ToolRegistry): void {
         }
 
         const rawMessage = [...headers, '', bodyText].join('\r\n');
-        const encoded = Buffer.from(rawMessage, 'utf-8').toString('base64url');
+        const encoded = encodeGmailRaw(rawMessage);
 
         const sendParams: any = {
           userId: 'me',
@@ -379,7 +379,7 @@ export function registerGmailTools(server: ToolRegistry): void {
         const data = res.data.data;
         if (!data) throw new Error('No attachment data returned');
 
-        const buffer = Buffer.from(data, 'base64url');
+        const buffer = decodeGmailAttachmentData(data);
         // Strip path components so callers can't escape savePath via "../".
         const fullPath = path.join(savePath, path.basename(filename));
         await fs.promises.writeFile(fullPath, buffer, { mode: 0o600 });
@@ -442,7 +442,7 @@ export function registerGmailTools(server: ToolRegistry): void {
         }
 
         const rawMessage = [...headers, '', bodyText].join('\r\n');
-        const encoded = Buffer.from(rawMessage, 'utf-8').toString('base64url');
+        const encoded = encodeGmailRaw(rawMessage);
 
         const draftParams: any = {
           userId: 'me',
