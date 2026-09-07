@@ -90,17 +90,8 @@ describe('executeApiMethod binary/export steering', () => {
 });
 
 describe('Drive v22 files.create / files.get media contract', () => {
-  const created: string[] = [];
-  afterEach(() => {
-    for (const p of created.splice(0)) fs.rmSync(p, { recursive: true, force: true });
-  });
-
-  it('desk upload: createReadStream body + supportsAllDrives + convertTo on resource mimeType', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-gm-upload-'));
-    created.push(tmp);
-    const localPath = path.join(tmp, 'notes.md');
-    fs.writeFileSync(localPath, '# hello\n');
-    const body = fs.createReadStream(localPath);
+  it('desk upload: stream body + supportsAllDrives + convertTo on resource mimeType', () => {
+    const body = Readable.from(Buffer.from('# hello\n'));
     const params = driveFilesCreateMediaParams({
       name: 'notes',
       mimeType: 'text/markdown',
