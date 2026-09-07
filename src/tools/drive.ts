@@ -42,6 +42,37 @@ export function prepareLocalDest(savePath: string, filename: string): string {
   return dest;
 }
 
+/** Stream (desk localPath) or Buffer (hosted contentBase64 → Readable.from). Drive 22 must keep both. */
+export type DriveUploadBody = NodeJS.ReadableStream | Buffer;
+
+/** Typed files.create media params so @googleapis/drive majors fail typecheck if upload body/fields change. */
+export function driveFilesCreateMediaParams(opts: {
+  name: string;
+  mimeType: string;
+  body: DriveUploadBody;
+  parents?: string[];
+  convertTo?: string;
+  fields?: string;
+}): drive_v3.Params$Resource$Files$Create {
+  return {
+    requestBody: {
+      name: opts.name,
+      parents: opts.parents,
+      ...(opts.convertTo ? { mimeType: opts.convertTo } : {}),
+    },
+    media: {
+      mimeType: opts.mimeType,
+      body: opts.body,
+    },
+    fields: opts.fields ?? 'id,name,mimeType,webViewLink,size',
+    supportsAllDrives: true,
+  };
+}
+
+export function driveFilesMediaGetParams(fileId: string): drive_v3.Params$Resource$Files$Get {
+  return { fileId, alt: 'media', supportsAllDrives: true };
+}
+
 // sendNotificationEmail is only valid for user/group permissions, and Google forbids
 // disabling it on an ownership transfer. Returns undefined to omit the param entirely.
 export function resolveShareNotification(opts: {
@@ -184,7 +215,7 @@ export function registerDriveTools(server: ToolRegistry): void {
 
         if (mimeType?.startsWith('text/')) {
           const downloaded = await drive.files.get(
-            { fileId, alt: 'media', supportsAllDrives: true },
+            driveFilesMediaGetParams(fileId),
             { responseType: 'text' },
           );
           return respond(String(downloaded.data));
@@ -271,20 +302,14 @@ export function registerDriveTools(server: ToolRegistry): void {
         const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
         const fileStream = fs.createReadStream(localPath);
 
-        const res = await drive.files.create({
-          requestBody: {
-            name: filename,
-            parents: parentFolderId ? [parentFolderId] : undefined,
-            // Setting a google-apps target type makes Drive convert the media on import.
-            ...(convertTo ? { mimeType: convertTo } : {}),
-          },
-          media: {
-            mimeType: resolvedMime,
-            body: fileStream,
-          },
-          fields: 'id,name,mimeType,webViewLink,size',
-          supportsAllDrives: true,
-        });
+        // Setting a google-apps target type makes Drive convert the media on import.
+        const res = await drive.files.create(driveFilesCreateMediaParams({
+          name: filename,
+          mimeType: resolvedMime,
+          body: fileStream,
+          parents: parentFolderId ? [parentFolderId] : undefined,
+          convertTo,
+        }));
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
@@ -312,7 +337,7 @@ export function registerDriveTools(server: ToolRegistry): void {
 
         const dest = prepareLocalDest(savePath, filename);
         const res = await drive.files.get(
-          { fileId, alt: 'media', supportsAllDrives: true },
+          driveFilesMediaGetParams(fileId),
           { responseType: 'stream' },
         );
 
@@ -1596,7 +1621,7 @@ async function downloadAndUpload(
       download =
         plan.kind === 'native'
           ? await sourceDrive.files.export({ fileId, mimeType: plan.exportMime }, { responseType: 'stream' })
-          : await sourceDrive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' });
+          : await sourceDrive.files.get(driveFilesMediaGetParams(fileId), { responseType: 'stream' });
     } catch (err) {
       if (plan.kind === 'native' && /too large/i.test((err as Error).message ?? '')) {
         throw new Error(
@@ -1613,19 +1638,14 @@ async function downloadAndUpload(
     }
 
     onSide('target');
-    const created = await targetDrive.files.create({
-      requestBody: {
-        name: intendedName,
-        ...(plan.kind === 'native' && plan.convertTo ? { mimeType: plan.convertTo } : {}),
-        ...(parentFolderId ? { parents: [parentFolderId] } : {}),
-      },
-      media: {
-        mimeType: plan.kind === 'native' ? plan.exportMime : (sourceMime ?? 'application/octet-stream'),
-        body: fs.createReadStream(tmp),
-      },
-      supportsAllDrives: true,
+    const created = await targetDrive.files.create(driveFilesCreateMediaParams({
+      name: intendedName,
+      mimeType: plan.kind === 'native' ? plan.exportMime : (sourceMime ?? 'application/octet-stream'),
+      body: fs.createReadStream(tmp),
+      parents: parentFolderId ? [parentFolderId] : undefined,
+      convertTo: plan.kind === 'native' && plan.convertTo ? plan.convertTo : undefined,
       fields: 'id,name,mimeType,webViewLink',
-    });
+    }));
     return created.data;
   } finally {
     await fs.promises.unlink(tmp).catch(() => {});

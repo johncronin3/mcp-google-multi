@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   encodeHeaderValue,
   encodeAddressHeader,
+  encodeGmailRaw,
+  decodeGmailAttachmentData,
   normalizeBodyLineEndings,
   buildMultipartAlternative,
   buildReplyHeaders,
@@ -310,6 +312,27 @@ describe('buildReplyHeaders', () => {
       .toEqual({ inReplyTo: 'gmailid123', references: 'gmailid123' });
     expect(buildReplyHeaders('gmailid123', '   ', '<a@x.com>'))
       .toEqual({ inReplyTo: 'gmailid123', references: 'gmailid123' });
+  });
+});
+
+describe('encodeGmailRaw / decodeGmailAttachmentData', () => {
+  it('encodes RFC822 as URL-safe unpadded base64 for messages.send', () => {
+    const rfc822 = [
+      'From: a@example.com',
+      'To: b@example.com',
+      'Subject: hi',
+      '',
+      'hello +/ world',
+    ].join('\r\n');
+    const encoded = encodeGmailRaw(rfc822);
+    expect(encoded).not.toMatch(/[+/=]/);
+    expect(Buffer.from(encoded, 'base64url').toString('utf-8')).toBe(rfc822);
+  });
+
+  it('round-trips attachment bytes the same way gmail_download_attachment decodes', () => {
+    const bytes = Buffer.from([0, 1, 2, 250, 255]);
+    const wire = bytes.toString('base64url');
+    expect(decodeGmailAttachmentData(wire).equals(bytes)).toBe(true);
   });
 });
 
