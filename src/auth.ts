@@ -6,6 +6,14 @@ import open from 'open';
 import { ACCOUNTS, ACCOUNT_CONFIG } from './accounts.js';
 import { deskMintMessage, isHostedHttp } from './hosted.js';
 import { writeToken } from './token-store.js';
+import {
+  resolveAuthUploadProject,
+  wantsSmUpload,
+  writeTokenAndUploadSm,
+  parseNamedFlag,
+  envWithProjectFlag,
+  safeErrorMessage,
+} from './token-secret.js';
 
 // Personal (non-Workspace) accounts 403 on admin scopes; ADMIN_SCOPES stays per-account opt-in, never granted by default.
 
@@ -130,7 +138,7 @@ export async function runAuthFlow(args: string[]): Promise<void> {
 
   const accountIdx = args.indexOf('--account');
   if (accountIdx === -1 || !args[accountIdx + 1]) {
-    console.error('Usage: mcp-google-multi auth --account <alias>');
+    console.error('Usage: mcp-google-multi auth --account <alias> [--upload-sm --project <gcp-project>]');
     console.error(`Valid aliases: ${ACCOUNTS.join(', ')}`);
     process.exit(1);
   }
@@ -157,6 +165,18 @@ export async function runAuthFlow(args: string[]): Promise<void> {
       'MASTER_KEY is not set. Generate one (openssl rand -base64 32) and add it to .env before authenticating.',
     );
     process.exit(1);
+  }
+
+  const uploadSm = wantsSmUpload(args);
+  if (uploadSm) {
+    try {
+      resolveAuthUploadProject(args);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(message);
+      console.error('Remint with --upload-sm is incomplete without an explicit GCP project. Desk file was not written.');
+      process.exit(1);
+    }
   }
 
   const oauth2Client = new OAuth2Client(
@@ -222,6 +242,29 @@ export async function runAuthFlow(args: string[]): Promise<void> {
 
             const { tokens } = await oauth2Client.getToken(code);
 
+            if (uploadSm) {
+              const result = await writeTokenAndUploadSm(
+                alias,
+                tokens,
+                envWithProjectFlag(args),
+                { secretId: parseNamedFlag(args, '--secret-id') },
+              );
+              res.writeHead(200, { 'Content-Type': 'text/html' });
+              res.end(
+                '<h2>Authentication successful!</h2><p>Desk token saved and Secret Manager version created. You can close this tab.</p>',
+              );
+              server.close();
+              server.closeAllConnections();
+
+              console.log(`Token saved (encrypted) for ${alias}.`);
+              console.log(`Secret Manager version: ${result.versionName}`);
+              console.log(
+                'Remint complete (desk + SM). Hosted Cloud Run still needs a remount before it serves the new refresh.',
+              );
+              resolve();
+              return;
+            }
+
             writeToken(alias, tokens);
 
             res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -237,9 +280,10 @@ export async function runAuthFlow(args: string[]): Promise<void> {
           }
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end('Internal error during authentication.');
+          res.end('Internal error during authentication. Remint is incomplete.');
           server.close();
           server.closeAllConnections();
+          console.error(safeErrorMessage(e));
           reject(e);
         }
       })

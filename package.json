@@ -50,6 +50,8 @@
     "prepublishOnly": "npm run build",
     "watch": "tsc --watch",
     "auth": "node dist/index.js auth --account",
+    "upload-sm": "node dist/index.js upload-sm",
+    "prove:google-mcp-token-secret": "tsx scripts/prove-google-mcp-token-secret.ts",
     "migrate-tokens": "node dist/index.js migrate-tokens",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
@@ -62,6 +64,7 @@
     "gen:coverage": "tsx scripts/gen-coverage.ts"
   },
   "dependencies": {
+    "@google-cloud/secret-manager": "^7.1.0",
     "@googleapis/admin": "^32.0.0",
     "@googleapis/calendar": "^16.0.0",
     "@googleapis/chat": "^46.0.0",
