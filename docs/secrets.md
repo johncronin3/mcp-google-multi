@@ -19,3 +19,5 @@ claude mcp add google-multi -s user -- ~/.local/bin/mcp-google-multi-run
 ```
 
 Now the only thing on disk is the **encrypted** token store. Pass the token via the `INFISICAL_TOKEN` env var (as above), **not** a `--token` flag, so it never shows up in `ps`. Any secrets manager works — Doppler, Vault, 1Password CLI, etc. — the pattern is the same.
+
+Hosted Cloud Run mounts per-alias encrypted `*.enc` files from Secret Manager (`google-mcp-token-<alias>`). Desk remint with `--upload-sm` is the fail-closed writer; see [Hosted MCP](./hosted-mcp.md).

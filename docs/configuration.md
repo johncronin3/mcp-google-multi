@@ -25,6 +25,8 @@ Everything is configured through environment variables (a `.env` in the working 
 | `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for `POST /mcp` (Secret Manager). Grok OAuth wraps this token only. |
 | `MCP_PUBLIC_HOST` | hosted | Public hostname (Cloud Run). Never `localhost:8787`. |
 | `MCP_HOSTED` | — | `1` force hosted (no browser, no 8000/8787/4242); `0` force desk. Cloud Run sets `K_SERVICE`. |
+| `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT` | desk SM | Explicit GCP project for desk→Secret Manager token uploads. Required when `--upload-sm` / `GOOGLE_UPLOAD_SM` is on. Never `gcloud config get-value project`. Interim pin if a comment must name one: `myflow-260730`. |
+| `GOOGLE_UPLOAD_SM` / `GOOGLE_SM_UPLOAD` | desk SM | `1`/`true`/`yes`/`on` — `auth --account` is incomplete until `google-mcp-token-<alias>` gets a new version (same as `--upload-sm`). Default off; CI stays dry/mocked. |
 
 Hosted / Grok Bot: see [hosted-mcp.md](./hosted-mcp.md) (three layers: provider credentials, MCP HTTP token, session grant).
 

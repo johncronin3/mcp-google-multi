@@ -59,6 +59,28 @@ In-process `set_grant` is for stdio/CLI; it does **not** survive another Cloud R
 
 Missing layer-1 tokens: **desk-mint error** (mint on a desk, mount `*.enc`).
 
+## Desk remint → Secret Manager (fail-closed)
+
+Hosted never remints. After a desk `auth --account <alias>`, Cloud Run still serves the previous refresh until Secret Manager `google-mcp-token-<alias>` gets a new version **and** the service remounts. A Fedora remint of `stromback.enc` that skipped SM left `google-mcp-token-stromback` on the revoked refresh (`invalid_grant`); Olga stayed green.
+
+Operator one-liner (Young Ma):
+
+```bash
+mcp-google-multi auth --account <alias> --upload-sm --project myflow-260730
+# or two-step (existing desk *.enc, no OAuth):
+mcp-google-multi upload-sm --account <alias> --project myflow-260730
+```
+
+`--upload-sm` / `GOOGLE_UPLOAD_SM=1` is fail-closed: SM error exits non-zero and reverts the desk `*.enc` to prior bytes when a prior file existed. Explicit project only (`--project` / `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT`). Never `gcloud config get-value project`. Credentials are never printed.
+
+Corner: in-repo secret id is `google-mcp-token-<alias>` (incident-confirmed for `stromback`). Cloud Run copies `*.enc` from `/mnt/tok-*` (`docker/entrypoint.sh`). A version bump is not a remount — Bulkhead remounts the secret volume (secret id + alias) before HAL `gmail_get_profile`.
+
+Prove (dry-run default, no network; `--live` is not for this PR):
+
+```bash
+npm run prove:google-mcp-token-secret -- --project <gcp-project> --alias <alias>
+```
+
 ## Grok Custom connector fields
 
 House operator runbook (catalog vs Custom, `localhost:8787` Retry → `connectors-oauth-error`, what to paste): AIC `docs/grok-custom-connector-oauth.md`.

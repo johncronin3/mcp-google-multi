@@ -75,6 +75,13 @@ async function main() {
     return;
   }
 
+  if (process.argv.includes('upload-sm')) {
+    const { runUploadSmCli } = await import('./token-secret.js');
+    const idx = process.argv.indexOf('upload-sm');
+    const code = await runUploadSmCli(process.argv.slice(idx + 1));
+    process.exit(code);
+  }
+
   if (process.argv.includes('migrate-tokens')) {
     const { runMigrateTokens } = await import('./migrate-tokens.js');
     runMigrateTokens();

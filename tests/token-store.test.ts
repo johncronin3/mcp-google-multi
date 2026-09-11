@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ACCOUNT_CONFIG } from '../src/accounts.js';
-import { deriveKey, encryptToken, decryptToken, readToken, writeToken, updateToken } from '../src/token-store.js';
+import { deriveKey, encryptToken, decryptToken, readToken, writeToken, updateToken, snapshotEncFile, restoreEncFile } from '../src/token-store.js';
 
 const KEY = 'test-master-key';
 const sample = { refresh_token: 'r', access_token: 'a', scope: 's', expiry_date: 123 };
@@ -224,5 +224,20 @@ describe('token-store crypto', () => {
     updateToken('test', { access_token: 'new', refresh_token: null, expiry_date: 456 });
 
     expect(readToken('test')).toEqual({ ...sample, access_token: 'new', expiry_date: 456 });
+  });
+
+  it('restores exact prior *.enc bytes (SM fail-closed revert)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-store-'));
+    cleanupDirs.push(dir);
+    ACCOUNT_CONFIG.test.encPath = path.join(dir, 'test.enc');
+    process.env.MASTER_KEY = KEY;
+    writeToken('test', sample);
+    const prior = snapshotEncFile('test');
+    expect(prior).toBeTruthy();
+    writeToken('test', { ...sample, access_token: 'new' });
+    expect(snapshotEncFile('test')?.equals(prior!)).toBe(false);
+    restoreEncFile('test', prior!);
+    expect(snapshotEncFile('test')?.equals(prior!)).toBe(true);
+    expect(readToken('test')).toEqual(sample);
   });
 });
