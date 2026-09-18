@@ -34,6 +34,19 @@ Google Handshake / Slice A (one hosted Connect per alias then forget) **does not
 
 **Not done:** Cloud Run deploy, Secret Manager mutate / `--live`, remint, Handshake Slice A, Partner access.
 
+## HAL yes card (do not run until John says)
+
+Checkout this branch, then:
+
+```bash
+gcloud run deploy google-multi-mcp \
+  --project=myflow-260730 \
+  --region=us-central1 \
+  --source=.
+```
+
+Region matches public host `google-multi-mcp-tdhsljvruq-uc.a.run.app`. Explicit `--project=` only. This agent did not deploy. No SM `--live`. No remint. Partner OFF.
+
 ## Call order after this stack
 
 **Desk remint (unchanged):** `--upload-sm` → snapshot prior `*.enc` → `writeToken` → fail-closed SM → version name. SM failure reverts prior bytes.
@@ -57,8 +70,8 @@ npm run prove:google-mcp-token-secret -- --project test-proj --alias stromback
 Last run on `cursor/hosted-refresh-sm-persist-4cdd` (CUT commit `2499ab2ac1572559f6072f45bad7a75e2ae5f9bb`):
 
 - `npx tsc --noEmit` exit 0 (`npm run typecheck` including scripts also exit 0)
-- Focused refresh + writer tests **50 passed** (`refresh-persist` 8, `client-refresh-persist` 2, `token-secret` 21, `token-store` 19)
-- Full **460 passed** (31 files)
+- Focused refresh + writer tests **51 passed** (`refresh-persist` 9, `client-refresh-persist` 2, `token-secret` 21, `token-store` 19)
+- Full **461 passed** (31 files)
 - `npm run build` exit 0
 - Prove dry-run `--project test-proj --alias stromback` and `--project=myflow-260730 --alias stromback` exit 0, `"network": false`
 - Missing `--project` with `GOOGLE_CLOUD_PROJECT=myflow-260730` exit 1

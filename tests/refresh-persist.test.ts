@@ -196,6 +196,29 @@ describe('hosted refresh persist (Secret Manager, no local mount write)', () => 
     expect(decryptToken(prior.toString('utf8'), KEY).refresh_token).toBe(PLANTED_OLD);
   });
 
+  it('hosted access-token-only refresh still writes SM first (every Cloud Run refresh)', async () => {
+    writeToken('test', sample);
+    const prior = snapshotEncFile('test')!;
+    const writes: { parent: string; payload: Buffer }[] = [];
+    setTokenSecretWriterForTests(async (args) => {
+      writes.push(args);
+      return { versionName: 'v-every-refresh' };
+    });
+
+    await persistRotatedTokenUpdates(
+      'test',
+      { access_token: 'a-new', expiry_date: 999 },
+      { ...process.env, MCP_HOSTED: 'true', K_SERVICE: 'google-multi-mcp', GOOGLE_CLOUD_PROJECT: 'test-proj', MASTER_KEY: KEY },
+    );
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.parent).toBe('projects/test-proj/secrets/google-mcp-token-test');
+    expect(snapshotEncFile('test')?.equals(prior)).toBe(true);
+    expect(readToken('test')?.refresh_token).toBe(PLANTED_OLD);
+    expect(readToken('test')?.access_token).toBe('a-new');
+    expect(JSON.stringify(writes[0]?.parent)).not.toContain(PLANTED_OLD);
+  });
+
   it('desk path still writes local *.enc after SM success', async () => {
     writeToken('test', sample);
     const writes: { parent: string; payload: Buffer }[] = [];

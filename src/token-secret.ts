@@ -278,6 +278,8 @@ export async function persistRotatedTokenUpdates(
   assertEncFileShape(envelope);
 
   const hosted = isHostedHttp(env);
+  // Hosted Cloud Run always SM-writes (every refresh) or throws. Local
+  // TOKEN_STORE_PATH / /mnt is never the success criterion.
   if (hosted || hasExplicitGcpProject(env)) {
     const parent = tokenSecretParent(safeAlias, env, opts.secretId);
     let versionName: string;
