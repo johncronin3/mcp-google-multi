@@ -28,7 +28,7 @@ Google Handshake / Slice A (one hosted Connect per alias then forget) **does not
 | Piece | SHA / ref |
 | --- | --- |
 | Live hosted base (PR #1 + merged #8 desk SM writer) | `feat/hosted-mcp-grok-oauth` @ `b7b1a292c74963ae87bd24977090abfdbe8d9446` |
-| This branch | `cursor/hosted-refresh-sm-persist-4cdd` |
+| This branch CUT | `cursor/hosted-refresh-sm-persist-4cdd` @ `2499ab2ac1572559f6072f45bad7a75e2ae5f9bb` |
 
 **Kept from PR #8 (do not drop):** fail-closed desk→SM writer, `google-mcp-token-<alias>` persist, explicit `GOOGLE_CLOUD_PROJECT` (never a silent gcloud ADC default), prove CLI `--project` required.
 
@@ -54,7 +54,7 @@ npm run prove:google-mcp-token-secret -- --project test-proj --alias stromback
 
 ## Test results
 
-Last run on `cursor/hosted-refresh-sm-persist-4cdd`:
+Last run on `cursor/hosted-refresh-sm-persist-4cdd` (CUT commit `2499ab2ac1572559f6072f45bad7a75e2ae5f9bb`):
 
 - `npx tsc --noEmit` exit 0 (`npm run typecheck` including scripts also exit 0)
 - Focused refresh + writer tests **50 passed** (`refresh-persist` 8, `client-refresh-persist` 2, `token-secret` 21, `token-store` 19)
