@@ -19,6 +19,25 @@ describe('mapGoogleError', () => {
     expect(e.error).toBe('insufficient_scope');
   });
 
+  it('403 accessNotConfigured → api_not_enabled with the per-API enable link', () => {
+    const e = mapGoogleError({
+      code: 403,
+      errors: [{ reason: 'accessNotConfigured' }],
+      message: 'Access Not Configured. Gmail API has not been used in project 12 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=12 then retry.',
+    }, acc);
+    expect(e.error).toBe('api_not_enabled');
+    expect(e.hint).toContain('console.cloud.google.com/apis/library/gmail.googleapis.com');
+  });
+
+  it('403 SERVICE_DISABLED (no URL) → api_not_enabled, generic library link', () => {
+    const e = mapGoogleError({
+      code: 403,
+      response: { data: { error: { status: 'PERMISSION_DENIED', message: 'Drive API is disabled. SERVICE_DISABLED' } } },
+    }, acc);
+    expect(e.error).toBe('api_not_enabled');
+    expect(e.hint).toContain('apis/library');
+  });
+
   it('403 generic → forbidden, passes the hint through', () => {
     const e = mapGoogleError({ code: 403, message: 'forbidden' }, acc, 'enable admin writes');
     expect(e.error).toBe('forbidden');
@@ -58,6 +77,48 @@ describe('mapGoogleError', () => {
     const json = JSON.stringify(e);
     expect(json).not.toContain('SECRET');
     expect(json).not.toContain('Authorization');
+  });
+
+  // Connect-level failures (no HTTP status): the gaxios path flattens the
+  // happy-eyeballs AggregateError into a bare code with an empty message.
+  it('gaxios/node-fetch empty-reason ETIMEDOUT → network_error, retriable, code surfaced', () => {
+    const e = mapGoogleError(
+      { message: 'request to https://oauth2.googleapis.com/token failed, reason: ', code: 'ETIMEDOUT', type: 'system' },
+      acc,
+    );
+    expect(e.error).toBe('network_error');
+    expect(e.retriable).toBe(true);
+    expect(e.message).toBe('request to https://oauth2.googleapis.com/token failed, reason: ETIMEDOUT');
+    expect(e.hint).toContain('network-family-autoselection');
+  });
+
+  it('undici fetch failed → network_error via cause AggregateError sub-errors', () => {
+    const e = mapGoogleError(
+      { message: 'fetch failed', cause: { message: '', errors: [{ code: 'ENETUNREACH' }, { code: 'ETIMEDOUT' }] } },
+      acc,
+    );
+    expect(e.error).toBe('network_error');
+    expect(e.retriable).toBe(true);
+    expect(e.message).toContain('ENETUNREACH');
+  });
+
+  it('ENOTFOUND (bad hostname) → network_error but not retriable', () => {
+    const e = mapGoogleError({ message: 'getaddrinfo ENOTFOUND example.invalid', code: 'ENOTFOUND' }, acc);
+    expect(e.error).toBe('network_error');
+    expect(e.retriable).toBe(false);
+    expect(e.message).toBe('getaddrinfo ENOTFOUND example.invalid');
+  });
+
+  it('a real HTTP status still wins over a network-looking cause', () => {
+    const e = mapGoogleError({ code: 503, message: 'unavailable', cause: { code: 'ECONNRESET' } }, acc);
+    expect(e.error).toBe('upstream_error');
+    expect(e.retriable).toBe(true);
+  });
+
+  it('statusless error without a network code stays upstream_error', () => {
+    const e = mapGoogleError({ message: 'something odd' }, acc);
+    expect(e.error).toBe('upstream_error');
+    expect(e.retriable).toBe(false);
   });
 
   it('reads the nested Google message + reason', () => {

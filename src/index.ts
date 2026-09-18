@@ -15,6 +15,9 @@ import { registerAccountTools } from './tools/accounts-tool.js';
 import { registerGrantTools } from './tools/grant-tools.js';
 import { getToolsets, toolsetEnabled } from './toolsets.js';
 import { resolvePolicy, isAllowed, describePolicy, type Policy } from './write-control.js';
+import { applyNetTuning } from './net-tuning.js';
+
+applyNetTuning();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf-8'));
