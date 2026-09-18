@@ -48,8 +48,7 @@ function netCodeOf(error: any): string | undefined {
   return undefined;
 }
 
-/** Console deep-link to enable one API (noob-proofing hint, B10). Needed by
- * #187's probe to classify accessNotConfigured as api_not_enabled. */
+/** Console deep-link to enable one API. Why: docs/internals.md (section-6 probe). */
 function apiEnableLink(api: string): string {
   return `https://console.cloud.google.com/apis/library/${api}.googleapis.com`;
 }
@@ -83,9 +82,7 @@ export function mapGoogleError(
     };
   }
   if (status === 403) {
-    // API not enabled for the project: a distinct, self-serve fix (enable the
-    // API) rather than a scope/permission dead-end. Prerequisite of #187's
-    // probe (bakissation B10); 7-day-trap reauth_required is not taken here.
+    // API not enabled: actionable enable-the-API, not a scope dead-end. Why: docs/internals.md.
     const notEnabled =
       reason === 'accessNotConfigured' ||
       reason === 'SERVICE_DISABLED' ||
