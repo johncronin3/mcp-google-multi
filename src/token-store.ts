@@ -65,7 +65,25 @@ function masterKey(): string {
   return process.env.MASTER_KEY ?? '';
 }
 
-export function readToken(alias: string): TokenData | null {
+/** In-memory overlay after a fail-closed SM persist. Hosted never treats disk as success. */
+const tokenOverlay = new Map<string, TokenData>();
+
+export function applyTokenUpsert(existing: object | null, updates: object): TokenData {
+  const definedUpdates = Object.fromEntries(
+    Object.entries(updates).filter(([, value]) => value !== null && value !== undefined),
+  );
+  return { ...(existing ?? {}), ...definedUpdates } as TokenData;
+}
+
+export function adoptTokenOverlay(alias: string, data: TokenData): void {
+  tokenOverlay.set(alias, { ...data });
+}
+
+export function resetTokenOverlayForTests(): void {
+  tokenOverlay.clear();
+}
+
+export function readTokenFromDisk(alias: string): TokenData | null {
   let contents: string;
   try {
     contents = fs.readFileSync(ACCOUNT_CONFIG[alias].encPath, 'utf8');
@@ -73,6 +91,12 @@ export function readToken(alias: string): TokenData | null {
     return null;
   }
   return decryptToken(contents, masterKey());
+}
+
+export function readToken(alias: string): TokenData | null {
+  const over = tokenOverlay.get(alias);
+  if (over) return { ...over };
+  return readTokenFromDisk(alias);
 }
 
 function sleep(ms: number): void {
@@ -190,11 +214,7 @@ export function writeToken(alias: string, data: object): void {
 
 export function updateToken(alias: string, updates: object): void {
   withTokenLock(alias, () => {
-    const existing = readToken(alias) ?? {};
-    const definedUpdates = Object.fromEntries(
-      Object.entries(updates).filter(([, value]) => value !== null && value !== undefined),
-    );
-    writeTokenAtomic(alias, { ...existing, ...definedUpdates });
+    writeTokenAtomic(alias, applyTokenUpsert(readTokenFromDisk(alias), updates));
   });
 }
 

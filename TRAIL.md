@@ -1,4 +1,92 @@
+# TRAIL — Hosted refresh persist via fail-closed SM writer (no local mount write)
+
+**Cloud Run held. Partner OFF. No Secret Manager `--live`. No remint. No merge.**
+
+## Production bug
+
+Hosted Google MCP on Cloud Run (`google-multi-mcp`, GCP project `myflow-260730`) already fail-closes **desk Connect remint** to Secret Manager (`google-mcp-token-<alias>`) via PR #8 / `cursor/desk-sm-token-writer-a10d` (merged into live hosted tip `feat/hosted-mcp-grok-oauth` @ `b7b1a292`). Google **refresh-token rotation** still called `updateToken` → `writeFileSync` on `TOKEN_STORE_PATH` (`/tmp/google-tokens`, copied from `/mnt/tok-*` at boot). A local/desk/mount write is not Secret Manager. HAL: Connect already SM-only is not enough; refresh must never succeed by writing a local file. PR #8 desk-writer is not enough.
+
+## What this tip is
+
+Hotfix stacked on live hosted tip `feat/hosted-mcp-grok-oauth` @ `b7b1a292c74963ae87bd24977090abfdbe8d9446` (includes merged PR #8).
+
+Refresh persist now matches Connect:
+
+1. Refresh-token shape check (opaque; refuse JWT access tokens)
+2. Encrypt v1 AES-GCM envelope
+3. In-memory upsert (no disk)
+4. Fail-closed Secret Manager write of `google-mcp-token-<alias>` (explicit GCP project; never a silent ADC default)
+5. Overlay so this process can serve the rotated row
+6. Desk/stdio may still write local `*.enc` after SM success (best-effort)
+
+Hosted / Cloud Run **never** writes `/mnt/tok-*` or `TOKEN_STORE_PATH` as a success criterion. SM failure does **not** adopt the rotated token and does **not** leave a partial disk write.
+
+Desk remint `--upload-sm` fail-closed behavior is unchanged.
+
+Google Handshake / Slice A (one hosted Connect per alias then forget) **does not exist** in this repo. QBO Handshake PR #2 is `feat/hosted-intuit-connect` @ `c90c98a`. Do not stack handshake in this cut.
+
+| Piece | SHA / ref |
+| --- | --- |
+| Live hosted base (PR #1 + merged #8 desk SM writer) | `feat/hosted-mcp-grok-oauth` @ `b7b1a292c74963ae87bd24977090abfdbe8d9446` |
+| This branch | `cursor/hosted-refresh-sm-persist-4cdd` |
+
+**Kept from PR #8 (do not drop):** fail-closed desk→SM writer, `google-mcp-token-<alias>` persist, explicit `GOOGLE_CLOUD_PROJECT` (never a silent gcloud ADC default), prove CLI `--project` required.
+
+**Not done:** Cloud Run deploy, Secret Manager mutate / `--live`, remint, Handshake Slice A, Partner access.
+
+## Call order after this stack
+
+**Desk remint (unchanged):** `--upload-sm` → snapshot prior `*.enc` → `writeToken` → fail-closed SM → version name. SM failure reverts prior bytes.
+
+**Rotation** (`getClient` → wrapped `refreshTokenNoCache` → `persistRotatedTokenUpdates`): shape check → encrypt → in-memory upsert → fail-closed SM write of `google-mcp-token-<alias>` → overlay. Hosted never writes `/mnt/tok-*` or `/tmp/google-tokens`. Desk/stdio writes `*.enc` after SM success when an explicit project is set. SM failure does **not** adopt overlay, does not write disk, and restores prior OAuth2 credentials.
+
+GCP project: `GOOGLE_CLOUD_PROJECT` (or `GCP_PROJECT` / `--project`). Never a silent gcloud ADC default. Runtime does **not** hardcode a project. Interim operator pin: `myflow-260730`. **Do not deploy. Do not run `--live`.**
+
+## How to test without a live remint
+
+```bash
+npx vitest run tests/refresh-persist.test.ts tests/client-refresh-persist.test.ts tests/token-secret.test.ts tests/token-store.test.ts
+npm run typecheck
+npm run test
+npm run build
+npm run prove:google-mcp-token-secret -- --project test-proj --alias stromback
+```
+
+## Test results
+
+Last run on `cursor/hosted-refresh-sm-persist-4cdd`:
+
+- `npx tsc --noEmit` exit 0 (`npm run typecheck` including scripts also exit 0)
+- Focused refresh + writer tests **50 passed** (`refresh-persist` 8, `client-refresh-persist` 2, `token-secret` 21, `token-store` 19)
+- Full **460 passed** (31 files)
+- `npm run build` exit 0
+- Prove dry-run `--project test-proj --alias stromback` and `--project=myflow-260730 --alias stromback` exit 0, `"network": false`
+- Missing `--project` with `GOOGLE_CLOUD_PROJECT=myflow-260730` exit 1
+- Hosted SM success → `google-mcp-token-test` written, local mount unchanged
+- Hosted/desk SM failure → no overlay, no partial disk write, rotated token not adopted
+- Desk path still writes local `*.enc` after SM success
+- **`--live` was not run. No Cloud Run. No SM mutate. No remint. Partner OFF.**
+
+## Operator steps NOT done (need John's yes)
+
+1. Merge (do **not** merge this PR)
+2. Deploy this branch to Cloud Run (do **not**)
+3. Run prove `--live` (this PR did not)
+4. Remint any live Google account
+5. Partner access
+6. Handshake Slice A / hosted Connect per alias
+7. Bulkhead remount after a live SM version bump
+
+## Constraints honored
+
+- Stacked onto live hosted tip `b7b1a292`; did not drop PR #8 desk writer or explicit project rules
+- No Cloud Run deploy, no Secret Manager mutate, no remint, no partner
+- No `gcloud config get-value project`
+- `--live` not run
+- Handshake not stacked (does not exist in this repo)
+
 # TRAIL — Fail-closed desk → Secret Manager writer for google-mcp-token-<alias>
+
 
 Branch: `cursor/desk-sm-token-writer-a10d` (off live hosted tip `feat/hosted-mcp-grok-oauth` @ `83bbc45`)
 Same permanence shape as QBO PR #5 (`persistRotatedTokens` → SM version or revert). Google-multi is per-alias `*.enc`, not a companies registry.

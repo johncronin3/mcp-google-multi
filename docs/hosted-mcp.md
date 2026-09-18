@@ -75,6 +75,10 @@ mcp-google-multi upload-sm --account <alias> --project myflow-260730
 
 Corner: in-repo secret id is `google-mcp-token-<alias>` (incident-confirmed for `stromback`). Cloud Run copies `*.enc` from `/mnt/tok-*` (`docker/entrypoint.sh`). A version bump is not a remount — Bulkhead remounts the secret volume (secret id + alias) before HAL `gmail_get_profile`.
 
+### Hosted refresh rotation
+
+Connect / desk remint to SM is not enough. Google refresh on Cloud Run must not write `/tmp/google-tokens` or `/mnt/tok-*` as success. Rotation persist is the same writer as Connect: encrypt + in-memory upsert → fail-closed Secret Manager version of `google-mcp-token-<alias>` (explicit `GOOGLE_CLOUD_PROJECT`) → overlay. SM failure does not keep the rotated token. Desk/stdio may still write local `*.enc` after SM success.
+
 Prove (dry-run default, no network; `--live` is not for this PR):
 
 ```bash

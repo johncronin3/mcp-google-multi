@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ACCOUNT_CONFIG } from '../src/accounts.js';
-import { encryptToken, snapshotEncFile, writeToken } from '../src/token-store.js';
+import { encryptToken, snapshotEncFile, writeToken, resetTokenOverlayForTests } from '../src/token-store.js';
 import {
   assertEncFileShape,
   explicitGcpProject,
@@ -41,6 +41,7 @@ afterEach(() => {
   ACCOUNT_CONFIG.test.encPath = originalPath;
   delete process.env.MASTER_KEY;
   setTokenSecretWriterForTests(undefined);
+  resetTokenOverlayForTests();
   for (const dir of cleanupDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 

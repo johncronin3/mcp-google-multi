@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ACCOUNT_CONFIG } from '../src/accounts.js';
-import { deriveKey, encryptToken, decryptToken, readToken, writeToken, updateToken, snapshotEncFile, restoreEncFile } from '../src/token-store.js';
+import { deriveKey, encryptToken, decryptToken, readToken, writeToken, updateToken, snapshotEncFile, restoreEncFile, resetTokenOverlayForTests } from '../src/token-store.js';
 
 const KEY = 'test-master-key';
 const sample = { refresh_token: 'r', access_token: 'a', scope: 's', expiry_date: 123 };
@@ -15,6 +15,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   ACCOUNT_CONFIG.test.encPath = originalPath;
   delete process.env.MASTER_KEY;
+  resetTokenOverlayForTests();
   for (const dir of cleanupDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 

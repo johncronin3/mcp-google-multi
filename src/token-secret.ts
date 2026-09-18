@@ -6,7 +6,15 @@
 
 import { ACCOUNTS, ACCOUNT_CONFIG } from './accounts.js';
 import { isHostedHttp } from './hosted.js';
-import { restoreEncFile, snapshotEncFile, writeToken } from './token-store.js';
+import {
+  adoptTokenOverlay,
+  applyTokenUpsert,
+  encryptToken,
+  readToken,
+  restoreEncFile,
+  snapshotEncFile,
+  writeToken,
+} from './token-store.js';
 
 export const GOOGLE_MCP_TOKEN_SECRET_PREFIX = 'google-mcp-token-';
 
@@ -49,6 +57,10 @@ export function parseNamedFlag(argv: string[], name: string): string | undefined
   return undefined;
 }
 
+export function hasExplicitGcpProject(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean((env.GOOGLE_CLOUD_PROJECT || '').trim() || (env.GCP_PROJECT || '').trim());
+}
+
 export function explicitGcpProject(env: NodeJS.ProcessEnv = process.env): string {
   const project =
     (env.GOOGLE_CLOUD_PROJECT || '').trim() ||
@@ -62,6 +74,20 @@ export function explicitGcpProject(env: NodeJS.ProcessEnv = process.env): string
     );
   }
   return project;
+}
+
+/** Google refresh tokens are opaque; access tokens are JWTs. Never log the value. */
+export function assertGoogleRefreshTokenShape(token: unknown): string {
+  if (typeof token !== 'string' || token.trim().length === 0) {
+    throw new Error('Refusing persist: refresh_token missing or empty');
+  }
+  const trimmed = token.trim();
+  if (trimmed.split('.').length === 3 && trimmed.startsWith('eyJ')) {
+    throw new Error(
+      'Refusing persist: value looks like an access token (JWT), not a refresh token',
+    );
+  }
+  return trimmed;
 }
 
 export function assertSafeAlias(alias: string): string {
@@ -230,6 +256,65 @@ export async function writeTokenAndUploadSm(
       { cause: err },
     );
   }
+}
+
+/**
+ * Hosted Google refresh persist. Matches Connect / QBO PR #9: shape check →
+ * encrypt → in-memory upsert → fail-closed SM write (explicit GCP project) →
+ * overlay. Never writes `/mnt` or TOKEN_STORE_PATH as success on hosted.
+ * Desk/stdio may write local `*.enc` after SM success. See docs/internals.md.
+ */
+export async function persistRotatedTokenUpdates(
+  alias: string,
+  updates: object,
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { secretId?: string; writer?: TokenSecretWriter } = {},
+): Promise<PersistResult> {
+  const safeAlias = assertSafeAlias(alias);
+  const next = applyTokenUpsert(readToken(safeAlias), updates);
+  assertGoogleRefreshTokenShape(next.refresh_token);
+  const key = (env.MASTER_KEY || process.env.MASTER_KEY || '').toString();
+  const envelope = Buffer.from(encryptToken(next, key), 'utf8');
+  assertEncFileShape(envelope);
+
+  const hosted = isHostedHttp(env);
+  if (hosted || hasExplicitGcpProject(env)) {
+    const parent = tokenSecretParent(safeAlias, env, opts.secretId);
+    let versionName: string;
+    try {
+      versionName = await addSecretVersion(parent, envelope, opts.writer);
+    } catch (err) {
+      throw new Error(
+        `Secret Manager persist of ${secretIdForAlias(safeAlias, opts.secretId)} failed; refusing to serve rotated refresh token. ${safeErrorMessage(err)}`,
+        { cause: err },
+      );
+    }
+    adoptTokenOverlay(safeAlias, next);
+    if (!hosted) {
+      try {
+        writeToken(safeAlias, next);
+      } catch {
+        /* desk I/O failed; durable persist is already SM */
+      }
+    }
+    return {
+      parent,
+      versionName,
+      alias: safeAlias,
+      secretId: secretIdForAlias(safeAlias, opts.secretId),
+      reverted: false,
+    };
+  }
+
+  writeToken(safeAlias, next);
+  adoptTokenOverlay(safeAlias, next);
+  return {
+    parent: '',
+    versionName: '',
+    alias: safeAlias,
+    secretId: secretIdForAlias(safeAlias, opts.secretId),
+    reverted: false,
+  };
 }
 
 export type UploadParseOk = {
