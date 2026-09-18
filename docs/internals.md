@@ -14,6 +14,12 @@ Hosted Cloud Run mounts per-alias secrets named `google-mcp-token-<alias>` (e.g.
 
 When `--upload-sm` / `GOOGLE_UPLOAD_SM` is on, `writeTokenAndUploadSm` snapshots prior desk bytes, writes the new envelope, then `addSecretVersion`. SM failure reverts the desk file to those prior bytes when a prior file existed — remint must not count as done if Secret Manager did not bump. Project is explicit (`--project` / `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT`); never `gcloud config get-value project`. The writer uploads encrypted `*.enc` bytes only (never decrypts, never logs payload / MASTER_KEY). Adding a secret version does not remount Cloud Run — Bulkhead remount is a separate operator step.
 
+### Hosted refresh persist (`persistRotatedTokenUpdates`, `src/token-secret.ts`)
+
+Google token rotation on Cloud Run used to call `updateToken` → `writeFileSync` on `/tmp/google-tokens` (copied from `/mnt/tok-*` at boot). A local write is not Secret Manager. Refresh must not succeed by writing `/mnt` or a desk path.
+
+`getClient` wraps `refreshTokenNoCache` so persist is awaited before the client keeps rotated credentials. Call order: shape check → encrypt v1 envelope → in-memory upsert → fail-closed `addSecretVersion` of `google-mcp-token-<alias>` (explicit GCP project; never a silent ADC default) → overlay. Hosted never writes TOKEN_STORE_PATH. Desk/stdio may write `*.enc` after SM success. SM failure does not adopt overlay and does not write disk.
+
 Interim operator pin if a comment must name a project: `myflow-260730`.
 
 ## Admin SDK
