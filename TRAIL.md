@@ -1,0 +1,255 @@
+# TRAIL — Hosted refresh persist via fail-closed SM writer (no local mount write)
+
+**Cloud Run held. Partner OFF. No Secret Manager `--live`. No remint. No merge.**
+
+## Production bug
+
+Hosted Google MCP on Cloud Run (`google-multi-mcp`, GCP project `myflow-260730`) already fail-closes **desk Connect remint** to Secret Manager (`google-mcp-token-<alias>`) via PR #8 / `cursor/desk-sm-token-writer-a10d` (merged into live hosted tip `feat/hosted-mcp-grok-oauth` @ `b7b1a292`). Google **refresh-token rotation** still called `updateToken` → `writeFileSync` on `TOKEN_STORE_PATH` (`/tmp/google-tokens`, copied from `/mnt/tok-*` at boot). A local/desk/mount write is not Secret Manager. HAL: Connect already SM-only is not enough; refresh must never succeed by writing a local file. PR #8 desk-writer is not enough.
+
+## What this tip is
+
+Hotfix stacked on live hosted tip `feat/hosted-mcp-grok-oauth` @ `b7b1a292c74963ae87bd24977090abfdbe8d9446` (includes merged PR #8).
+
+Refresh persist now matches Connect:
+
+1. Refresh-token shape check (opaque; refuse JWT access tokens)
+2. Encrypt v1 AES-GCM envelope
+3. In-memory upsert (no disk)
+4. Fail-closed Secret Manager write of `google-mcp-token-<alias>` (explicit GCP project; never a silent ADC default)
+5. Overlay so this process can serve the rotated row
+6. Desk/stdio may still write local `*.enc` after SM success (best-effort)
+
+Hosted / Cloud Run **never** writes `/mnt/tok-*` or `TOKEN_STORE_PATH` as a success criterion. SM failure does **not** adopt the rotated token and does **not** leave a partial disk write.
+
+Desk remint `--upload-sm` fail-closed behavior is unchanged.
+
+Google Handshake / Slice A (one hosted Connect per alias then forget) **does not exist** in this repo. QBO Handshake PR #2 is `feat/hosted-intuit-connect` @ `c90c98a`. Do not stack handshake in this cut.
+
+| Piece | SHA / ref |
+| --- | --- |
+| Live hosted base (PR #1 + merged #8 desk SM writer) | `feat/hosted-mcp-grok-oauth` @ `b7b1a292c74963ae87bd24977090abfdbe8d9446` |
+| This branch CUT | `cursor/hosted-refresh-sm-persist-4cdd` @ `2499ab2ac1572559f6072f45bad7a75e2ae5f9bb` |
+
+**Kept from PR #8 (do not drop):** fail-closed desk→SM writer, `google-mcp-token-<alias>` persist, explicit `GOOGLE_CLOUD_PROJECT` (never a silent gcloud ADC default), prove CLI `--project` required.
+
+**Not done:** Cloud Run deploy, Secret Manager mutate / `--live`, remint, Handshake Slice A, Partner access.
+
+## HAL yes card (do not run until John says)
+
+Checkout this branch, then:
+
+```bash
+gcloud run deploy google-multi-mcp \
+  --project=myflow-260730 \
+  --region=us-central1 \
+  --source=.
+```
+
+Region matches public host `google-multi-mcp-tdhsljvruq-uc.a.run.app`. Explicit `--project=` only. This agent did not deploy. No SM `--live`. No remint. Partner OFF.
+
+## Call order after this stack
+
+**Desk remint (unchanged):** `--upload-sm` → snapshot prior `*.enc` → `writeToken` → fail-closed SM → version name. SM failure reverts prior bytes.
+
+**Rotation** (`getClient` → wrapped `refreshTokenNoCache` → `persistRotatedTokenUpdates`): shape check → encrypt → in-memory upsert → fail-closed SM write of `google-mcp-token-<alias>` → overlay. Hosted never writes `/mnt/tok-*` or `/tmp/google-tokens`. Desk/stdio writes `*.enc` after SM success when an explicit project is set. SM failure does **not** adopt overlay, does not write disk, and restores prior OAuth2 credentials.
+
+GCP project: `GOOGLE_CLOUD_PROJECT` (or `GCP_PROJECT` / `--project`). Never a silent gcloud ADC default. Runtime does **not** hardcode a project. Interim operator pin: `myflow-260730`. **Do not deploy. Do not run `--live`.**
+
+## How to test without a live remint
+
+```bash
+npx vitest run tests/refresh-persist.test.ts tests/client-refresh-persist.test.ts tests/token-secret.test.ts tests/token-store.test.ts
+npm run typecheck
+npm run test
+npm run build
+npm run prove:google-mcp-token-secret -- --project test-proj --alias stromback
+```
+
+## Test results
+
+Last run on `cursor/hosted-refresh-sm-persist-4cdd` (CUT commit `2499ab2ac1572559f6072f45bad7a75e2ae5f9bb`):
+
+- `npx tsc --noEmit` exit 0 (`npm run typecheck` including scripts also exit 0)
+- Focused refresh + writer tests **51 passed** (`refresh-persist` 9, `client-refresh-persist` 2, `token-secret` 21, `token-store` 19)
+- Full **461 passed** (31 files)
+- `npm run build` exit 0
+- Prove dry-run `--project test-proj --alias stromback` and `--project=myflow-260730 --alias stromback` exit 0, `"network": false`
+- Missing `--project` with `GOOGLE_CLOUD_PROJECT=myflow-260730` exit 1
+- Hosted SM success → `google-mcp-token-test` written, local mount unchanged
+- Hosted/desk SM failure → no overlay, no partial disk write, rotated token not adopted
+- Desk path still writes local `*.enc` after SM success
+- **`--live` was not run. No Cloud Run. No SM mutate. No remint. Partner OFF.**
+
+## Operator steps NOT done (need John's yes)
+
+1. Merge (do **not** merge this PR)
+2. Deploy this branch to Cloud Run (do **not**)
+3. Run prove `--live` (this PR did not)
+4. Remint any live Google account
+5. Partner access
+6. Handshake Slice A / hosted Connect per alias
+7. Bulkhead remount after a live SM version bump
+
+## Constraints honored
+
+- Stacked onto live hosted tip `b7b1a292`; did not drop PR #8 desk writer or explicit project rules
+- No Cloud Run deploy, no Secret Manager mutate, no remint, no partner
+- No `gcloud config get-value project`
+- `--live` not run
+- Handshake not stacked (does not exist in this repo)
+
+# TRAIL — Fail-closed desk → Secret Manager writer for google-mcp-token-<alias>
+
+
+Branch: `cursor/desk-sm-token-writer-a10d` (off live hosted tip `feat/hosted-mcp-grok-oauth` @ `83bbc45`)
+Same permanence shape as QBO PR #5 (`persistRotatedTokens` → SM version or revert). Google-multi is per-alias `*.enc`, not a companies registry.
+
+**Not in this change:** merge, Cloud Run deploy, prove `--live`, Google remint, session grants, Dependabot #7, calendar RSVP, drive upload, Partner access.
+
+Partner OFF. Bulkhead labeled remount (secret id + alias) before HAL `gmail_get_profile` after any live ship.
+
+## What changed (Cecil)
+
+Hosted alias `stromback` (`john@stromback.com`) went `invalid_grant` after a Fedora desk remint of `stromback.enc` that revoked the refresh still held in Cloud Run secret `google-mcp-token-stromback`, because SM was never re-uploaded / remount never landed. Olga stayed green. Bleed stop is closed (SM tip bumped, remount proved). This branch makes "remint done" impossible without an SM version bump when SM upload mode is on.
+
+| Piece | Role |
+| --- | --- |
+| `src/token-secret.ts` | Explicit GCP project + `addSecretVersion` of `google-mcp-token-<alias>` from desk `*.enc` bytes. `writeTokenAndUploadSm` snapshots prior desk bytes, writes, SM; SM failure reverts prior bytes when a prior file existed. Never logs token / enc / MASTER_KEY. |
+| `src/token-store.ts` | `snapshotEncFile` / `restoreEncFile` (raw envelope bytes, not re-encrypt) |
+| `src/auth.ts` | `--upload-sm` / `GOOGLE_UPLOAD_SM` / `GOOGLE_SM_UPLOAD`: remint incomplete until SM version name returns. Project required before the browser. |
+| `src/index.ts` | `upload-sm` CLI (one alias, existing desk file, no OAuth) |
+| `src/token-secret-prove.ts` | Dry-run-default prove: `--project` **and** `--alias` required; `--live` byte-copies latest and reads **name / createTime / etag only** |
+| `scripts/prove-google-mcp-token-secret.ts` | CLI wrapper. CI must not pass `--live`. |
+| `scripts/upload-google-mcp-token-secret.ts` | Same as `mcp-google-multi upload-sm` via tsx |
+| Tests | project required, fail-closed SM error + desk revert, success metadata-only, prove dry-run / mocked `--live` |
+
+## Where (call order)
+
+Young Ma operator path:
+
+```bash
+mcp-google-multi auth --account <alias> --upload-sm --project myflow-260730
+```
+
+1. Resolve `--project` / `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT` (fail before browser if missing)
+2. Google OAuth for **that alias only**
+3. Snapshot prior desk `*.enc` bytes
+4. `writeToken` (AES-256-GCM envelope)
+5. `addSecretVersion` → `projects/$PROJECT/secrets/google-mcp-token-<alias>`
+6. Only then print version name (metadata). Remint counts as done.
+
+If step 5 fails: revert step 4 when a prior file existed, exit non-zero, **do not** treat remint as done.
+
+Two-step (desk file already written, no OAuth):
+
+```bash
+mcp-google-multi upload-sm --account <alias> --project myflow-260730
+```
+
+GCP project: `GOOGLE_CLOUD_PROJECT` (or `GCP_PROJECT` / `--project`). Never a silent gcloud ADC default. Runtime does **not** hardcode a project. If an operator script must name one, interim pin is `myflow-260730` — **do not deploy**.
+
+Default without `--upload-sm` / env gate: desk-only auth (OSS / local). CI stays dry/mocked.
+
+## Secret id naming (honest corner)
+
+In-repo / incident: Secret Manager id is `google-mcp-token-<alias>` (confirmed for `stromback` → `google-mcp-token-stromback`). `docker/entrypoint.sh` copies `*.enc` from `/mnt/tok-*` into `TOKEN_STORE_PATH=/tmp/google-tokens`. This PR did **not** inspect live Cloud Run mount maps per alias; if an alias was mounted under a different secret id, `--secret-id` overrides. A version bump is **not** a remount — existing Cloud Run instances keep the old volume until Bulkhead remounts / new revision.
+
+`--live` prove byte-copies the current SM payload (does not read desk `*.enc`, does not remint Google).
+
+## Secret Manager prove path (not executed live on this PR)
+
+Still **mocked in CI**. `--live` was not run.
+
+```bash
+# Dry-run (no network). --project and --alias are required. Does not call gcloud.
+npm run prove:google-mcp-token-secret -- --project test-proj --alias stromback
+```
+
+`--live` would: access latest payload (held in memory, never printed) → `addSecretVersion` (byte-copy of latest, no Google remint) → `getSecretVersion` metadata (name / createTime / etag only).
+
+**Do not pass `--live` until John says so.** Not for this pull request. No Cloud Run deploy. No Google remint. Partner stays off.
+
+Interim pin if a comment must name a project: `myflow-260730`.
+
+### Still mocked (this PR)
+
+- Google OAuth / `auth --account` (no remint)
+- Secret Manager `addSecretVersion` on the writer path (test seam)
+- Prove `--live` (injected fake client + mocked SM SDK; no GCP call)
+
+### Corner
+
+`--live` proves SM **write + metadata read-back**, not a full Google remint. It byte-copies the current secret so it does not clobber tokens. It does **not** call Google, does **not** remint, and does **not** run `writeTokenAndUploadSm` against production.
+
+## How to test without a live remint
+
+No Google OAuth, no Secret Manager network, no Cloud Run.
+
+```bash
+npx vitest run tests/token-secret.test.ts tests/token-secret-prove.test.ts tests/token-store.test.ts
+```
+
+Full suite:
+
+```bash
+npm run typecheck && npm run lint && npm run test && npm run build
+```
+
+Dry-run prove (required `--project` + `--alias`; no network):
+
+```bash
+npm run prove:google-mcp-token-secret -- --project test-proj --alias stromback
+```
+
+Missing `--project` exits 1 even if `GOOGLE_CLOUD_PROJECT` is set. **`--live` was not run.**
+
+Last run on this branch: focused writer **45 passed** (2 files) plus token-store **19 passed**; full **450 passed** (29 files); prove dry-run `--project test-proj --alias stromback` exit 0, no network; missing `--project` exit 1. Typecheck passed. Lint is clean on the writer files. Hosted tip already has 3 unrelated eslint errors (`src/http.ts`, `src/oauth.ts`, `tests/oauth-as.test.ts`) — not touched.
+
+What the mocks cover:
+
+- Missing `GOOGLE_CLOUD_PROJECT` throws (no silent default)
+- Missing prove `--project` exits non-zero even if `GOOGLE_CLOUD_PROJECT` is set
+- Mock `addSecretVersion` success vs `PERMISSION_DENIED` + desk revert
+- Prove dry-run never touches the SM client
+- Mocked prove `--live` reports name/createTime/etag and never the payload
+- Success reports version name only (never asserts secret payload in logs)
+
+## Later prove owner (after John says)
+
+HAL: `gmail_get_profile` on `stromback` **after** Bulkhead labeled remount of `google-mcp-token-stromback`. Partner stays off. Olga must stay green (this writer never touches other aliases).
+
+## Operator steps NOT done (need John's yes)
+
+1. Merge (do **not** merge this PR in this pass)
+2. Deploy this branch to Cloud Run (do **not**)
+3. Run prove `--live` (this PR did not)
+4. Remint any live Google account (this PR did not)
+5. Partner access
+6. Change session grants
+7. Merge Dependabot #7
+8. Bulkhead remount (secret id + alias) — required after a live SM version bump, before HAL prove
+
+## Constraints honored
+
+- No merge, no Cloud Run deploy, no `--live`, no remint
+- No session grant changes
+- No Dependabot #7
+- No `gcloud config get-value project`
+- Credentials never logged or printed
+- `--live` not run
+- Partner OFF
+
+# Hosted return-bytes for downloads (fix/hosted-return-bytes)
+
+- **Hosted Cloud Run** (`isHostedHttp`: `MCP_HOSTED=1` / `K_SERVICE`): `gmail_download_attachment`, `drive_download`, `drive_export` return `{ filename, mimeType, size, encoding: "base64", data }` in the MCP tool result. Writing `savePath` on the container is useless to Grok Bot agents.
+- **Desk/stdio**: unchanged — require `savePath`, write file, return path (gmail text / drive JSON).
+- **Hosted + savePath**: still return bytes; optional `note` that savePath is not applicable. Do not fail.
+- Shared helpers: `hostedBytesPayload`, `mcpJsonResult`, `deskSavePathRequiredMessage` in `src/hosted.ts`.
+- No Cloud Run deploy in this take. HAL rebuilds after merge.
+
+# Gmail attachments (feat/gmail-attachments)
+
+- **Drive `driveFileId` is the hosted path.** Cloud Run fetches bytes with Drive `files.get alt=media` on the same Google account. Upload on the desk (`drive_upload`), then pass the file id to `gmail_send` / `gmail_create_draft`.
+- **Local `path` is desktop-only.** Hosted Cloud Run cannot see laptop filesystems. A missing path returns a clear error that hosted Cloud Run cannot see laptop paths. Use `driveFileId` or `messageId`+`attachmentId` instead of `/home/...` on the hosted server.
+- **Downloads on hosted now return base64** (see above). Desk `savePath` unchanged.
+- **Do not send the Taddeo rental PDF.**

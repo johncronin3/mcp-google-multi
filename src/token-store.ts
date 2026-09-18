@@ -65,7 +65,25 @@ function masterKey(): string {
   return process.env.MASTER_KEY ?? '';
 }
 
-export function readToken(alias: string): TokenData | null {
+/** In-memory overlay after a fail-closed SM persist. Hosted never treats disk as success. */
+const tokenOverlay = new Map<string, TokenData>();
+
+export function applyTokenUpsert(existing: object | null, updates: object): TokenData {
+  const definedUpdates = Object.fromEntries(
+    Object.entries(updates).filter(([, value]) => value !== null && value !== undefined),
+  );
+  return { ...(existing ?? {}), ...definedUpdates } as TokenData;
+}
+
+export function adoptTokenOverlay(alias: string, data: TokenData): void {
+  tokenOverlay.set(alias, { ...data });
+}
+
+export function resetTokenOverlayForTests(): void {
+  tokenOverlay.clear();
+}
+
+export function readTokenFromDisk(alias: string): TokenData | null {
   let contents: string;
   try {
     contents = fs.readFileSync(ACCOUNT_CONFIG[alias].encPath, 'utf8');
@@ -73,6 +91,12 @@ export function readToken(alias: string): TokenData | null {
     return null;
   }
   return decryptToken(contents, masterKey());
+}
+
+export function readToken(alias: string): TokenData | null {
+  const over = tokenOverlay.get(alias);
+  if (over) return { ...over };
+  return readTokenFromDisk(alias);
 }
 
 function sleep(ms: number): void {
@@ -140,12 +164,12 @@ function withTokenLock<T>(alias: string, fn: () => T): T {
   }
 }
 
-function writeTokenAtomic(alias: string, data: object): void {
+function writeRawAtomic(alias: string, bytes: Buffer): void {
   const p = ACCOUNT_CONFIG[alias].encPath;
   const dir = path.dirname(p);
   const tmp = path.join(dir, `.${path.basename(p)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
   try {
-    fs.writeFileSync(tmp, encryptToken(data, masterKey()), { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(tmp, bytes, { mode: 0o600, flag: 'wx' });
     // Open read-write, not read-only: on Windows fsync maps to FlushFileBuffers,
     // which returns EPERM on a read-only handle.
     const fd = fs.openSync(tmp, 'r+');
@@ -163,6 +187,10 @@ function writeTokenAtomic(alias: string, data: object): void {
       // throw and mask the real write error. The orphan tmp is harmless.
     }
   }
+}
+
+function writeTokenAtomic(alias: string, data: object): void {
+  writeRawAtomic(alias, Buffer.from(encryptToken(data, masterKey()), 'utf8'));
 }
 
 // Windows only: renaming over a momentarily-open file throws transient EPERM/EACCES/EBUSY (reads take no lock); see docs/internals.md.
@@ -186,14 +214,24 @@ export function writeToken(alias: string, data: object): void {
 
 export function updateToken(alias: string, updates: object): void {
   withTokenLock(alias, () => {
-    const existing = readToken(alias) ?? {};
-    const definedUpdates = Object.fromEntries(
-      Object.entries(updates).filter(([, value]) => value !== null && value !== undefined),
-    );
-    writeTokenAtomic(alias, { ...existing, ...definedUpdates });
+    writeTokenAtomic(alias, applyTokenUpsert(readTokenFromDisk(alias), updates));
   });
 }
 
 export function hasToken(alias: string): boolean {
   return fs.existsSync(ACCOUNT_CONFIG[alias].encPath);
+}
+
+/** Raw `*.enc` bytes (never decrypt). Missing file → null. */
+export function snapshotEncFile(alias: string): Buffer | null {
+  try {
+    return fs.readFileSync(ACCOUNT_CONFIG[alias].encPath);
+  } catch {
+    return null;
+  }
+}
+
+/** Restore exact prior `*.enc` bytes after a failed SM upload. See docs/internals.md. */
+export function restoreEncFile(alias: string, bytes: Buffer): void {
+  withTokenLock(alias, () => writeRawAtomic(alias, bytes));
 }

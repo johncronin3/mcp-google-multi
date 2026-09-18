@@ -9,6 +9,8 @@ import {
   isGrantEnforced,
   loadGrantsFile,
   resetGrantsFileCache,
+  resolveGrantByName,
+  runWithGrant,
   setSessionGrant,
   grantStatusSummary,
 } from '../src/session-grant.js';
@@ -99,5 +101,29 @@ describe('session-grant', () => {
     expect(s.code_prefix).toBe(`${full.slice(0, 12)}…`);
     expect(s.code_prefix).not.toBe(full);
     expect(s.accounts).toEqual(['test']);
+  });
+
+  it('resolveGrantByName restores a slice without the code (JWT replica path)', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    clearSessionGrant();
+    expect(() => allowedAccounts()).toThrow(/No session grant/);
+    const g = resolveGrantByName('StrombackBrain2');
+    expect(g?.name).toBe('StrombackBrain2');
+    expect(g?.source).toBe('token');
+    expect(g?.code).toBe('');
+    runWithGrant(g, () => {
+      expect(allowedAccounts()).toEqual(['test']);
+      expect(grantStatusSummary().source).toBe('token');
+    });
+    // After the request, in-process memory is still empty (multi-instance).
+    expect(() => allowedAccounts()).toThrow(/No session grant/);
+  });
+
+  it('unknown grant name fails closed', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    expect(resolveGrantByName('Not A Real Grant')).toBeNull();
+    runWithGrant(null, () => {
+      expect(() => allowedAccounts()).toThrow(/No session grant/);
+    });
   });
 });

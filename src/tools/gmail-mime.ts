@@ -181,3 +181,119 @@ export function buildMultipartAlternative(
     body: parts.join('\r\n'),
   };
 }
+
+export interface MimeAttachment {
+  filename: string;
+  mimeType: string;
+  data: Buffer;
+}
+
+/** RFC 2045 §6.8: 76-char lines. */
+export function encodeBase64Mime(data: Buffer): string {
+  const b64 = data.toString('base64');
+  const lines: string[] = [];
+  for (let i = 0; i < b64.length; i += 76) {
+    lines.push(b64.slice(i, i + 76));
+  }
+  return lines.join('\r\n');
+}
+
+/** Flatten RFC 2047 folds so the value can sit in a quoted parameter. */
+function quotedFilename(filename: string): string {
+  const encoded = encodeHeaderValue(filename).replace(/\r\n /g, ' ');
+  return `"${encoded.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+export function buildAttachmentPart(att: MimeAttachment): string {
+  const filename = quotedFilename(att.filename);
+  return [
+    `Content-Type: ${att.mimeType}; name=${filename}`,
+    'Content-Transfer-Encoding: base64',
+    `Content-Disposition: attachment; filename=${filename}`,
+    '',
+    encodeBase64Mime(att.data),
+  ].join('\r\n');
+}
+
+/** multipart/mixed wrapping an existing inner body (plain or multipart/alternative) + attachments. */
+export function buildMultipartMixed(
+  innerContentType: string,
+  innerBody: string,
+  attachments: MimeAttachment[],
+): { contentType: string; body: string } {
+  const boundary = generateMimeBoundary();
+  const innerHeaders = [`Content-Type: ${innerContentType}`];
+  if (innerContentType.startsWith('text/')) {
+    innerHeaders.push('Content-Transfer-Encoding: 8bit');
+  }
+  const chunks: string[] = [
+    `--${boundary}`,
+    ...innerHeaders,
+    '',
+    innerBody,
+  ];
+  for (const att of attachments) {
+    chunks.push(`--${boundary}`, buildAttachmentPart(att));
+  }
+  chunks.push(`--${boundary}--`, '');
+  return {
+    contentType: `multipart/mixed; boundary="${boundary}"`,
+    body: chunks.join('\r\n'),
+  };
+}
+
+/** Full RFC 5322 message: headers + optional HTML alternative + optional mixed attachments. */
+export function buildRfc822Message(opts: {
+  from: string;
+  to: string;
+  subject: string;
+  body: string;
+  htmlBody?: string;
+  cc?: string;
+  inReplyTo?: string;
+  references?: string;
+  attachments?: MimeAttachment[];
+}): string {
+  const attachments = opts.attachments ?? [];
+  const headers = [
+    `From: ${encodeAddressHeader(opts.from)}`,
+    `To: ${encodeAddressHeader(opts.to)}`,
+    `Subject: ${encodeHeaderValue(opts.subject)}`,
+    'MIME-Version: 1.0',
+  ];
+  if (opts.cc) headers.push(`Cc: ${encodeAddressHeader(opts.cc)}`);
+  if (opts.inReplyTo) headers.push(`In-Reply-To: ${opts.inReplyTo}`);
+  if (opts.references) headers.push(`References: ${opts.references}`);
+
+  let contentType: string;
+  let bodyText: string;
+  if (opts.htmlBody) {
+    const alt = buildMultipartAlternative(opts.body, opts.htmlBody);
+    contentType = alt.contentType;
+    bodyText = alt.body;
+  } else {
+    contentType = 'text/plain; charset="UTF-8"';
+    bodyText = normalizeBodyLineEndings(opts.body);
+  }
+
+  if (attachments.length > 0) {
+    const mixed = buildMultipartMixed(contentType, bodyText, attachments);
+    headers.push(`Content-Type: ${mixed.contentType}`);
+    bodyText = mixed.body;
+  } else {
+    headers.push(`Content-Type: ${contentType}`);
+    if (!opts.htmlBody) {
+      headers.push('Content-Transfer-Encoding: 8bit');
+    }
+  }
+
+  return [...headers, '', bodyText].join('\r\n');
+}
+
+export function localPathUnavailableMessage(filePath: string): string {
+  return (
+    `Cannot read attachment path "${filePath}": file not found. ` +
+    `Local path is desktop-only; hosted Cloud Run cannot see laptop paths. ` +
+    `Use driveFileId (Drive is the hosted path) or messageId+attachmentId to copy from Gmail.`
+  );
+}

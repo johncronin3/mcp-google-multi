@@ -8,6 +8,12 @@ import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
 import { capText } from '../trim.js';
+import {
+  deskSavePathRequiredMessage,
+  hostedBytesPayload,
+  isHostedHttp,
+  mcpJsonResult,
+} from '../hosted.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -34,6 +40,17 @@ const COMMENT_FIELDS = `${COMMENT_BASE_FIELDS},replies(${REPLY_SUBFIELDS})`;
 const COMMENT_LIST_FIELDS = `nextPageToken,comments(${COMMENT_BASE_FIELDS},replies(${REPLY_SUBFIELDS}))`;
 const REPLY_FIELDS = `kind,htmlContent,${REPLY_SUBFIELDS}`;
 const REPLY_LIST_FIELDS = `nextPageToken,replies(${REPLY_FIELDS})`;
+
+
+function asDownloadBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (typeof data === 'string') return Buffer.from(data, 'binary');
+  throw new Error('Drive download returned no binary data');
+}
 
 // path.basename() is a traversal guard — a caller-supplied filename must never escape savePath.
 export function prepareLocalDest(savePath: string, filename: string): string {
@@ -297,11 +314,16 @@ export function registerDriveTools(server: ToolRegistry): void {
   server.registerTool(
     'drive_download',
     {
-      description: 'Download a binary file from Drive to local disk. For Google Workspace formats (Docs, Sheets, Slides), use drive_export instead.',
+      description:
+        'Download a binary file from Drive. Desk/stdio: writes to savePath on local disk. ' +
+        'Hosted Cloud Run: returns base64 bytes in the MCP result (savePath ignored). ' +
+        'For Google Workspace formats (Docs, Sheets, Slides), use drive_export instead.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID'),
-        savePath: z.string().describe('Absolute directory path to save into'),
+        savePath: z.string().optional().describe(
+          'Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result.',
+        ),
         filename: z.string().describe('Filename to save as'),
       },
     },
@@ -309,6 +331,32 @@ export function registerDriveTools(server: ToolRegistry): void {
       try {
         const auth = await getClient(account as Account);
         const drive = driveClient({ version: 'v3', auth });
+        const safeName = path.basename(filename);
+        const looked = mime.lookup(safeName);
+        const mimeType = (looked || 'application/octet-stream') as string;
+
+        if (isHostedHttp()) {
+          const res = await drive.files.get(
+            { fileId, alt: 'media', supportsAllDrives: true },
+            { responseType: 'arraybuffer' },
+          );
+          const buffer = asDownloadBuffer(res.data);
+          return mcpJsonResult(
+            hostedBytesPayload({
+              filename: safeName,
+              mimeType,
+              data: buffer,
+              savePathProvided: Boolean(savePath),
+            }),
+          );
+        }
+
+        if (!savePath) {
+          return {
+            isError: true as const,
+            content: [{ type: 'text' as const, text: deskSavePathRequiredMessage() }],
+          };
+        }
 
         const dest = prepareLocalDest(savePath, filename);
         const res = await drive.files.get(
@@ -332,12 +380,17 @@ export function registerDriveTools(server: ToolRegistry): void {
   server.registerTool(
     'drive_export',
     {
-      description: 'Export a Google Workspace document (Doc, Sheet, Slide) to a standard format and save to disk. Supported: PDF, DOCX, XLSX, PPTX, TXT, CSV, Markdown (text/markdown for Docs).',
+      description:
+        'Export a Google Workspace document (Doc, Sheet, Slide) to a standard format. ' +
+        'Desk/stdio: saves to savePath on local disk. Hosted Cloud Run: returns base64 bytes in the MCP result (savePath ignored). ' +
+        'Supported: PDF, DOCX, XLSX, PPTX, TXT, CSV, Markdown (text/markdown for Docs).',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID'),
         mimeType: z.string().describe('Target export MIME type (e.g. "application/pdf", "text/markdown", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")'),
-        savePath: z.string().describe('Absolute directory path to save into'),
+        savePath: z.string().optional().describe(
+          'Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result.',
+        ),
         filename: z.string().describe('Filename to save as'),
       },
     },
@@ -345,6 +398,30 @@ export function registerDriveTools(server: ToolRegistry): void {
       try {
         const auth = await getClient(account as Account);
         const drive = driveClient({ version: 'v3', auth });
+        const safeName = path.basename(filename);
+
+        if (isHostedHttp()) {
+          const res = await drive.files.export(
+            { fileId, mimeType: exportMime },
+            { responseType: 'arraybuffer' },
+          );
+          const buffer = asDownloadBuffer(res.data);
+          return mcpJsonResult(
+            hostedBytesPayload({
+              filename: safeName,
+              mimeType: exportMime,
+              data: buffer,
+              savePathProvided: Boolean(savePath),
+            }),
+          );
+        }
+
+        if (!savePath) {
+          return {
+            isError: true as const,
+            content: [{ type: 'text' as const, text: deskSavePathRequiredMessage() }],
+          };
+        }
 
         const dest = prepareLocalDest(savePath, filename);
         const res = await drive.files.export(

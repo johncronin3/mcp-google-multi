@@ -3,6 +3,7 @@ import type { ToolRegistry } from '../registry.js';
 import { ACCOUNTS, ACCOUNT_CONFIG } from '../accounts.js';
 import { getAdminAccounts, resolveScopesForAccount } from '../auth.js';
 import { allowedAccounts, isGrantEnforced } from '../session-grant.js';
+import { deskMintMessage, isHostedHttp } from '../hosted.js';
 import { hasToken, readToken } from '../token-store.js';
 
 export interface AccountHealthDeps {
@@ -44,7 +45,9 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
         status: 'missing',
         hint: legacy
           ? 'Plaintext token.json found — run: npx mcp-google-multi migrate-tokens'
-          : `Run: npx mcp-google-multi auth --account ${alias}`,
+          : isHostedHttp()
+            ? deskMintMessage(alias, config.email)
+            : `Run: npx mcp-google-multi auth --account ${alias}`,
       },
       scopes: noScopes,
     };
@@ -78,7 +81,9 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
       expiryDate: expiry !== undefined ? new Date(expiry).toISOString() : undefined,
       hint:
         status === 'needs_reauth'
-          ? `Run: npx mcp-google-multi auth --account ${alias}`
+          ? isHostedHttp()
+            ? deskMintMessage(alias, config.email)
+            : `Run: npx mcp-google-multi auth --account ${alias}`
           : missing.length > 0
             ? 'Re-auth to grant the missing scopes'
             : undefined,
