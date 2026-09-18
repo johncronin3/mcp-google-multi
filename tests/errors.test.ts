@@ -19,6 +19,25 @@ describe('mapGoogleError', () => {
     expect(e.error).toBe('insufficient_scope');
   });
 
+  it('403 accessNotConfigured → api_not_enabled with the per-API enable link', () => {
+    const e = mapGoogleError({
+      code: 403,
+      errors: [{ reason: 'accessNotConfigured' }],
+      message: 'Access Not Configured. Gmail API has not been used in project 12 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=12 then retry.',
+    }, acc);
+    expect(e.error).toBe('api_not_enabled');
+    expect(e.hint).toContain('console.cloud.google.com/apis/library/gmail.googleapis.com');
+  });
+
+  it('403 SERVICE_DISABLED (no URL) → api_not_enabled, generic library link', () => {
+    const e = mapGoogleError({
+      code: 403,
+      response: { data: { error: { status: 'PERMISSION_DENIED', message: 'Drive API is disabled. SERVICE_DISABLED' } } },
+    }, acc);
+    expect(e.error).toBe('api_not_enabled');
+    expect(e.hint).toContain('apis/library');
+  });
+
   it('403 generic → forbidden, passes the hint through', () => {
     const e = mapGoogleError({ code: 403, message: 'forbidden' }, acc, 'enable admin writes');
     expect(e.error).toBe('forbidden');

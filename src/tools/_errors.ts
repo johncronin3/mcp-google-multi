@@ -48,6 +48,22 @@ function netCodeOf(error: any): string | undefined {
   return undefined;
 }
 
+/** Console deep-link to enable one API (noob-proofing hint, B10). Needed by
+ * #187's probe to classify accessNotConfigured as api_not_enabled. */
+function apiEnableLink(api: string): string {
+  return `https://console.cloud.google.com/apis/library/${api}.googleapis.com`;
+}
+
+/** Extract the disabled API id from an accessNotConfigured / SERVICE_DISABLED
+ * error so the hint can deep-link straight to its enable page. */
+function disabledApiId(message: string): string | null {
+  const url = message.match(/\/apis\/api\/([a-z0-9-]+)\.googleapis\.com/i);
+  if (url) return url[1].toLowerCase();
+  const named = message.match(/\b([A-Za-z][A-Za-z0-9 ]*?) API has not been used/);
+  if (named) return named[1].trim().toLowerCase().replace(/\s+/g, '');
+  return null;
+}
+
 export function mapGoogleError(
   error: any,
   account: Account,
@@ -67,6 +83,25 @@ export function mapGoogleError(
     };
   }
   if (status === 403) {
+    // API not enabled for the project: a distinct, self-serve fix (enable the
+    // API) rather than a scope/permission dead-end. Prerequisite of #187's
+    // probe (bakissation B10); 7-day-trap reauth_required is not taken here.
+    const notEnabled =
+      reason === 'accessNotConfigured' ||
+      reason === 'SERVICE_DISABLED' ||
+      /has not been used in project|accessNotConfigured|SERVICE_DISABLED|it is disabled/i.test(message);
+    if (notEnabled) {
+      const api = disabledApiId(message);
+      return {
+        error: 'api_not_enabled',
+        message,
+        hint: api
+          ? `Enable this API for your project: ${apiEnableLink(api)}`
+          : 'Enable the API for your project at https://console.cloud.google.com/apis/library',
+        retriable: false,
+        account,
+      };
+    }
     const scopeIssue =
       reason === 'insufficientPermissions' ||
       reason === 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' ||
