@@ -16,6 +16,8 @@ import { registerGrantTools } from './tools/grant-tools.js';
 import { getToolsets, toolsetEnabled } from './toolsets.js';
 import { resolvePolicy, isAllowed, describePolicy, type Policy } from './write-control.js';
 import { applyNetTuning } from './net-tuning.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { argNormalizationEnabled, withArgNormalization } from './arg-normalize.js';
 
 applyNetTuning();
 
@@ -128,13 +130,20 @@ async function main() {
     return;
   }
 
-  const server = buildGoogleMcpServer();
-  const transport = new StdioServerTransport();
+  const { server, registry } = buildGoogleMcp();
+  const transport = wrapArgTransport(new StdioServerTransport(), registry);
   await server.connect(transport);
 }
 
-/** MCP server with the same tools as stdio. Does not bind a transport. */
-export function buildGoogleMcpServer(): McpServer {
+/** Wrap stdio / Streamable HTTP transports so tools/call keys normalize before SDK validation. */
+export function wrapArgTransport(transport: Transport, registry: ToolRegistry): Transport {
+  return argNormalizationEnabled()
+    ? withArgNormalization(transport, (n) => registry.argShape(n))
+    : transport;
+}
+
+/** MCP server + registry. Does not bind a transport. */
+export function buildGoogleMcp(): { server: McpServer; registry: ToolRegistry } {
   const policy = resolvePolicy();
   const server = new McpServer({
     name: 'mcp-google-multi',
@@ -149,7 +158,12 @@ export function buildGoogleMcpServer(): McpServer {
     process.stderr.write(`GOOGLE_REVEAL_AT_BOOT: listing ${bootRevealed.join(', ')}\n`);
   }
   registry.installListHandler();
-  return server;
+  return { server, registry };
+}
+
+/** MCP server with the same tools as stdio. Does not bind a transport. */
+export function buildGoogleMcpServer(): McpServer {
+  return buildGoogleMcp().server;
 }
 
 const startedAsCli =
