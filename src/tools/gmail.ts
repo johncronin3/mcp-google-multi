@@ -7,6 +7,7 @@ import { ACCOUNTS } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
+import { prepareLocalDest } from './_local-files.js';
 import {
   deskSavePathRequiredMessage,
   hostedBytesPayload,
@@ -597,8 +598,7 @@ export function registerGmailTools(server: ToolRegistry): void {
           };
         }
 
-        // Strip path components so callers can't escape savePath via "../".
-        const fullPath = path.join(savePath, safeName);
+        const fullPath = prepareLocalDest(savePath, filename);
         await fs.promises.writeFile(fullPath, buffer, { mode: 0o600 });
 
         return {

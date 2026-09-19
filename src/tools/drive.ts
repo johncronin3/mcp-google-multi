@@ -6,6 +6,7 @@ import { ACCOUNTS, ACCOUNT_CONFIG } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
+import { openLocalReadStream, prepareLocalDest } from './_local-files.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
 import { capText } from '../trim.js';
 import {
@@ -41,7 +42,6 @@ const COMMENT_LIST_FIELDS = `nextPageToken,comments(${COMMENT_BASE_FIELDS},repli
 const REPLY_FIELDS = `kind,htmlContent,${REPLY_SUBFIELDS}`;
 const REPLY_LIST_FIELDS = `nextPageToken,replies(${REPLY_FIELDS})`;
 
-
 function asDownloadBuffer(data: unknown): Buffer {
   if (Buffer.isBuffer(data)) return data;
   if (data instanceof ArrayBuffer) return Buffer.from(data);
@@ -50,13 +50,6 @@ function asDownloadBuffer(data: unknown): Buffer {
   }
   if (typeof data === 'string') return Buffer.from(data, 'binary');
   throw new Error('Drive download returned no binary data');
-}
-
-// path.basename() is a traversal guard — a caller-supplied filename must never escape savePath.
-export function prepareLocalDest(savePath: string, filename: string): string {
-  const dest = path.join(savePath, path.basename(filename));
-  fs.mkdirSync(savePath, { recursive: true });
-  return dest;
 }
 
 // sendNotificationEmail is only valid for user/group permissions, and Google forbids
@@ -286,7 +279,7 @@ export function registerDriveTools(server: ToolRegistry): void {
         const drive = driveClient({ version: 'v3', auth });
 
         const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
-        const fileStream = fs.createReadStream(localPath);
+        const fileStream = await openLocalReadStream(localPath);
 
         const res = await drive.files.create({
           requestBody: {
@@ -517,7 +510,7 @@ export function registerDriveTools(server: ToolRegistry): void {
         if (localPathArg) {
           params.media = {
             mimeType: mimeTypeArg ?? (mime.lookup(localPathArg) || 'application/octet-stream'),
-            body: fs.createReadStream(localPathArg),
+            body: await openLocalReadStream(localPathArg),
           };
           if (convertTo) requestBody.mimeType = convertTo;
         }
@@ -1698,7 +1691,7 @@ async function downloadAndUpload(
       },
       media: {
         mimeType: plan.kind === 'native' ? plan.exportMime : (sourceMime ?? 'application/octet-stream'),
-        body: fs.createReadStream(tmp),
+        body: await openLocalReadStream(tmp),
       },
       supportsAllDrives: true,
       fields: 'id,name,mimeType,webViewLink',
