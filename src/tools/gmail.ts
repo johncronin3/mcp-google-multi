@@ -556,7 +556,7 @@ export function registerGmailTools(server: ToolRegistry): void {
         attachmentId: z.string().describe('The attachment ID from gmail_read response'),
         filename: z.string().describe('Filename to save as (e.g. report.xlsx)'),
         savePath: z.string().optional().describe(
-          'Desk only: absolute directory path to save into (e.g. /home/user/Downloads). ' +
+          'Desk only: absolute DIRECTORY path to save into (created if missing, on the machine running the server), e.g. /home/user/Downloads. ' +
           'Ignored on hosted Cloud Run — bytes are returned in the tool result.',
         ),
       },
