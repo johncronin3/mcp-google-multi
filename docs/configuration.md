@@ -20,6 +20,7 @@ Everything is configured through environment variables (a `.env` in the working 
 | `DISCOVERY_CACHE_PATH` | — | override the Discovery-doc cache dir (default: `$XDG_CONFIG_HOME/mcp-google-multi/discovery`, falling back to `~/.config/mcp-google-multi/discovery`) |
 | `GOOGLE_TRIM` | — | `off` (or `0`/`false`/`no`) disables compact JSON serialization of tool responses |
 | `GOOGLE_ARG_NORMALIZE` | — | `off` (or `0`/`false`/`no`) disables tools/call argument-key normalization (snake_case → declared camelCase when unambiguous; each rename logs one line to stderr). Applies to stdio and house Streamable HTTP. |
+| `GOOGLE_ARG_UNKNOWN` | `warn` | what to do with a `tools/call` argument the tool does not declare: `warn` logs it to stderr and drops it as before, `reject` refuses the call with a typed `unknown_argument` error naming the likely intended parameter, `off` restores the silent 5.x drop. Keys starting with `_`, keys containing `/`, and tools that declare no arguments are never screened. |
 | `GOOGLE_GRANTS_PATH` | — | host-local grants file (default: `~/.config/mcp-google-multi/grants.json`) — see [Session grants](#session-grants-my-flowstyle) |
 | `GOOGLE_GRANTS_ENFORCE` | — | `true` force fail-closed grants; `false` disable even if grants file exists; default = enforce when file has ≥1 grant |
 | `GOOGLE_GRANT_CODE` | — | optional process-wide fallback code (prefer session tool `set_grant` or Grok OAuth-bound grant) |

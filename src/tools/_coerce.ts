@@ -22,6 +22,9 @@ export function coerceJson<T extends z.ZodTypeAny>(schema: T) {
   return z.preprocess((val) => (typeof val === 'string' ? parseJsonLoose(val) : val), schema);
 }
 
+/** Array/object/bool coercion lives in the schema because arg normalization
+ * runs on BOTH transports but only coerces keys it RENAMED — a value sent
+ * under the correct key never passes through it. */
 export const coerceBoolean = z.preprocess((val) => {
   if (typeof val === 'boolean') return val;
   if (typeof val === 'string') {

@@ -17,12 +17,25 @@ import { getToolsets, toolsetEnabled } from './toolsets.js';
 import { resolvePolicy, isAllowed, describePolicy, type Policy } from './write-control.js';
 import { applyNetTuning } from './net-tuning.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { argNormalizationEnabled, withArgNormalization } from './arg-normalize.js';
+import { argNormalizationEnabled, withArgNormalization, type StrictArgOptions } from './arg-normalize.js';
+import { unknownArgMode } from './arg-strict.js';
 
 applyNetTuning();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf-8'));
+
+/** Unknown-argument screening options, or undefined when the feature is off.
+ * Shared by stdio and house Streamable HTTP so a mistyped argument behaves identically. */
+function strictArgOptions(registry: ToolRegistry): StrictArgOptions | undefined {
+  const mode = unknownArgMode();
+  if (mode === 'off') return undefined;
+  return {
+    mode,
+    declaredFor: (tool) => registry.declaredKeys(tool),
+    siblingsFor: (tool, keys) => registry.siblingSpellings(tool, keys),
+  };
+}
 
 function buildRegistry(server: McpServer, policy: Policy): ToolRegistry {
   const registry = new ToolRegistry(server, policy);
@@ -137,9 +150,14 @@ async function main() {
 
 /** Wrap stdio / Streamable HTTP transports so tools/call keys normalize before SDK validation. */
 export function wrapArgTransport(transport: Transport, registry: ToolRegistry): Transport {
-  return argNormalizationEnabled()
-    ? withArgNormalization(transport, (n) => registry.argShape(n))
-    : transport;
+  const strict = strictArgOptions(registry);
+  if (!argNormalizationEnabled() && !strict) return transport;
+  return withArgNormalization(
+    transport,
+    (n) => registry.argShape(n),
+    undefined,
+    strict,
+  );
 }
 
 /** MCP server + registry. Does not bind a transport. */
