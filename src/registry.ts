@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { type Policy, isAllowed, writeDisabledResult } from './write-control.js';
 import { compactResult, trimEnabled } from './trim.js';
 import { fanoutAccountField, invalidAccountsResult, parseAccountSelector, runFanout } from './fanout.js';
+import type { ArgKind, ArgShape } from './arg-normalize.js';
+import { suggestKeys } from './arg-strict.js';
 
 export type Cud = 'read' | 'create' | 'update' | 'delete';
 
@@ -47,6 +49,23 @@ const SERVICE_OVERRIDES: Record<string, string> = {
 // read tools that write local files — same savePath fanned across accounts would clobber
 const FANOUT_EXCLUDE = new Set(['gmail_download_attachment', 'drive_download', 'drive_export']);
 
+/** Unwrap optional/default/nullable to the declared scalar kind (zod 4 defs). */
+function scalarKindOf(field: unknown): ArgKind {
+  type Def = { type?: string; innerType?: unknown };
+  let cur = field as { _zod?: { def?: Def } } | undefined;
+  for (let i = 0; i < 4 && cur?._zod?.def; i++) {
+    const def = cur._zod.def;
+    if (def.type === 'number') return 'number';
+    if (def.type === 'boolean') return 'boolean';
+    if (def.type === 'optional' || def.type === 'default' || def.type === 'nullable') {
+      cur = def.innerType as typeof cur;
+      continue;
+    }
+    return 'other';
+  }
+  return 'other';
+}
+
 function isAccountEnum(field: unknown): boolean {
   return (field as { _zod?: { def?: { type?: string } } } | undefined)?._zod?.def?.type === 'enum';
 }
@@ -70,6 +89,7 @@ export class ToolRegistry {
   readonly registerTool: McpServer['registerTool'];
   private readonly revealed = new Set<string>();
   private readonly jsonSchemaCache = new Map<string, unknown>();
+  private readonly argShapeCache = new Map<string, ArgShape>();
   private readonly compactOutput = trimEnabled();
   private registeringMeta = false;
 
@@ -139,6 +159,58 @@ export class ToolRegistry {
 
   services(): string[] {
     return [...new Set(this.tools.filter((t) => !t.meta).map((t) => t.service))];
+  }
+
+  /** Declared input-schema keys + scalar kinds for one tool (tools/call arg
+   * normalization; the kind drives value coercion on renamed keys). */
+  argShape(name: string): ArgShape | undefined {
+    const cached = this.argShapeCache.get(name);
+    if (cached) return cached;
+    const entry = this.tools.find((t) => t.name === name);
+    if (!entry) return undefined;
+    const shape = new Map<string, ArgKind>();
+    for (const [key, field] of Object.entries(entry.inputShape)) shape.set(key, scalarKindOf(field));
+    this.argShapeCache.set(name, shape);
+    return shape;
+  }
+
+  /** Declared argument keys for a tool, in declaration order; undefined when
+   * the tool is not registered. Backs unknown-argument screening, which needs
+   * the full key list rather than argShape's scalar-kind subset view. */
+  declaredKeys(name: string): readonly string[] | undefined {
+    const entry = this.tools.find((t) => t.name === name);
+    return entry ? Object.keys(entry.inputShape) : undefined;
+  }
+
+  /** Keys spelling a similar concept elsewhere in the same service, for the
+   * hint on a call whose key matched nothing. Kept only when a key is declared
+   * by at least two tools in the service or by a curated one, so one-off
+   * generated parameters do not become advice. */
+  siblingSpellings(tool: string, unknownKeys: string[]): Array<{ key: string; tools: string[] }> {
+    const self = this.tools.find((t) => t.name === tool);
+    if (!self) return [];
+    const declared = new Set(Object.keys(self.inputShape));
+    const byKey = new Map<string, { tools: string[]; curated: boolean }>();
+    for (const t of this.tools) {
+      if (t.service !== self.service || t.name === tool) continue;
+      for (const key of Object.keys(t.inputShape)) {
+        if (declared.has(key)) continue;
+        const e = byKey.get(key) ?? { tools: [], curated: false };
+        e.tools.push(t.name);
+        if (!t.meta) e.curated = true;
+        byKey.set(key, e);
+      }
+    }
+    const candidates = [...byKey.entries()].filter(([, e]) => e.tools.length >= 2 || e.curated);
+    // Reuse the tiered matcher rather than a substring test: the motivating
+    // case (parentId against parentFolderId) fails containment and edit
+    // distance alike, which is the whole reason that matcher exists.
+    const keys = candidates.map(([key]) => key);
+    const hits = new Set(unknownKeys.flatMap((k) => suggestKeys(k, keys)));
+    return candidates
+      .filter(([key]) => hits.has(key))
+      .slice(0, 2)
+      .map(([key, e]) => ({ key, tools: e.tools }));
   }
 
   catalog(service: string, query?: string): CatalogOperation[] {

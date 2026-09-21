@@ -20,7 +20,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { buildGoogleMcpServer } from './index.js';
+import { buildGoogleMcp, wrapArgTransport } from './index.js';
 import {
   DEFAULT_PUBLIC_MCP_HOST,
   EXTRA_PUBLIC_HOSTS,
@@ -166,7 +166,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
     return;
   }
 
-  const mcp = buildGoogleMcpServer();
+  const { server: mcp, registry } = buildGoogleMcp();
   const pub = publicMcpHost();
   // Some SDK versions treat missing Origin as invalid when allowedOrigins is set.
   const transport = new StreamableHTTPServerTransport({
@@ -175,7 +175,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
     allowedHosts: [hostHeader, pub, `${pub}:443`, 'localhost', '127.0.0.1', '[::1]'],
     ...(originHeader ? { allowedOrigins: [...allowedOrigins(), originHeader] } : {}),
   });
-  await mcp.connect(transport);
+  await mcp.connect(wrapArgTransport(transport, registry));
   await transport.handleRequest(req, res);
 }
 

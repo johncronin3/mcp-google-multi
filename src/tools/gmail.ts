@@ -7,6 +7,7 @@ import { ACCOUNTS } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
+import { prepareLocalDest } from './_local-files.js';
 import {
   deskSavePathRequiredMessage,
   hostedBytesPayload,
@@ -555,7 +556,7 @@ export function registerGmailTools(server: ToolRegistry): void {
         attachmentId: z.string().describe('The attachment ID from gmail_read response'),
         filename: z.string().describe('Filename to save as (e.g. report.xlsx)'),
         savePath: z.string().optional().describe(
-          'Desk only: absolute directory path to save into (e.g. /home/user/Downloads). ' +
+          'Desk only: absolute DIRECTORY path to save into (created if missing, on the machine running the server), e.g. /home/user/Downloads. ' +
           'Ignored on hosted Cloud Run — bytes are returned in the tool result.',
         ),
       },
@@ -597,8 +598,7 @@ export function registerGmailTools(server: ToolRegistry): void {
           };
         }
 
-        // Strip path components so callers can't escape savePath via "../".
-        const fullPath = path.join(savePath, safeName);
+        const fullPath = prepareLocalDest(savePath, filename);
         await fs.promises.writeFile(fullPath, buffer, { mode: 0o600 });
 
         return {

@@ -6,6 +6,7 @@ import { ACCOUNTS, ACCOUNT_CONFIG } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
+import { openLocalReadStream, prepareLocalDest } from './_local-files.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
 import { capText } from '../trim.js';
 import {
@@ -33,6 +34,53 @@ const GOOGLE_WORKSPACE_TYPES = new Set([
   'application/vnd.google-apps.drawing',
 ]);
 
+// drive_read inlines only textual content. Beyond text/*, RFC 6839 structured-
+// syntax suffixes (+json/+xml/...) and a few bare application/* types are text
+// in practice — image/svg+xml was the motivating false "binary" refusal.
+const TEXTUAL_EXACT = new Set([
+  'application/json',
+  'application/xml',
+  'application/javascript',
+  'application/x-ndjson',
+  'application/yaml',
+  'application/x-yaml',
+  'application/sql',
+  'application/x-sh',
+  'application/csv',
+]);
+export function isTextualMime(mimeType: string): boolean {
+  const bare = mimeType.split(';')[0].trim().toLowerCase();
+  if (bare.startsWith('text/')) return true;
+  if (/\+(json|xml|yaml|toml|csv)$/.test(bare)) return true;
+  return TEXTUAL_EXACT.has(bare);
+}
+
+const BINARY_READ_HINT =
+  'Binary content cannot be inlined. Use drive_download to save the file to disk, or drive_export for Google Workspace files.';
+
+// Accepted alongside the full application/vnd.google-apps.* ids so the obvious
+// short spelling ("document") works; the enum advertises both.
+const CONVERT_SHORTHANDS: Record<string, string> = {
+  document: 'application/vnd.google-apps.document',
+  spreadsheet: 'application/vnd.google-apps.spreadsheet',
+  presentation: 'application/vnd.google-apps.presentation',
+  drawing: 'application/vnd.google-apps.drawing',
+};
+export function resolveConvertTarget(convertTo: string | undefined): string | undefined {
+  if (!convertTo) return undefined;
+  return CONVERT_SHORTHANDS[convertTo] ?? convertTo;
+}
+const CONVERT_TO_VALUES = [
+  'document',
+  'spreadsheet',
+  'presentation',
+  'drawing',
+  'application/vnd.google-apps.document',
+  'application/vnd.google-apps.spreadsheet',
+  'application/vnd.google-apps.presentation',
+  'application/vnd.google-apps.drawing',
+] as const;
+
 // Comment/Reply fields list — Drive API requires explicit `fields` on every call.
 const COMMENT_BASE_FIELDS = 'id,kind,content,htmlContent,createdTime,modifiedTime,resolved,anchor,author,deleted,quotedFileContent';
 const REPLY_SUBFIELDS = 'id,content,action,createdTime,modifiedTime,author,deleted';
@@ -40,7 +88,6 @@ const COMMENT_FIELDS = `${COMMENT_BASE_FIELDS},replies(${REPLY_SUBFIELDS})`;
 const COMMENT_LIST_FIELDS = `nextPageToken,comments(${COMMENT_BASE_FIELDS},replies(${REPLY_SUBFIELDS}))`;
 const REPLY_FIELDS = `kind,htmlContent,${REPLY_SUBFIELDS}`;
 const REPLY_LIST_FIELDS = `nextPageToken,replies(${REPLY_FIELDS})`;
-
 
 function asDownloadBuffer(data: unknown): Buffer {
   if (Buffer.isBuffer(data)) return data;
@@ -50,13 +97,6 @@ function asDownloadBuffer(data: unknown): Buffer {
   }
   if (typeof data === 'string') return Buffer.from(data, 'binary');
   throw new Error('Drive download returned no binary data');
-}
-
-// path.basename() is a traversal guard — a caller-supplied filename must never escape savePath.
-export function prepareLocalDest(savePath: string, filename: string): string {
-  const dest = path.join(savePath, path.basename(filename));
-  fs.mkdirSync(savePath, { recursive: true });
-  return dest;
 }
 
 // sendNotificationEmail is only valid for user/group permissions, and Google forbids
@@ -118,7 +158,7 @@ export function registerDriveTools(server: ToolRegistry): void {
   server.registerTool(
     'drive_read',
     {
-      description: 'Read the content of a Google Drive file (returns up to maxChars characters per call; non-Google-native files over 2MB return too_large)',
+      description: 'Read the content of a Google Drive file: Workspace docs and textual types (text/*, JSON/XML/SVG and similar) inline; other binaries return error:binary (returns up to maxChars characters per call; non-Google-native files over 2MB return too_large)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID'),
@@ -177,6 +217,7 @@ export function registerDriveTools(server: ToolRegistry): void {
                 name,
                 mimeType,
                 error: 'binary',
+                hint: BINARY_READ_HINT,
                 webViewLink,
               }, null, 2),
             }],
@@ -199,7 +240,7 @@ export function registerDriveTools(server: ToolRegistry): void {
           };
         }
 
-        if (mimeType?.startsWith('text/')) {
+        if (mimeType && isTextualMime(mimeType)) {
           const downloaded = await drive.files.get(
             { fileId, alt: 'media', supportsAllDrives: true },
             { responseType: 'text' },
@@ -215,6 +256,7 @@ export function registerDriveTools(server: ToolRegistry): void {
               name,
               mimeType,
               error: 'binary',
+              hint: BINARY_READ_HINT,
               webViewLink,
             }, null, 2),
           }],
@@ -231,7 +273,7 @@ export function registerDriveTools(server: ToolRegistry): void {
       description: 'List files in a Google Drive folder or root',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        folderId: z.string().optional().describe('Folder ID (omit for root)'),
+        folderId: z.string().optional().describe('Folder ID to list, omit for root. Named folderId here, not parentFolderId'),
         maxResults: z.number().min(1).max(100).default(50).optional()
           .describe('Max results to return (default: 50)'),
       },
@@ -268,16 +310,11 @@ export function registerDriveTools(server: ToolRegistry): void {
       description: 'Upload a local file to Google Drive. Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        localPath: z.string().describe('Absolute path to file on disk'),
+        localPath: z.string().describe('Absolute path of the SOURCE file on disk to upload (on the machine running the server; this is not savePath)'),
         filename: z.string().describe('Name as it appears in Drive'),
         mimeType: z.string().optional().describe('Source MIME type of the local file (inferred from extension if omitted). With `convertTo`, this is the format Drive imports from.'),
-        convertTo: z.enum([
-          'application/vnd.google-apps.document',
-          'application/vnd.google-apps.spreadsheet',
-          'application/vnd.google-apps.presentation',
-          'application/vnd.google-apps.drawing',
-        ]).optional().describe('Convert the upload into this native Google Workspace type on import (e.g. upload .md/.html/.docx/.txt with convertTo=...google-apps.document to get a real Google Doc). Source must be an importable format. Omit to store the file as-is.'),
-        parentFolderId: z.string().optional().describe('Parent folder ID (defaults to My Drive root)'),
+        convertTo: z.enum(CONVERT_TO_VALUES).optional().describe('Convert the upload into this native Google Workspace type on import: "document" | "spreadsheet" | "presentation" | "drawing" (full application/vnd.google-apps.* ids also accepted). E.g. upload .md/.html/.docx/.txt with convertTo=document to get a real Google Doc. Source must be an importable format. Omit to store the file as-is.'),
+        parentFolderId: z.string().optional().describe('Parent folder ID, not parentId. Defaults to My Drive root'),
       },
     },
     async ({ account, localPath, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
@@ -286,14 +323,14 @@ export function registerDriveTools(server: ToolRegistry): void {
         const drive = driveClient({ version: 'v3', auth });
 
         const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
-        const fileStream = fs.createReadStream(localPath);
+        const fileStream = await openLocalReadStream(localPath);
 
         const res = await drive.files.create({
           requestBody: {
             name: filename,
             parents: parentFolderId ? [parentFolderId] : undefined,
             // Setting a google-apps target type makes Drive convert the media on import.
-            ...(convertTo ? { mimeType: convertTo } : {}),
+            ...(convertTo ? { mimeType: resolveConvertTarget(convertTo) } : {}),
           },
           media: {
             mimeType: resolvedMime,
@@ -322,16 +359,19 @@ export function registerDriveTools(server: ToolRegistry): void {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID'),
         savePath: z.string().optional().describe(
-          'Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result.',
+          'Desk only: absolute DIRECTORY path to save into (created if missing, on the machine running the server). Ignored on hosted Cloud Run — bytes are returned in the tool result.',
         ),
-        filename: z.string().describe('Filename to save as'),
+        filename: z.string().optional().describe('Filename to save as (defaults to the file name in Drive)'),
       },
     },
     async ({ account, fileId, savePath, filename }) => {
       try {
         const auth = await getClient(account as Account);
         const drive = driveClient({ version: 'v3', auth });
-        const safeName = path.basename(filename);
+        const name = filename
+          ?? (await drive.files.get({ fileId, fields: 'name', supportsAllDrives: true })).data.name
+          ?? fileId;
+        const safeName = path.basename(name);
         const looked = mime.lookup(safeName);
         const mimeType = (looked || 'application/octet-stream') as string;
 
@@ -358,7 +398,7 @@ export function registerDriveTools(server: ToolRegistry): void {
           };
         }
 
-        const dest = prepareLocalDest(savePath, filename);
+        const dest = prepareLocalDest(savePath, name);
         const res = await drive.files.get(
           { fileId, alt: 'media', supportsAllDrives: true },
           { responseType: 'stream' },
@@ -389,16 +429,22 @@ export function registerDriveTools(server: ToolRegistry): void {
         fileId: z.string().describe('Google Drive file ID'),
         mimeType: z.string().describe('Target export MIME type (e.g. "application/pdf", "text/markdown", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")'),
         savePath: z.string().optional().describe(
-          'Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result.',
+          'Desk only: absolute DIRECTORY path to save into (created if missing, on the machine running the server). Ignored on hosted Cloud Run — bytes are returned in the tool result.',
         ),
-        filename: z.string().describe('Filename to save as'),
+        filename: z.string().optional().describe('Filename to save as (defaults to the Drive name plus the extension implied by mimeType)'),
       },
     },
     async ({ account, fileId, mimeType: exportMime, savePath, filename }) => {
       try {
         const auth = await getClient(account as Account);
         const drive = driveClient({ version: 'v3', auth });
-        const safeName = path.basename(filename);
+        let name = filename;
+        if (!name) {
+          const meta = await drive.files.get({ fileId, fields: 'name', supportsAllDrives: true });
+          const ext = mime.extension(exportMime);
+          name = `${meta.data.name ?? fileId}${ext ? `.${ext}` : ''}`;
+        }
+        const safeName = path.basename(name);
 
         if (isHostedHttp()) {
           const res = await drive.files.export(
@@ -423,7 +469,7 @@ export function registerDriveTools(server: ToolRegistry): void {
           };
         }
 
-        const dest = prepareLocalDest(savePath, filename);
+        const dest = prepareLocalDest(savePath, name);
         const res = await drive.files.export(
           { fileId, mimeType: exportMime },
           { responseType: 'stream' },
@@ -449,7 +495,7 @@ export function registerDriveTools(server: ToolRegistry): void {
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         name: z.string().describe('Folder name'),
-        parentFolderId: z.string().optional().describe('Parent folder ID (defaults to My Drive root)'),
+        parentFolderId: z.string().optional().describe('Parent folder ID, not parentId. Defaults to My Drive root'),
       },
     },
     async ({ account, name, parentFolderId }) => {
@@ -482,15 +528,10 @@ export function registerDriveTools(server: ToolRegistry): void {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID'),
         newName: z.string().optional().describe('New filename'),
-        newParentFolderId: z.string().optional().describe('Move to this folder'),
-        localPath: z.string().optional().describe('Replace file content with this local file'),
+        newParentFolderId: z.string().optional().describe('Move to this folder, named newParentFolderId here, not parentFolderId'),
+        localPath: z.string().optional().describe('Replace file content with this local file (path on the machine running the server)'),
         mimeType: z.string().optional().describe('MIME type of the replacement file (required if localPath is provided)'),
-        convertTo: z.enum([
-          'application/vnd.google-apps.document',
-          'application/vnd.google-apps.spreadsheet',
-          'application/vnd.google-apps.presentation',
-          'application/vnd.google-apps.drawing',
-        ]).optional().describe('When replacing content via localPath, convert the new content into this native Google Workspace type on import (e.g. replace a Google Doc body from a local .docx). Source must be an importable format.'),
+        convertTo: z.enum(CONVERT_TO_VALUES).optional().describe('When replacing content via localPath, convert the new content into this native Google Workspace type on import: "document" | "spreadsheet" | "presentation" | "drawing" (full application/vnd.google-apps.* ids also accepted).'),
       },
     },
     async ({ account, fileId, newName, newParentFolderId, localPath: localPathArg, mimeType: mimeTypeArg, convertTo }) => {
@@ -517,9 +558,9 @@ export function registerDriveTools(server: ToolRegistry): void {
         if (localPathArg) {
           params.media = {
             mimeType: mimeTypeArg ?? (mime.lookup(localPathArg) || 'application/octet-stream'),
-            body: fs.createReadStream(localPathArg),
+            body: await openLocalReadStream(localPathArg),
           };
-          if (convertTo) requestBody.mimeType = convertTo;
+          if (convertTo) requestBody.mimeType = resolveConvertTarget(convertTo);
         }
 
         const res = await drive.files.update(params);
@@ -644,7 +685,7 @@ export function registerDriveTools(server: ToolRegistry): void {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID to copy'),
         newName: z.string().optional().describe('Name for the copy (default: "Copy of <original>")'),
-        parentFolderId: z.string().optional().describe('Where to put the copy (default: same folder)'),
+        parentFolderId: z.string().optional().describe('Where to put the copy, not parentId. Default: same folder'),
       },
     },
     async ({ account, fileId, newName, parentFolderId }) => {
@@ -676,7 +717,7 @@ export function registerDriveTools(server: ToolRegistry): void {
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         fileId: z.string().describe('Google Drive file ID'),
-        newParentFolderId: z.string().describe('Destination folder ID'),
+        newParentFolderId: z.string().describe('Destination folder ID, named newParentFolderId here, not parentFolderId'),
       },
     },
     async ({ account, fileId, newParentFolderId }) => {
@@ -1363,7 +1404,7 @@ export function registerDriveTools(server: ToolRegistry): void {
         fromAccount: accountEnum.describe('Source account alias'),
         toAccount: accountEnum.describe('Target account alias'),
         fileId: z.string().describe('File ID in the source account (folders are not supported)'),
-        parentFolderId: z.string().optional().describe('Target folder ID (default: target My Drive root)'),
+        parentFolderId: z.string().optional().describe('Target folder ID, not parentId. Default: target My Drive root'),
         newName: z.string().optional().describe('Rename the copy (default: keep the source name)'),
         move: coerceBoolean.optional().describe('Trash the source after a successful copy (delete-gated)'),
       },
@@ -1698,7 +1739,7 @@ async function downloadAndUpload(
       },
       media: {
         mimeType: plan.kind === 'native' ? plan.exportMime : (sourceMime ?? 'application/octet-stream'),
-        body: fs.createReadStream(tmp),
+        body: await openLocalReadStream(tmp),
       },
       supportsAllDrives: true,
       fields: 'id,name,mimeType,webViewLink',
