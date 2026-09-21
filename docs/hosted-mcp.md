@@ -43,8 +43,10 @@ Access tokens are HMAC-SHA256 JWTs signed with `MCP_HTTP_TOKEN` so replicas shar
 Claim `gname` is the session grant **name** (layer 3). Never put grant codes or Google tokens in the JWT.
 
 On each `/mcp` request, if the Bearer is a JWT, restore the grant with `resolveGrantByName(gname)`
-into `AsyncLocalStorage`. Fail closed if grants are enforced and `gname` is missing/unknown.
-In-process `set_grant` is for stdio/CLI; it does **not** survive another Cloud Run instance.
+into `AsyncLocalStorage`. When grants are enforced, a JWT missing or unknown `gname` is rejected
+at the `/mcp` gate (HTTP 403) — do not wait for a tool to fail. In-process `set_grant` is for
+stdio/CLI only; on hosted (`MCP_HOSTED` / `K_SERVICE`) the tool refuses and tells you to bind
+the grant on `/oauth/authorize`. Codes never go in the JWT.
 
 ## Hosted must not
 

@@ -36,6 +36,8 @@ interface ToolConfig {
 const CUD_OVERRIDES: Record<string, Cud> = {
   drive_untrash: 'update',
   drive_transfer: 'create',
+  // Session meta, not a Google write — else read-only hosted never reaches hostedSetGrantRefusal.
+  set_grant: 'read',
 };
 
 const SERVICE_OVERRIDES: Record<string, string> = {

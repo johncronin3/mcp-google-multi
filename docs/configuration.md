@@ -38,7 +38,7 @@ Without a session grant, multi-account tools can reach **every** alias in `GOOGL
 
 1. Host-local file `grants.json` (see `grants.example.json`) maps **name + code → account aliases**.
 2. **Stdio / CLI:** call `set_grant` / `clear_grant` / `grant_status` at session start (in-process).
-3. **Hosted Grok:** enter the grant code on `/oauth/authorize`; the access JWT carries the grant *name* so every Cloud Run replica restores the same slice (no sticky sessions). In-process `set_grant` alone does not survive another instance.
+3. **Hosted Grok:** enter the grant code on `/oauth/authorize`; the access JWT carries the grant *name* (`gname`) so every Cloud Run replica restores the same slice (no sticky sessions). Hosted `set_grant` is refused — it only mutates process memory and does not survive another instance.
 4. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant.
 
 **Codes stay host-local** — never commit real codes. You may reuse the **same secret** as a My Flow grant code so operators keep one code per brain; Google only looks up its own `grants.json`.

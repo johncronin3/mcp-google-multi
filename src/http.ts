@@ -37,7 +37,7 @@ import {
   isJwtAccessToken,
   isOAuthPath,
 } from './oauth.js';
-import { resolveGrantByName, runWithGrant } from './session-grant.js';
+import { jwtAccessGrantGate, resolveGrantByName, runWithGrant } from './session-grant.js';
 
 export { DEFAULT_PUBLIC_MCP_HOST, publicMcpHost };
 
@@ -217,10 +217,15 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   const jwt = isJwtAccessToken(token);
   const grantName = jwt ? accessGrantName(token) : undefined;
   const tokenGrant = grantName ? resolveGrantByName(grantName) : null;
+  // Fail at the HTTP gate when enforced JWT lacks a resolvable gname — see docs/internals.md (session grants).
+  const gate = jwt ? jwtAccessGrantGate(grantName, tokenGrant) : null;
+  if (gate) {
+    json(res, 403, gate);
+    return;
+  }
 
   try {
     if (jwt) {
-      // JWT path is request-scoped: fail closed if gname missing/unknown.
       await runWithGrant(tokenGrant, () => handleMcp(req, res));
     } else {
       await handleMcp(req, res);

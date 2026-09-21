@@ -253,3 +253,10 @@ HAL: `gmail_get_profile` on `stromback` **after** Bulkhead labeled remount of `g
 - **Local `path` is desktop-only.** Hosted Cloud Run cannot see laptop filesystems. A missing path returns a clear error that hosted Cloud Run cannot see laptop paths. Use `driveFileId` or `messageId`+`attachmentId` instead of `/home/...` on the hosted server.
 - **Downloads on hosted now return base64** (see above). Desk `savePath` unchanged.
 - **Do not send the Taddeo rental PDF.**
+
+# Durable authorize → JWT gname → ALS (Cecil)
+
+- `/mcp` fail-closes at the HTTP gate (403) when grants are enforced and the Bearer is a JWT missing/unknown `gname` — no late tool failure. Restore remains `accessGrantName` → `resolveGrantByName` → `runWithGrant`.
+- Hosted `set_grant` (`MCP_HOSTED` / `K_SERVICE`) refuses: bind grant on `/oauth/authorize` (durable). In-process memory does not survive Cloud Run replicas.
+- `docker/entrypoint.sh` already exports `GOOGLE_GRANTS_PATH` from `/mnt/grants/grants.json` when unset — no new bake.
+- Codes never in JWT. Partner OFF. No deploy. Prove after John rolls: authorize with Personal Brain Grant 3 code, call a tool that needs an alias, no `set_grant`.

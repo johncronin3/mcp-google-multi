@@ -13,6 +13,9 @@ import {
   runWithGrant,
   setSessionGrant,
   grantStatusSummary,
+  jwtAccessGrantGate,
+  hostedSetGrantRefusal,
+  activeGrant,
 } from '../src/session-grant.js';
 
 // ACCOUNTS come from process env at module load — setup.ts / env must define them.
@@ -125,5 +128,71 @@ describe('session-grant', () => {
     runWithGrant(null, () => {
       expect(() => allowedAccounts()).toThrow(/No session grant/);
     });
+  });
+
+  it('jwtAccessGrantGate fails at the /mcp gate when enforced JWT lacks resolvable gname', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    expect(jwtAccessGrantGate(undefined, null)?.error).toBe('grant_required');
+    expect(jwtAccessGrantGate('', null)?.error).toBe('grant_required');
+    expect(jwtAccessGrantGate('Not A Real Grant', null)?.error).toBe('grant_unknown');
+    const g = resolveGrantByName('StrombackBrain2');
+    expect(g).not.toBeNull();
+    expect(jwtAccessGrantGate('StrombackBrain2', g)).toBeNull();
+    process.env.GOOGLE_GRANTS_ENFORCE = 'false';
+    expect(jwtAccessGrantGate(undefined, null)).toBeNull();
+    expect(jwtAccessGrantGate('Nope', null)).toBeNull();
+  });
+
+  it('ALS isolates token restore from in-process set_grant (second replica)', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    setSessionGrant('code_0_StrombackBrain2');
+    expect(activeGrant()?.source).toBe('session');
+    expect(allowedAccounts()).toEqual(['test']);
+
+    const tokenSlice = resolveGrantByName('StrombackBrain2');
+    expect(tokenSlice?.code).toBe('');
+    runWithGrant(tokenSlice, () => {
+      expect(activeGrant()?.source).toBe('token');
+      expect(grantStatusSummary().source).toBe('token');
+      expect(allowedAccounts()).toEqual(['test']);
+    });
+    // Same process still has the session grant after ALS ends.
+    expect(activeGrant()?.source).toBe('session');
+
+    // JWT request with no resolvable grant must not inherit process memory.
+    runWithGrant(null, () => {
+      expect(activeGrant()).toBeNull();
+      expect(() => allowedAccounts()).toThrow(/No session grant/);
+    });
+    expect(allowedAccounts()).toEqual(['test']);
+
+    // Second replica: no ALS, empty process session.
+    clearSessionGrant();
+    expect(activeGrant()).toBeNull();
+    expect(() => allowedAccounts()).toThrow(/No session grant/);
+  });
+
+  it('hostedSetGrantRefusal is set only when hosted', () => {
+    const prevH = process.env.MCP_HOSTED;
+    const prevK = process.env.K_SERVICE;
+    try {
+      delete process.env.MCP_HOSTED;
+      delete process.env.K_SERVICE;
+      expect(hostedSetGrantRefusal()).toBeNull();
+      process.env.MCP_HOSTED = '1';
+      expect(hostedSetGrantRefusal()).toMatch(/oauth\/authorize/);
+      expect(hostedSetGrantRefusal()).toMatch(/gname/);
+      expect(hostedSetGrantRefusal()).not.toMatch(/grant_code=\w{8}/);
+      delete process.env.MCP_HOSTED;
+      process.env.K_SERVICE = 'google-multi-mcp';
+      expect(hostedSetGrantRefusal()).toMatch(/does not survive Cloud Run/);
+      process.env.MCP_HOSTED = '0';
+      expect(hostedSetGrantRefusal()).toBeNull();
+    } finally {
+      if (prevH === undefined) delete process.env.MCP_HOSTED;
+      else process.env.MCP_HOSTED = prevH;
+      if (prevK === undefined) delete process.env.K_SERVICE;
+      else process.env.K_SERVICE = prevK;
+    }
   });
 });

@@ -42,8 +42,8 @@ process.env.GOOGLE_GRANTS_ENFORCE = 'true';
 delete process.env.GOOGLE_GRANT_CODE;
 
 const { createHttpRequestListener, publicMcpHost } = await import('../src/http.js');
-const { clearSessionGrant, resetGrantsFileCache } = await import('../src/session-grant.js');
-const { verifyJwt } = await import('../src/oauth.js');
+const { clearSessionGrant, getSessionGrant, resetGrantsFileCache } = await import('../src/session-grant.js');
+const { signJwt, verifyJwt } = await import('../src/oauth.js');
 
 resetGrantsFileCache();
 
@@ -315,6 +315,87 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     });
     expect(listed.status).toBe(200);
     expect(listed.text).toMatch(/grant_required|No session grant/);
+  });
+
+  it('enforced JWT missing gname is 403 at the /mcp gate', async () => {
+    clearSessionGrant();
+    const jwt = signJwt({ typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi' }, 3600);
+    expect(verifyJwt(jwt)?.gname).toBeUndefined();
+    const { status, text } = await request({
+      method: 'POST',
+      path: '/mcp',
+      token: jwt,
+      host: publicMcpHost(),
+      body: { jsonrpc: '2.0', id: 4, method: 'initialize', params: {} },
+    });
+    expect(status).toBe(403);
+    const body = JSON.parse(text);
+    expect(body.error).toBe('grant_required');
+    expect(body.message).toMatch(/gname/);
+    expect(body.message).toMatch(/oauth\/authorize/);
+    expect(text).not.toContain(GRANT_CODE);
+    expect(text).not.toContain('test-code-personal-brain-not-prod');
+  });
+
+  it('enforced JWT with unknown gname is 403 at the /mcp gate', async () => {
+    clearSessionGrant();
+    const jwt = signJwt(
+      { typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: 'Not A Real Grant' },
+      3600,
+    );
+    expect(verifyJwt(jwt)?.gname).toBe('Not A Real Grant');
+    const { status, text } = await request({
+      method: 'POST',
+      path: '/mcp',
+      token: jwt,
+      host: publicMcpHost(),
+      body: { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
+    });
+    expect(status).toBe(403);
+    const body = JSON.parse(text);
+    expect(body.error).toBe('grant_unknown');
+    expect(body.message).toMatch(/grants\.json|oauth\/authorize/);
+    expect(text).not.toContain(GRANT_CODE);
+  });
+
+  it('hosted set_grant refuses and does not mutate process memory', async () => {
+    const prev = process.env.MCP_HOSTED;
+    process.env.MCP_HOSTED = '1';
+    clearSessionGrant();
+    try {
+      const listed = await request({
+        method: 'POST',
+        path: '/mcp',
+        token: TOKEN,
+        host: publicMcpHost(),
+        body: {
+          jsonrpc: '2.0',
+          id: 9,
+          method: 'tools/call',
+          params: { name: 'set_grant', arguments: { grant_code: GRANT_CODE } },
+        },
+      });
+      expect(listed.status).toBe(200);
+      expect(listed.text).toMatch(/hosted_set_grant_refused|does not survive Cloud Run/);
+      expect(listed.text).toMatch(/oauth\/authorize/);
+      expect(listed.text).toMatch(/gname/);
+      expect(getSessionGrant()).toBeNull();
+
+      const status = await request({
+        method: 'POST',
+        path: '/mcp',
+        token: TOKEN,
+        host: publicMcpHost(),
+        body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'grant_status', arguments: {} } },
+      });
+      expect(status.status).toBe(200);
+      expect(status.text).toMatch(/Not authenticated|oauth\/authorize|set_grant is refused/);
+      expect(status.text).not.toContain('StrombackBrain2');
+    } finally {
+      if (prev === undefined) delete process.env.MCP_HOSTED;
+      else process.env.MCP_HOSTED = prev;
+      clearSessionGrant();
+    }
   });
 
   it('POST /mcp without Bearer is 401 with resource_metadata', async () => {
