@@ -42,6 +42,7 @@ describe('inferCud', () => {
     ['sheets_clear_range', 'delete'],
     ['tasks_clear', 'delete'],
     ['docs_delete_named_range', 'delete'],
+    ['set_grant', 'read'],
   ];
   it.each(cases)('%s → %s', (name, expected) => {
     expect(inferCud(name)).toBe(expected);
