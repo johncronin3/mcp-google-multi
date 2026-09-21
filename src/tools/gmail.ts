@@ -20,6 +20,7 @@ import {
   localPathUnavailableMessage,
   type MimeAttachment,
 } from './gmail-mime.js';
+import { checkOutbound } from '../outbound-allowlist.js';
 import mime from 'mime-types';
 import { sliceClean } from '../trim.js';
 import type { GmailMessageHeader, GmailMessageFull, GmailAttachment } from '../types.js';
@@ -516,6 +517,12 @@ export function registerGmailTools(server: ToolRegistry): void {
       try {
         const auth = await getClient(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
+        const outbound = checkOutbound(
+          'gmail recipient',
+          [...to.split(','), ...(cc ? cc.split(',') : [])],
+          account as Account,
+        );
+        if (outbound) return outbound;
         const encoded = await composeEncodedRaw(account as Account, gmail, auth, {
           to, subject, body, htmlBody, cc, replyToMessageId, attachments,
         });
@@ -632,6 +639,12 @@ export function registerGmailTools(server: ToolRegistry): void {
       try {
         const auth = await getClient(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
+        const outbound = checkOutbound(
+          'gmail recipient',
+          [...to.split(','), ...(cc ? cc.split(',') : [])],
+          account as Account,
+        );
+        if (outbound) return outbound;
         const encoded = await composeEncodedRaw(account as Account, gmail, auth, {
           to, subject, body, htmlBody, cc, replyToMessageId, attachments,
         });
