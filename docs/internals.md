@@ -44,6 +44,16 @@ On this house hosted isolate, B9 `doctor`/`diagnose` are **not present**, so the
 
 The Google API path is gaxios → node-fetch → `node:https`. When the happy-eyeballs `AggregateError` (whose `message` is empty) reaches node-fetch, its `FetchError` keeps only the `code`/`syscall` and discards the error object, producing the famously unhelpful `request to <url> failed, reason: ` with the real signal hiding in `error.code`. `mapGoogleError` previously fed `error.code` through `Number()` (built for HTTP statuses), so `ETIMEDOUT` was dropped and the envelope said `upstream_error, retriable: false` — wrong on both counts. `netCodeOf` walks the cause chain (GaxiosError → FetchError; undici `TypeError` → `AggregateError.errors`) for known connect/DNS syscall codes and returns a `network_error` envelope that names the code, marks transient codes retriable, and points at the happy-eyeballs flag. Per-address sub-errors are only available on undici call sites; node-fetch destroys them upstream.
 
+## Session grants
+
+### Why `/mcp` rejects JWTs missing `gname` at the HTTP gate (`jwtAccessGrantGate`, `src/session-grant.ts`)
+
+`runWithGrant(null)` used to let `initialize` and `tools/list` succeed, then fail inside the first alias-scoped tool. On Grok that looks like a flaky tool, not a missing authorize-time grant. When enforcement is on and the Bearer is a layer-2 access JWT, missing/unknown `gname` is HTTP 403 at `/mcp` before `handleMcp`. Static `MCP_HTTP_TOKEN` (CLI/Hermes) is unchanged — those sessions still use in-process `set_grant`. Codes never go in the JWT; replicas restore via `resolveGrantByName` + ALS.
+
+### Why hosted `set_grant` is refused (`hostedSetGrantRefusal`)
+
+`setSessionGrant` writes process memory. Cloud Run has no sticky sessions, so a successful `set_grant` on replica A is invisible on replica B. Agents treat that `ok` as durable. Hosted (`isHostedHttp`: `MCP_HOSTED` / `K_SERVICE`) refuses the tool and points at `/oauth/authorize`. `docker/entrypoint.sh` already exports `GOOGLE_GRANTS_PATH` from `/mnt/grants/grants.json` when unset — no second bake.
+
 ## Executor
 
 ### Request bodies on GET/HEAD (`resolveRequestBody`, `src/executor.ts`)

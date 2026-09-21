@@ -16,6 +16,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { ACCOUNTS } from './accounts.js';
+import { isHostedHttp } from './hosted.js';
 
 export interface GrantRecord {
   /** Human name aligned with OS / My Flow recipes (e.g. "StrombackBrain2"). */
@@ -142,6 +143,42 @@ export function resolveGrantByName(name: string): SessionGrantState | null {
   const accounts = accountsForRecord(rec);
   if (accounts.length === 0) return null;
   return { code: '', name: rec.name, accounts, label: 'token', source: 'token' };
+}
+
+/**
+ * HTTP-gate reason when a layer-2 access JWT must carry a resolvable layer-3 `gname`.
+ * See docs/internals.md (session grants). Static Bearer is not this path.
+ */
+export function jwtAccessGrantGate(
+  grantName: string | undefined,
+  resolved: SessionGrantState | null,
+): { error: 'grant_required' | 'grant_unknown'; message: string } | null {
+  if (!isGrantEnforced()) return null;
+  if (!grantName) {
+    return {
+      error: 'grant_required',
+      message:
+        'Access JWT is missing session grant name (gname). Re-authorize at /oauth/authorize with the session grant code. In-process set_grant does not survive Cloud Run replicas. Codes never go in the JWT.',
+    };
+  }
+  if (!resolved) {
+    return {
+      error: 'grant_unknown',
+      message:
+        'Access JWT grant name is not in host-local grants.json (or has no matching aliases). Re-authorize at /oauth/authorize with a current session grant code.',
+    };
+  }
+  return null;
+}
+
+/** Hosted Cloud Run must not treat in-process set_grant as durable. See docs/internals.md. */
+export function hostedSetGrantRefusal(): string | null {
+  if (!isHostedHttp()) return null;
+  return (
+    'In-process set_grant does not survive Cloud Run replicas. ' +
+    'Bind the session grant on /oauth/authorize so the access JWT carries the grant name (gname). ' +
+    'Codes never go in the JWT.'
+  );
 }
 
 function findGrantByCode(code: string): GrantRecord | null {
