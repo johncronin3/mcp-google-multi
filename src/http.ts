@@ -19,7 +19,7 @@ import {
   type RequestListener,
   type ServerResponse,
 } from 'node:http';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { buildGoogleMcpServer } from './index.js';
 import {
   DEFAULT_PUBLIC_MCP_HOST,
@@ -169,7 +169,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
   const mcp = buildGoogleMcpServer();
   const pub = publicMcpHost();
   // Some SDK versions treat missing Origin as invalid when allowedOrigins is set.
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new NodeStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableDnsRebindingProtection: true,
     allowedHosts: [hostHeader, pub, `${pub}:443`, 'localhost', '127.0.0.1', '[::1]'],
