@@ -6,6 +6,7 @@ import { ACCOUNTS, ACCOUNT_CONFIG } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
+import { checkOutbound, outboundDeniedEnvelope, resolveOutboundAllowlist } from '../outbound-allowlist.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
 import { capText } from '../trim.js';
 import {
@@ -720,6 +721,22 @@ export function registerDriveTools(server: ToolRegistry): void {
       },
     },
     async ({ account, fileId, type, role, emailAddress, domain, sendNotification, emailMessage, transferOwnership, expirationTime }) => {
+      {
+        // Outbound allowlist (off unless GOOGLE_OUTBOUND_ALLOWLIST is set):
+        // user/group grantees must match; a domain share needs its exact
+        // "@domain" entry; "anyone" (link sharing) is refused while active.
+        const list = resolveOutboundAllowlist();
+        if (list) {
+          if ((type === 'user' || type === 'group') && emailAddress) {
+            const outbound = checkOutbound('drive_share grantee', [emailAddress], String(account));
+            if (outbound) return outbound;
+          } else if (type === 'domain' && domain && !list.entries.includes(`@${domain.trim().toLowerCase()}`)) {
+            return outboundDeniedEnvelope('drive_share domain grantee', [`@${domain}`], String(account));
+          } else if (type === 'anyone') {
+            return outboundDeniedEnvelope('drive_share grantee', ['anyone (link sharing)'], String(account));
+          }
+        }
+      }
       try {
         const auth = await getClient(account as Account);
         const drive = driveClient({ version: 'v3', auth });
