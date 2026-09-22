@@ -1,6 +1,76 @@
 # Configuration reference
 
-Everything is configured through environment variables (a `.env` in the working directory is loaded automatically). Back to the [README](../README.md).
+Everything is configured through environment variables and an optional `${XDG_CONFIG_HOME:-~/.config}/mcp-google-multi/config.json`. `.env` files load automatically with this precedence (highest first): real environment, then `.env` in the working directory, then `.env` in the package root, then `${XDG_CONFIG_HOME:-~/.config}/mcp-google-multi/.env`. Set `MCP_GOOGLE_MULTI_ENV=/abs/path/.env` to load exactly that file instead of searching; a missing or unreadable pointed file is a fatal `E_ENV_NOT_FOUND`. Node.js 22+ is required; older runtimes exit with `E_NODE_TOO_OLD`. Back to the [README](../README.md).
+
+## config.json (account registry)
+
+Accounts live in a mutable, plaintext-by-design `config.json` (no secrets ever; safe to commit):
+
+```jsonc
+{
+  "version": 1,
+  "accounts": {
+    "work":     { "email": "you@company.com", "admin": true },
+    "personal": { "email": "you@gmail.com" }
+  }
+}
+```
+
+- **Env override:** while `GOOGLE_ACCOUNTS` is set and non-empty, the whole registry comes from env and the file is ignored (12-factor deployments keep working unchanged). `GOOGLE_ADMIN_ACCOUNTS`, when set, overrides per-account `admin` flags.
+- **`mcp-google-multi migrate-config`** synthesizes the file from your current env (idempotent; never edits env).
+- On first start with `GOOGLE_ACCOUNTS` set and no file, the file is materialized automatically.
+- Secrets (`GOOGLE_CLIENT_ID`/`SECRET`, `MASTER_KEY`) are never config fields — a secret-shaped key fails validation (`E_CONFIG_INVALID`).
+- Startup errors: no accounts anywhere = `E_NO_ACCOUNTS_CONFIGURED`; invalid file = `E_CONFIG_INVALID`; a file written by a newer version = `E_CONFIG_VERSION_UNSUPPORTED` (upgrade the package).
+
+## Scope profiles (per-account consent)
+
+Each account can point at a named **scope profile** so consent is exactly what that account uses — a Workspace account can carry admin + `gmail_settings` while a personal account is never asked for them:
+
+```jsonc
+{
+  "version": 1,
+  "accounts": {
+    "work":     { "email": "you@company.com", "scopeProfile": "workspace-admin" },
+    "personal": { "email": "you@gmail.com" }
+  },
+  "scopeProfiles": {
+    "workspace-admin": { "bundles": ["gmail_settings", "chat"], "admin": true }
+  }
+}
+```
+
+- A missing `scopeProfile` means the built-in `base` profile (base scopes only). `admin: true` on a profile equals including the `admin` bundle.
+- Services register for the **union** of every account's bundles; authorization stays per account at call time (an account without the bundle gets a scope error with a re-auth hint, not silent access).
+- Changing a profile changes that account's consent set — re-run `auth --account <alias>` for it.
+- An unknown bundle name fails startup with `E_UNKNOWN_BUNDLE` and a did-you-mean suggestion (v5 silently ignored typos).
+- `GOOGLE_OPTIONAL_SCOPES` still works as a legacy global override applied to every account (warns `E_LEGACY_GLOBAL_SCOPES`; `migrate-config` folds it into an explicit `legacy-global` profile).
+
+### Bundle catalog
+
+| Bundle | Risk | Unlocks |
+|---|---|---|
+| `slides` | low | Create and edit Slides presentations |
+| `keep` | low | Read and edit Keep notes |
+| `driveactivity` | low | Read the Drive activity feed |
+| `postmaster` | low | Read Postmaster Tools deliverability data |
+| `analytics` | low | Read Google Analytics (GA4): reports, realtime, account/property config |
+| `analytics_write` | medium | Edit GA4 configuration: properties, streams, key events, custom definitions (includes read) |
+| `forms` | medium | Build Forms and read responses |
+| `chat` | medium | Read/send Chat messages, manage spaces |
+| `gmail_settings` | medium | Mailbox settings: filters, labels, vacation |
+| `classroom` | medium | Courses, coursework, rosters, announcements |
+| `cloudsearch` | medium | Query Cloud Search across Workspace content |
+| `drivelabels` | medium | Manage Drive labels |
+| `script` | medium | Apps Script projects and deployments |
+| `groupssettings` | medium | Google Groups settings |
+| `gmail_settings_sharing` | high | Forwarding/delegation — can route mail out |
+| `cloudidentity` | high | Cloud Identity groups and devices |
+| `groupsmigration` | high | Migrate messages into Groups |
+| `licensing` | high | Assign/revoke license seats |
+| `reseller` | high | Reseller subscriptions and orders |
+| `appsmarket` | high | Marketplace license assignments |
+| `vault` | high (Workspace-only) | eDiscovery over the whole domain |
+| `admin` | high (Workspace-only) | Directory management + audit reports |
 
 ## Environment variables
 
@@ -8,7 +78,9 @@ Everything is configured through environment variables (a `.env` in the working 
 |---|---|---|
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | ✓ | OAuth **Desktop** client from Google Cloud — see [Google Cloud setup](./google-cloud-setup.md) |
 | `GOOGLE_ACCOUNTS` | ✓ | `alias:email,…` — e.g. `work:you@co.com,personal:you@gmail.com` |
-| `MASTER_KEY` | ✓ | base64 32-byte key that encrypts the token store (`openssl rand -base64 32`) |
+| `GOOGLE_DEFAULT_ACCOUNT` | | Alias used when a tool call omits `account` (or set `"defaultAccount"` in config.json; env wins; note: while `GOOGLE_ACCOUNTS` is set, the whole registry — including the default — comes from env, so the config field is inert). Unset = `account` stays required per call (`E_NO_DEFAULT_ACCOUNT` hint on omission). Explicit aliases, `*` and CSV are never affected |
+| `GOOGLE_DISCOVERY` | | Tool-surface visibility: `lazy` (default — meta-tools only until `{service}_discover`), `curated` (~200 curated tools advertised eagerly), `eager` (everything). At runtime an agent can `discover_all` / `discover_reset` to expand/collapse a lazy surface without config changes |
+| `MASTER_KEY` | | encrypts the token store. Optional since v6: auto-provisioned as env > OS keychain > `master.key` (0600) > generated-on-setup. Keep it in env for deployments that may downgrade or move hosts. Never regenerated while encrypted tokens exist (`E_MASTER_KEY_MISSING_TOKENS_EXIST`) |
 | `GOOGLE_PROFILE` | — | write policy: `read-only` (default) · `safe-writes` · `full-writes` |
 | `GOOGLE_READ_ONLY` | — | `true` = hard kill-switch for all writes |
 | `GOOGLE_WRITE_ALLOW` / `GOOGLE_WRITE_DENY` | — | glob overrides, e.g. `calendar:*`, `*:delete*` (deny wins) |
@@ -18,12 +90,18 @@ Everything is configured through environment variables (a `.env` in the working 
 | `GOOGLE_REVEAL_AT_BOOT` | — | CSV of service names (or `all`/`*`) to list on the **first** `tools/list` without calling `{service}_discover`. Use for clients (notably Claude Desktop/Cowork) that cannot select deferred tools after `tools/list_changed`. Example: `drive` so `drive_upload` is callable for deck posts. |
 | `TOKEN_STORE_PATH` | — | override the encrypted token dir (default: `$XDG_CONFIG_HOME/mcp-google-multi/tokens`, falling back to `~/.config/mcp-google-multi/tokens`) |
 | `DISCOVERY_CACHE_PATH` | — | override the Discovery-doc cache dir (default: `$XDG_CONFIG_HOME/mcp-google-multi/discovery`, falling back to `~/.config/mcp-google-multi/discovery`) |
+| `GOOGLE_ARG_UNKNOWN` | `reject` | what to do with a `tools/call` argument the tool does not declare: `reject` (default) refuses the call with a typed `unknown_argument` error naming the likely intended parameter, `warn` logs it to stderr and drops it as 5.x did, `off` restores the silent 5.x drop with no log. A bad value falls back to `warn`, not to the default. Never screened: keys starting with `_`, keys containing `/`, the client artifacts `random_string`/`toolCallId`/`tool_call_id`/`tool_call_description`, tools that declare no arguments, and a key whose declared twin the same call also sent |
+| `GOOGLE_OUTBOUND_ALLOWLIST` | off | opt-in outbound target allowlist for unattended deployments: comma-separated addresses and `@domain` suffixes gating Gmail recipients, Calendar attendees and Drive grantees (curated tools, generated tools and the escape hatch; uninspectable raw-compose methods and `anyone` link shares are refused while active). Blocked calls fail with `recipient_not_allowed` and a hint |
+| `GOOGLE_USAGE_METRICS` | off | local usage metrics: `on\|1\|true\|yes` enables, `off\|0\|false\|no` disables; any other value warns and stays OFF; wins over the `usageMetrics` config key. See [usage-metrics.md](./usage-metrics.md) |
+| `usageMetrics` (config.json) | absent = off | same switch as a config key; remove it before downgrading below 6.0 (strict schema) |
+| `USAGE_METRICS_PATH` | — | override the metrics dir (default: `$XDG_STATE_HOME/mcp-google-multi/metrics`, falling back to `~/.local/state/mcp-google-multi/metrics`); setting the path alone enables nothing |
 | `GOOGLE_TRIM` | — | `off` (or `0`/`false`/`no`) disables compact JSON serialization of tool responses |
+| `GOOGLE_ARG_NORMALIZE` | — | `off` (or `0`/`false`/`no`) disables tools/call argument-key normalization (snake_case → declared camelCase when unambiguous; each rename logs one line to stderr) |
 | `GOOGLE_GRANTS_PATH` | — | host-local grants file (default: `~/.config/mcp-google-multi/grants.json`) — see [Session grants](#session-grants-my-flowstyle) |
 | `GOOGLE_GRANTS_ENFORCE` | — | `true` force fail-closed grants; `false` disable even if grants file exists; default = enforce when file has ≥1 grant |
 | `GOOGLE_GRANT_CODE` | — | optional process-wide fallback code (prefer session tool `set_grant` or Grok OAuth-bound grant) |
-| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for `POST /mcp` (Secret Manager). Grok OAuth wraps this token only. |
-| `MCP_PUBLIC_HOST` | hosted | Public hostname (Cloud Run). Never `localhost:8787`. |
+| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for house `POST /mcp` (Secret Manager). Grok OAuth wraps this token only. |
+| `MCP_PUBLIC_HOST` | hosted | Public hostname for house Streamable HTTP. Never `localhost:8787`. |
 | `MCP_HOSTED` | — | `1` force hosted (no browser, no 8000/8787/4242); `0` force desk. Cloud Run sets `K_SERVICE`. |
 | `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT` | desk SM | Explicit GCP project for desk→Secret Manager token uploads. Required when `--upload-sm` / `GOOGLE_UPLOAD_SM` is on. Never `gcloud config get-value project`. Interim pin if a comment must name one: `myflow-260730`. |
 | `GOOGLE_UPLOAD_SM` / `GOOGLE_SM_UPLOAD` | desk SM | `1`/`true`/`yes`/`on` — `auth --account` is incomplete until `google-mcp-token-<alias>` gets a new version (same as `--upload-sm`). Default off; CI stays dry/mocked. |
@@ -48,7 +126,26 @@ Without a session grant, multi-account tools can reach **every** alias in `GOOGL
 | Personal Brain Grant 3 | all aliases (personal, stromback, opcenter, …) |
 | StrombackBrain2 | `stromback` only |
 
-`GOOGLE_PROFILE` (read-only / safe-writes / full-writes) is **write-control**, not brain isolation — do not confuse the two.
+`GOOGLE_PROFILE` (read-only / safe-writes / full-writes) is **write-control**, not brain isolation — do not confuse the two. v6 `safe-writes` also refuses privileged org/Vault/script writes and `*_watch` push registrations (`MIGRATION-v6.md`).
+
+## Transport
+
+By default `dist/index.js` speaks **stdio** (`MCP_TRANSPORT=stdio`). It can also serve bakissation's Streamable HTTP (`src/http-transport.ts`) when `MCP_TRANSPORT` is `http` or `both`.
+
+The house Cloud Run image does **not** use that path. `Dockerfile` runs `docker/entrypoint.sh` → `dist/http.js` (`src/http.ts`: Grok OAuth, JWT `gname`, per-request `buildGoogleMcpServer`). Bakissation's distroless `MCP_TRANSPORT=http` Dockerfile was not taken.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `http`, or `both` — applies to `dist/index.js`, not house `dist/http.js` |
+| `MCP_HTTP_HOST` | `127.0.0.1` | bind address for `src/http-transport.ts` |
+| `MCP_HTTP_PORT` | `4243` | bind port for `src/http-transport.ts` |
+| `MCP_PUBLIC_URL` | `http://<host>:<port>` | canonical public base for the upstream transport |
+| `MCP_OWNER_EMAILS` | *(required for upstream http)* | CSV of Google emails allowed to authenticate; upstream HTTP refuses to start without it |
+| `MCP_ALLOWED_ORIGINS` | — | extra Origins for the upstream transport |
+| `MCP_CIMD_ALLOWED_ISSUERS` | `claude.ai` | CSV host allowlist for OAuth client-metadata documents |
+| `MCP_ACCESS_TTL` | `600` | MCP access-token lifetime (seconds) on the upstream authorization server |
+
+Over upstream HTTP the process is its own **OAuth 2.1 authorization server** (owner gate, audience-bound token). That is a different OAuth surface from house Grok OAuth in `src/oauth.ts`. Full upstream remote-HTTP walkthrough is in [docs/http-setup.md](./http-setup.md). This isolate does not deploy either transport.
 
 ## Write-control (deny-by-default)
 
@@ -57,16 +154,29 @@ Reads are never gated. **Every create/update/delete is off until you opt in** �
 | `GOOGLE_PROFILE` | Allows |
 |---|---|
 | `read-only` (default) | reads only |
-| `safe-writes` | create + update (deletes still blocked) |
+| `safe-writes` | create + update on your own data (deletes and privileged writes blocked) |
 | `full-writes` | everything |
 
 `GOOGLE_READ_ONLY=true` overrides all. For fine control: `GOOGLE_WRITE_ALLOW="calendar:*, sheets:update*"` and `GOOGLE_WRITE_DENY="*:delete*"` (deny wins). The policy applies identically to curated tools, generated tools, and the escape hatch.
+
+### What `safe-writes` refuses beyond deletes
+
+"Not a delete" is a statement about an HTTP verb, not about consequences. `safe-writes` also refuses two classes of write that are shaped like an ordinary create or update:
+
+- **Privileged scope.** The method can be authorized by a scope that acts on the whole organization, on legal holds, on billing, or on deployed code: `admin.directory.*`, `admin.datatransfer`, `cloud-identity*`, `apps.licensing`, `apps.order`, `apps.groups.settings`, `apps.groups.migration`, `ediscovery*` (Vault), `script.projects`, `script.deployments`. This is what stops `admin_users_make_admin` and `admin_two_step_verification_turn_off`, both of which are plain `update`s.
+- **Push-channel registration.** Any `*_watch` method, plus `workspaceevents` subscription create and reactivate. These register a webhook that delivers your activity to an external URL, so they are exports wearing the shape of a create.
+
+The rule is derived from each method's declared scopes and name, not from a hand-kept list, so it keeps working as the generated surface is regenerated. A method whose scopes are unknown is treated as **not** privileged: absent information is not evidence, and failing the other way would break ordinary writes.
+
+`GOOGLE_WRITE_ALLOW` still wins over this, because naming a tool explicitly is a deliberate opt-in. `GOOGLE_WRITE_DENY` still wins over that.
+
+In numbers, `safe-writes` permits 271 of 545 write tools instead of 385. Everything it newly refuses is Workspace administration, Vault, reseller billing, script deployment, or push registration. No `gmail`, `drive`, `calendar`, `docs`, `sheets`, `tasks` or `contacts` write is affected except the seven `*_watch` registrations.
 
 ## Services
 
 Core services register by default: `gmail`, `drive`, `calendar`, `sheets`, `docs`, `contacts`, `searchconsole`, `tasks`, `meet`, `workspaceevents`.
 
-Optional services register when their bundle is enabled (below): `slides`, `forms`, `chat`, `classroom`, `cloudidentity`, `cloudsearch`, `vault`, `keep`, `driveactivity`, `drivelabels`, `script`, `postmaster`, `groupssettings`, `groupsmigration`, `licensing`, `reseller`, `appsmarket` — plus `admin`, which requires `GOOGLE_ADMIN_ACCOUNTS`.
+Optional services register when their bundle is enabled (below): `slides`, `forms`, `chat`, `analytics` (or `analytics_write`), `classroom`, `cloudidentity`, `cloudsearch`, `vault`, `keep`, `driveactivity`, `drivelabels`, `script`, `postmaster`, `groupssettings`, `groupsmigration`, `licensing`, `reseller`, `appsmarket` — plus `admin`, which requires `GOOGLE_ADMIN_ACCOUNTS`.
 
 `GOOGLE_TOOLSETS` is a filter only: listing an optional service does not enable it without its bundle/admin gate.
 
@@ -74,7 +184,7 @@ Optional services register when their bundle is enabled (below): `slides`, `form
 
 Add bundle names to `GOOGLE_OPTIONAL_SCOPES` (CSV), then re-run `auth` for each account so the new scopes are granted:
 
-`slides`, `forms`, `chat`, `classroom`, `cloudidentity`, `cloudsearch`, `vault`, `keep`, `driveactivity`, `drivelabels`, `script`, `postmaster`, `groupssettings`, `groupsmigration`, `licensing`, `reseller`, `appsmarket`.
+`slides`, `forms`, `chat`, `analytics`, `analytics_write`, `classroom`, `cloudidentity`, `cloudsearch`, `vault`, `keep`, `driveactivity`, `drivelabels`, `script`, `postmaster`, `groupssettings`, `groupsmigration`, `licensing`, `reseller`, `appsmarket`.
 
 Two bundles extend the always-on `gmail` service instead of enabling a new one — Gmail settings **writes** only accept the dedicated settings scopes (reads already work with the base scope):
 

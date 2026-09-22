@@ -4,7 +4,7 @@
  * Never logs token / enc payload / MASTER_KEY. See docs/internals.md.
  */
 
-import { ACCOUNTS, ACCOUNT_CONFIG } from './accounts.js';
+import { ACCOUNTS, getAccountSet } from './accounts.js';
 import { isHostedHttp } from './hosted.js';
 import {
   adoptTokenOverlay,
@@ -437,7 +437,7 @@ export async function runUploadSmCli(
     io.error(`Unknown account "${alias}". Valid aliases: ${ACCOUNTS.join(', ')}`);
     return 1;
   }
-  if (!ACCOUNT_CONFIG[alias]) {
+  if (!getAccountSet().configs[alias]) {
     io.error(`Unknown account "${alias}".`);
     return 1;
   }

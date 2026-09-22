@@ -1,414 +1,379 @@
-/**
- * Grok connector OAuth (layer 2) around MCP_HTTP_TOKEN + session grant in JWT (layer 3).
- * Does not mint Google provider tokens (layer 1).
- */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import http from 'node:http';
+import { createHash, randomBytes } from 'node:crypto';
+import { rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { McpServer } from "@modelcontextprotocol/server";
+import { resolveHttpConfig } from '../src/http-config.js';
+import { HttpTransportHost } from '../src/http-transport.js';
+import { buildAuthServer, redirectAllowed, DCR_MAX_CLIENTS, DCR_MAX_REDIRECT_URIS, type AuthServerDeps } from '../src/oauth-as.js';
+import { jwtSecretFrom } from '../src/mcp-token.js';
+import { SsrfBlockedError } from '../src/ssrf-guard.js';
+import { z } from "zod";
 
-const TOKEN = 'mcp-test-token-not-secret';
-const PUBLIC_HOST = 'google-multi-mcp-test.a.run.app';
-const GRANT_CODE = 'test-code-stromback-not-prod';
+const BASE = 'https://mcp.test';
+const CLIENT_ID = 'https://claude.ai/oauth/mcp-client';
+const REDIRECT = 'https://claude.ai/api/mcp/auth_callback';
+const secret = jwtSecretFrom('an-hs256-test-key');
 
-const dir = mkdtempSync(path.join(tmpdir(), 'gmulti-oauth-'));
-const grantsPath = path.join(dir, 'grants.json');
-writeFileSync(
-  grantsPath,
-  JSON.stringify({
-    version: 1,
-    grants: [
-      {
-        name: 'Personal Brain Grant 3',
-        code: 'test-code-personal-brain-not-prod',
-        accounts: ['test'],
-      },
-      {
-        name: 'StrombackBrain2',
-        code: GRANT_CODE,
-        accounts: ['test'],
-      },
-    ],
-  }),
-  'utf8',
-);
+const verifier = randomBytes(32).toString('base64url');
+const challenge = createHash('sha256').update(verifier).digest('base64url');
 
-process.env.MCP_HTTP_TOKEN = TOKEN;
-process.env.MCP_PUBLIC_HOST = PUBLIC_HOST;
-process.env.GOOGLE_GRANTS_PATH = grantsPath;
-process.env.GOOGLE_GRANTS_ENFORCE = 'true';
-delete process.env.GOOGLE_GRANT_CODE;
+let tmp: string;
+const hosts: HttpTransportHost[] = [];
+const written: Record<string, unknown> = {};
 
-const { createHttpRequestListener, publicMcpHost } = await import('../src/http.js');
-const { clearSessionGrant, getSessionGrant, resetGrantsFileCache } = await import('../src/session-grant.js');
-const { signJwt, verifyJwt } = await import('../src/oauth.js');
+beforeEach(() => {
+  tmp = mkdtempSync(path.join(tmpdir(), 'gm-as-'));
+});
+afterEach(async () => {
+  await Promise.all(hosts.splice(0).map((h) => h.close()));
+  rmSync(tmp, { recursive: true, force: true });
+  for (const k of Object.keys(written)) delete written[k];
+});
 
-resetGrantsFileCache();
-
-const server = http.createServer(createHttpRequestListener());
-let port = 0;
-
-beforeAll(
-  () =>
-    new Promise<void>((resolve, reject) => {
-      server.listen(0, '127.0.0.1', () => {
-        const addr = server.address();
-        if (!addr || typeof addr === 'string') {
-          reject(new Error('no listen address'));
-          return;
-        }
-        port = addr.port;
-        resolve();
-      });
+async function start(depOverrides: Partial<AuthServerDeps> = {}): Promise<number> {
+  const cfg = { ...resolveHttpConfig({ MCP_TRANSPORT: 'http', MCP_PUBLIC_URL: BASE }), port: 0 };
+  const deps: AuthServerDeps = {
+    fetchCimd: async (cid) => {
+      if (cid === CLIENT_ID) return { client_id: cid, redirect_uris: [REDIRECT] };
+      throw new SsrfBlockedError('blocked or unknown client');
+    },
+    buildGoogleAuthUrl: ({ state }) => `https://google.test/auth?state=${encodeURIComponent(state)}`,
+    exchangeCode: async (code) => ({
+      tokens: { refresh_token: 'g-rt', access_token: 'g-at' },
+      email: code === 'owner-code' ? 'owner@x.example' : code === 'work-code' ? 'work@x.example' : 'stranger@x.example',
     }),
-);
+    writeToken: (alias, tokens) => {
+      written[alias] = tokens;
+    },
+    aliasEmail: (a) => (a === 'work' ? 'work@x.example' : undefined),
+    now: () => Date.now(),
+    ...depOverrides,
+  };
+  const as = buildAuthServer(
+    { base: BASE, resourceUri: `${BASE}/mcp`, secret, ownerEmails: ['owner@x.example'], cimdIssuers: ['claude.ai'], masterKey: 'mk', refreshStorePath: path.join(tmp, 'mcp-tokens.enc') },
+    deps,
+  );
+  const server = new McpServer({ name: 'as-test', version: '0' });
+  server.registerTool('ping', { description: 'p', inputSchema: z.object({}) }, async () => ({ content: [{ type: 'text' as const, text: 'pong' }] }));
+  const host = new HttpTransportHost({ server, config: cfg, version: '0', ownerConfigured: true, authenticate: as.authenticate, routes: as.routes, log: deps.log });
+  await host.start();
+  hosts.push(host);
+  return host.address()!.port;
+}
 
-afterAll(
-  () =>
-    new Promise<void>((resolve, reject) => {
-      server.close((err) => {
-        rmSync(dir, { recursive: true, force: true });
-        err ? reject(err) : resolve();
-      });
-    }),
-);
-
-function request(opts: {
-  method?: string;
-  path?: string;
-  token?: string | null;
-  host?: string;
-  origin?: string;
-  body?: unknown;
-  form?: Record<string, string>;
-  skipAuth?: boolean;
-}): Promise<{ status: number; text: string; headers: http.IncomingHttpHeaders }> {
-  let payload: string | undefined;
-  const headers: Record<string, string> = {};
-  if (opts.host) headers.host = opts.host;
-  if (opts.origin) headers.origin = opts.origin;
-  if (opts.token !== null && !opts.skipAuth && opts.token !== undefined) {
-    headers.authorization = `Bearer ${opts.token}`;
-  } else if (opts.token !== null && !opts.skipAuth && opts.token === undefined && !opts.form && opts.body) {
-    headers.authorization = `Bearer ${TOKEN}`;
-  }
-  if (opts.form) {
-    payload = new URLSearchParams(opts.form).toString();
-    headers['content-type'] = 'application/x-www-form-urlencoded';
-    headers['content-length'] = String(Buffer.byteLength(payload));
-  } else if (opts.body !== undefined) {
-    payload = JSON.stringify(opts.body);
-    headers['content-type'] = 'application/json';
-    headers.accept = 'application/json, text/event-stream';
-    headers['content-length'] = String(Buffer.byteLength(payload));
-  }
+interface Res {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  text: string;
+}
+function req(port: number, method: string, urlPath: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<Res> {
   return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: '127.0.0.1',
-        port,
-        path: opts.path || '/mcp',
-        method: opts.method || 'GET',
-        headers,
-      },
+    const data = opts.body !== undefined ? Buffer.from(opts.body) : undefined;
+    const r = http.request(
+      { hostname: '127.0.0.1', port, method, path: urlPath, headers: { host: 'mcp.test', ...(data ? { 'content-length': String(data.length) } : {}), ...opts.headers } },
       (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(c as Buffer));
-        res.on('end', () => {
-          resolve({
-            status: res.statusCode || 0,
-            text: Buffer.concat(chunks).toString('utf8'),
-            headers: res.headers,
-          });
-        });
+        let text = '';
+        res.on('data', (c) => (text += c));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, text }));
       },
     );
-    req.on('error', reject);
-    if (payload) req.write(payload);
-    req.end();
+    r.on('error', reject);
+    if (data) r.write(data);
+    r.end();
   });
 }
 
-function pkce() {
-  const verifier = randomBytes(32).toString('base64url');
-  const challenge = createHash('sha256').update(verifier, 'ascii').digest('base64url');
-  return { verifier, challenge };
+function stateFrom(location: string): string {
+  return new URL(location).searchParams.get('state') ?? '';
 }
+const authorizeQuery = (over: Record<string, string> = {}) =>
+  new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: 'S256', resource: `${BASE}/mcp`, state: 'client-xyz', ...over }).toString();
+const form = (o: Record<string, string>) => ({ headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(o).toString() });
 
-describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
-  it('serves authorization-server metadata', async () => {
-    const { status, text } = await request({
-      path: '/.well-known/oauth-authorization-server',
-      skipAuth: true,
-      token: null,
-    });
-    expect(status).toBe(200);
-    const body = JSON.parse(text);
-    expect(body.issuer).toBe(`https://${PUBLIC_HOST}`);
-    expect(body.authorization_endpoint).toContain('/oauth/authorize');
-    expect(body.token_endpoint).toContain('/oauth/token');
-    expect(body.registration_endpoint).toContain('/oauth/register');
-    expect(body.code_challenge_methods_supported).toContain('S256');
+describe('redirectAllowed (C6)', () => {
+  it('exact match, fixed claude.ai, and port-agnostic loopback', () => {
+    expect(redirectAllowed(REDIRECT, [])).toBe(true); // fixed callback always allowed
+    expect(redirectAllowed('https://claude.ai/cb', ['https://claude.ai/cb'])).toBe(true);
+    expect(redirectAllowed('http://localhost:3118/callback', ['http://localhost/callback'])).toBe(true); // random port
+    expect(redirectAllowed('http://127.0.0.1:5000/callback', ['http://localhost/callback'])).toBe(true); // loopback equiv
+    expect(redirectAllowed('https://evil.example/cb', ['https://claude.ai/cb'])).toBe(false);
+    expect(redirectAllowed('http://localhost:3118/other', ['http://localhost/callback'])).toBe(false); // path differs
+    // #1: a "127." prefix must NOT masquerade as loopback
+    expect(redirectAllowed('http://127.evil.com/callback', ['http://localhost/callback'])).toBe(false);
+    expect(redirectAllowed('http://127.0.0.1.evil.com/callback', ['http://127.0.0.1/callback'])).toBe(false);
   });
+});
 
-  it('DCR register returns client_id grok', async () => {
-    const { status, text } = await request({
-      method: 'POST',
-      path: '/oauth/register',
-      skipAuth: true,
-      token: null,
-      body: { redirect_uris: ['https://grok.com/connectors-oauth-exchange-code/'], client_name: 'Grok' },
-    });
-    expect(status).toBe(201);
-    const body = JSON.parse(text);
-    expect(body.client_id).toBe('grok');
-    expect(body.redirect_uris).toContain('https://grok.com/connectors-oauth-exchange-code/');
-    expect(body.token_endpoint_auth_method).toBe('none');
+describe('discovery metadata', () => {
+  it('serves PRM and AS metadata with S256 and no jwks_uri', async () => {
+    const port = await start();
+    const prm = JSON.parse((await req(port, 'GET', '/.well-known/oauth-protected-resource')).text);
+    expect(prm.resource).toBe(`${BASE}/mcp`);
+    expect(prm.authorization_servers).toEqual([BASE]);
+    const as = JSON.parse((await req(port, 'GET', '/.well-known/oauth-authorization-server')).text);
+    expect(as.issuer).toBe(BASE);
+    expect(as.code_challenge_methods_supported).toEqual(['S256']);
+    expect(as.jwks_uri).toBeUndefined();
+    expect(as.client_id_metadata_document_supported).toBe(true);
   });
+});
 
-  it('authorize page is not Google login', async () => {
-    const { challenge } = pkce();
-    const q = new URLSearchParams({
-      client_id: 'grok',
-      redirect_uri: 'https://grok.com/connectors-oauth-exchange-code/',
-      response_type: 'code',
-      code_challenge: challenge,
-      code_challenge_method: 'S256',
-      state: 'st',
-    });
-    const { status, text } = await request({
-      path: `/oauth/authorize?${q}`,
-      skipAuth: true,
-      token: null,
-    });
-    expect(status).toBe(200);
-    expect(text).toMatch(/not<\/strong> Google login|not Google login/i);
-    expect(text).toContain('MCP HTTP token');
-    expect(text).toContain('Session grant');
-    expect(text).toContain('StrombackBrain2');
-    expect(text).toContain('Personal Brain Grant 3');
-    expect(text).not.toContain(GRANT_CODE);
-    expect(text).not.toContain('mega-OAuth');
-  });
-
-  it('loopback redirect 302s to localhost:8787 so Grok Bot can exchange PKCE', async () => {
-    const { verifier, challenge } = pkce();
-    const form = {
-      client_id: 'grok',
-      redirect_uri: 'http://localhost:8787/callback',
-      response_type: 'code',
-      code_challenge: challenge,
-      code_challenge_method: 'S256',
-      state: 'retry',
-      password: TOKEN,
-      grant_code: GRANT_CODE,
-    };
-    const { status, headers } = await request({
-      method: 'POST',
-      path: '/oauth/authorize',
-      skipAuth: true,
-      token: null,
-      form,
-    });
-    expect(status).toBe(302);
-    const loc = String(headers.location || '');
-    expect(loc.startsWith('http://localhost:8787/callback')).toBe(true);
-    expect(loc).toContain('code=');
-    expect(loc).toContain('state=retry');
-    expect(loc).not.toContain('grok.com/connectors-oauth-exchange-code');
-    expect(verifier.length).toBeGreaterThan(10);
-  });
-
-  it('PKCE token JWT carries grant name and restores the slice without set_grant', async () => {
-    const { verifier, challenge } = pkce();
-    const redirect = 'https://grok.com/connectors-oauth-exchange-code/';
-    const posted = await request({
-      method: 'POST',
-      path: '/oauth/authorize',
-      skipAuth: true,
-      token: null,
-      form: {
-        client_id: 'grok',
-        redirect_uri: redirect,
-        response_type: 'code',
-        code_challenge: challenge,
-        code_challenge_method: 'S256',
-        state: 's1',
-        password: TOKEN,
-        grant_code: GRANT_CODE,
-      },
-    });
-    expect(posted.status).toBe(302);
-    const loc = String(posted.headers.location || '');
-    expect(loc.startsWith(redirect)).toBe(true);
-    const code = new URL(loc).searchParams.get('code');
+describe('happy path (legs A + B)', () => {
+  it('authorize -> callback(owner) -> token -> /mcp -> refresh', async () => {
+    const port = await start();
+    // /authorize -> 302 to Google with a signed state
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    expect(authz.status).toBe(302);
+    const state = stateFrom(authz.headers.location as string);
+    expect(state).toBeTruthy();
+    // /callback owner_gate -> 302 back to client with a code + iss
+    const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
+    expect(cb.status).toBe(302);
+    const back = new URL(cb.headers.location as string);
+    expect(back.origin + back.pathname).toBe(REDIRECT);
+    expect(back.searchParams.get('iss')).toBe(BASE);
+    expect(back.searchParams.get('state')).toBe('client-xyz');
+    const code = back.searchParams.get('code')!;
     expect(code).toBeTruthy();
-
-    const tok = await request({
-      method: 'POST',
-      path: '/oauth/token',
-      skipAuth: true,
-      token: null,
-      form: {
-        grant_type: 'authorization_code',
-        code: code as string,
-        redirect_uri: redirect,
-        code_verifier: verifier,
-        client_id: 'grok',
-      },
+    // /token authorization_code -> access + refresh
+    const tok = JSON.parse((await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }))).text);
+    expect(tok.access_token).toBeTruthy();
+    expect(tok.refresh_token).toBeTruthy();
+    // POST /mcp with the Bearer -> initialize works
+    const init = await req(port, 'POST', '/mcp', {
+      headers: { authorization: `Bearer ${tok.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'c', version: '0' } } }),
     });
-    expect(tok.status).toBe(200);
-    const tokens = JSON.parse(tok.text);
-    expect(tokens.token_type).toBe('Bearer');
-    expect(tokens.access_token).toBeTruthy();
-    const payload = verifyJwt(tokens.access_token);
-    expect(payload?.typ).toBe('access');
-    expect(payload?.gname).toBe('StrombackBrain2');
-    expect(payload).not.toHaveProperty('code');
-    expect(JSON.stringify(payload)).not.toContain(GRANT_CODE);
+    expect(init.status).toBe(200);
+    expect(JSON.parse(init.text).result.serverInfo.name).toBe('as-test');
+    // refresh -> a rotated token
+    const ref = JSON.parse((await req(port, 'POST', '/token', form({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }))).text);
+    expect(ref.access_token).toBeTruthy();
+    expect(ref.refresh_token).not.toBe(tok.refresh_token);
+  });
+});
 
-    clearSessionGrant();
-
-    const listed = await request({
-      method: 'POST',
-      path: '/mcp',
-      token: tokens.access_token,
-      host: publicMcpHost(),
-      body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'grant_status', arguments: {} } },
+describe('success-path observability (logs completions, not just failures)', () => {
+  it('logs /callback owner_gate, /token (both grants), and the /mcp dispatch — no PII', async () => {
+    const logs: string[] = [];
+    const port = await start({ log: (l) => logs.push(l) });
+    const state = stateFrom((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).headers.location as string);
+    const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
+    const code = new URL(cb.headers.location as string).searchParams.get('code')!;
+    const tok = JSON.parse((await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }))).text);
+    await req(port, 'POST', '/mcp', {
+      headers: { authorization: `Bearer ${tok.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'c', version: '0' } } }),
     });
-    expect(listed.status).toBe(200);
-    expect(listed.text).toContain('StrombackBrain2');
-    expect(listed.text).toMatch(/source\\":\\"token\\"/);
-    expect(listed.text).toContain('test');
+    await req(port, 'POST', '/token', form({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }));
+
+    expect(logs).toContain('callback ok flow=owner_gate');
+    expect(logs).toContain('token issued grant=authorization_code');
+    expect(logs).toContain('token issued grant=refresh_token');
+    expect(logs).toContain('200 /mcp method=initialize');
+    // never leak the owner email, Google tokens, or the minted access/refresh values
+    expect(logs.join('\n')).not.toMatch(/owner@x|g-rt|g-at|access_token|Bearer/);
   });
 
-  it('static Bearer still works for CLI (layer 2 without OAuth)', async () => {
-    const { status } = await request({
-      method: 'POST',
-      path: '/mcp',
-      token: TOKEN,
-      host: publicMcpHost(),
-      body: {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: {
-          protocolVersion: '2024-11-05',
-          capabilities: {},
-          clientInfo: { name: 'cli', version: '0' },
-        },
-      },
-    });
-    expect(status).toBe(200);
+  it('logs the /callback alias_reauth completion by alias (no email)', async () => {
+    const logs: string[] = [];
+    const port = await start({ log: (l) => logs.push(l) });
+    const state = stateFrom((await req(port, 'GET', `/authorize?${authorizeQuery({ flow: 'alias_reauth', alias: 'work' })}`)).headers.location as string);
+    await req(port, 'GET', `/callback?code=work-code&state=${encodeURIComponent(state)}`);
+    expect(logs).toContain('callback ok flow=alias_reauth alias=work');
+    expect(logs.join('\n')).not.toMatch(/work@x\.example/);
+  });
+});
+
+describe('negative paths (one per §5.12 MUST)', () => {
+  it('CIMD fetch fail / unknown issuer -> 400 invalid_client (SSRF-blocked)', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: 'https://evil.example/c' })}`);
+    expect(r.status).toBe(400);
+    expect(JSON.parse(r.text).error).toBe('invalid_client');
   });
 
-  it('enforced grants without JWT gname fail closed on account_list', async () => {
-    clearSessionGrant();
-    const listed = await request({
-      method: 'POST',
-      path: '/mcp',
-      token: TOKEN,
-      host: publicMcpHost(),
-      body: { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
-    });
-    expect(listed.status).toBe(200);
-    expect(listed.text).toMatch(/grant_required|No session grant/);
+  it('redirect_uri mismatch -> 400 error page, NOT redirected (open-redirect defense)', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', `/authorize?${authorizeQuery({ redirect_uri: 'https://evil.example/cb' })}`);
+    expect(r.status).toBe(400);
+    expect(r.headers.location).toBeUndefined();
+    expect(r.text).toContain('E_REDIRECT_URI_MISMATCH');
   });
 
-  it('enforced JWT missing gname is 403 at the /mcp gate', async () => {
-    clearSessionGrant();
-    const jwt = signJwt({ typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi' }, 3600);
-    expect(verifyJwt(jwt)?.gname).toBeUndefined();
-    const { status, text } = await request({
-      method: 'POST',
-      path: '/mcp',
-      token: jwt,
-      host: publicMcpHost(),
-      body: { jsonrpc: '2.0', id: 4, method: 'initialize', params: {} },
-    });
-    expect(status).toBe(403);
-    const body = JSON.parse(text);
-    expect(body.error).toBe('grant_required');
-    expect(body.message).toMatch(/gname/);
-    expect(body.message).toMatch(/oauth\/authorize/);
-    expect(text).not.toContain(GRANT_CODE);
-    expect(text).not.toContain('test-code-personal-brain-not-prod');
+  it('missing PKCE S256 -> 400', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', `/authorize?${authorizeQuery({ code_challenge: '', code_challenge_method: '' })}`);
+    expect(r.status).toBe(400);
   });
 
-  it('enforced JWT with unknown gname is 403 at the /mcp gate', async () => {
-    clearSessionGrant();
-    const jwt = signJwt(
-      { typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: 'Not A Real Grant' },
-      3600,
-    );
-    expect(verifyJwt(jwt)?.gname).toBe('Not A Real Grant');
-    const { status, text } = await request({
-      method: 'POST',
-      path: '/mcp',
-      token: jwt,
-      host: publicMcpHost(),
-      body: { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
-    });
-    expect(status).toBe(403);
-    const body = JSON.parse(text);
-    expect(body.error).toBe('grant_unknown');
-    expect(body.message).toMatch(/grants\.json|oauth\/authorize/);
-    expect(text).not.toContain(GRANT_CODE);
+  it('resource mismatch -> 400', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', `/authorize?${authorizeQuery({ resource: 'https://mcp.test/wrong' })}`);
+    expect(r.status).toBe(400);
   });
 
-  it('hosted set_grant refuses and does not mutate process memory', async () => {
-    const prev = process.env.MCP_HOSTED;
-    process.env.MCP_HOSTED = '1';
-    clearSessionGrant();
-    try {
-      const listed = await request({
-        method: 'POST',
-        path: '/mcp',
-        token: TOKEN,
-        host: publicMcpHost(),
-        body: {
-          jsonrpc: '2.0',
-          id: 9,
-          method: 'tools/call',
-          params: { name: 'set_grant', arguments: { grant_code: GRANT_CODE } },
-        },
-      });
-      expect(listed.status).toBe(200);
-      expect(listed.text).toMatch(/hosted_set_grant_refused|does not survive Cloud Run/);
-      expect(listed.text).toMatch(/oauth\/authorize/);
-      expect(listed.text).toMatch(/gname/);
-      expect(getSessionGrant()).toBeNull();
-
-      const status = await request({
-        method: 'POST',
-        path: '/mcp',
-        token: TOKEN,
-        host: publicMcpHost(),
-        body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'grant_status', arguments: {} } },
-      });
-      expect(status.status).toBe(200);
-      expect(status.text).toMatch(/Not authenticated|oauth\/authorize|set_grant is refused/);
-      expect(status.text).not.toContain('StrombackBrain2');
-    } finally {
-      if (prev === undefined) delete process.env.MCP_HOSTED;
-      else process.env.MCP_HOSTED = prev;
-      clearSessionGrant();
-    }
+  it('tampered state -> 400 E_STATE_INVALID', async () => {
+    const port = await start();
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    const state = stateFrom(authz.headers.location as string);
+    const r = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state.slice(0, -2) + 'xx')}`);
+    expect(r.status).toBe(400);
+    expect(r.text).toContain('E_STATE_INVALID');
   });
 
-  it('POST /mcp without Bearer is 401 with resource_metadata', async () => {
-    const { status, text, headers } = await request({
-      method: 'POST',
-      path: '/mcp',
-      token: null,
-      skipAuth: true,
-      host: publicMcpHost(),
-      body: { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
-    });
-    expect(status).toBe(401);
-    expect(JSON.parse(text).error).toBe('Unauthorized');
-    expect(String(headers['www-authenticate'] || '')).toContain('oauth-protected-resource');
+  it('replayed state -> 400 (single-use)', async () => {
+    const port = await start();
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    const state = stateFrom(authz.headers.location as string);
+    await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
+    const replay = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
+    expect(replay.status).toBe(400);
+    expect(replay.text).toContain('E_STATE_INVALID');
+  });
+
+  it('non-owner email -> 302 access_denied with iss (not a token)', async () => {
+    const port = await start();
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    const state = stateFrom(authz.headers.location as string);
+    const r = await req(port, 'GET', `/callback?code=stranger-code&state=${encodeURIComponent(state)}`);
+    expect(r.status).toBe(302);
+    const back = new URL(r.headers.location as string);
+    expect(back.searchParams.get('error')).toBe('access_denied');
+    expect(back.searchParams.get('iss')).toBe(BASE);
+    expect(back.searchParams.get('code')).toBeNull();
+  });
+
+  async function getCode(port: number): Promise<string> {
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    const state = stateFrom(authz.headers.location as string);
+    const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
+    return new URL(cb.headers.location as string).searchParams.get('code')!;
+  }
+
+  it('PKCE verifier mismatch at /token -> invalid_grant', async () => {
+    const port = await start();
+    const code = await getCode(port);
+    const r = await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: 'wrong-verifier' }));
+    expect(r.status).toBe(400);
+    expect(JSON.parse(r.text).error).toBe('invalid_grant');
+  });
+
+  it('replayed authorization code -> invalid_grant', async () => {
+    const port = await start();
+    const code = await getCode(port);
+    await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier }));
+    const again = await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier }));
+    expect(again.status).toBe(400);
+    expect(JSON.parse(again.text).error).toBe('invalid_grant');
+  });
+
+  it('reusing a rotated-away refresh token -> invalid_grant', async () => {
+    const port = await start();
+    const code = await getCode(port);
+    const tok = JSON.parse((await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier }))).text);
+    await req(port, 'POST', '/token', form({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }));
+    const reuse = await req(port, 'POST', '/token', form({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }));
+    expect(reuse.status).toBe(400);
+    expect(JSON.parse(reuse.text).error).toBe('invalid_grant');
+  });
+
+  it('/mcp without a bearer -> 401 + WWW-Authenticate', async () => {
+    const port = await start();
+    const r = await req(port, 'POST', '/mcp', { headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: '{}' });
+    expect(r.status).toBe(401);
+    expect(r.headers['www-authenticate']).toContain('resource_metadata');
+  });
+
+  it('/mcp with a garbage bearer -> 401', async () => {
+    const port = await start();
+    const r = await req(port, 'POST', '/mcp', { headers: { authorization: 'Bearer not.a.jwt', accept: 'application/json, text/event-stream', 'content-type': 'application/json' }, body: '{}' });
+    expect(r.status).toBe(401);
+  });
+
+  it('alias_reauth writes the alias tokens when the Google identity matches', async () => {
+    const port = await start();
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery({ flow: 'alias_reauth', alias: 'work' })}`);
+    const state = stateFrom(authz.headers.location as string);
+    const cb = await req(port, 'GET', `/callback?code=work-code&state=${encodeURIComponent(state)}`);
+    expect(cb.status).toBe(200);
+    expect(written.work).toEqual({ refresh_token: 'g-rt', access_token: 'g-at' });
+  });
+
+  it('alias_reauth REFUSES a mismatched Google identity (no token injection, #2)', async () => {
+    const port = await start();
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery({ flow: 'alias_reauth', alias: 'work' })}`);
+    const state = stateFrom(authz.headers.location as string);
+    // attacker logs in with their own account (stranger@x.example != work@x.example)
+    const cb = await req(port, 'GET', `/callback?code=stranger-code&state=${encodeURIComponent(state)}`);
+    expect(cb.status).toBe(403);
+    expect(written.work).toBeUndefined();
+  });
+
+  it('a DCR-registered client gets a consent interstitial, then proceeds on approval (#3)', async () => {
+    const port = await start();
+    const reg = JSON.parse((await req(port, 'POST', '/register', { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['https://attacker.example/cb'] }) })).text);
+    const dcrId = reg.client_id as string;
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: dcrId, redirect_uri: 'https://attacker.example/cb' })}`);
+    // NOT an immediate redirect to Google — an approval page instead
+    expect(authz.status).toBe(200);
+    expect(authz.headers['content-type']).toContain('text/html');
+    expect(authz.text).toContain('attacker.example');
+    expect(authz.text).toContain('name="pending"');
+    // extract the pending token and approve
+    const pending = authz.text.match(/name="pending" value="([^"]+)"/)![1];
+    const approved = await req(port, 'POST', '/authorize', { headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ pending }).toString() });
+    expect(approved.status).toBe(302);
+    expect(new URL(approved.headers.location as string).searchParams.get('state')).toBeTruthy();
+  });
+
+  it('clientless alias_reauth link (BV-1 in-call re-auth) redirects to Google with no client leg', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', `/authorize?flow=alias_reauth&alias=work`);
+    expect(r.status).toBe(302);
+    expect(new URL(r.headers.location as string).searchParams.get('state')).toBeTruthy();
+  });
+
+  it('clientless alias_reauth for an unknown alias -> 400', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', `/authorize?flow=alias_reauth&alias=nope`);
+    expect(r.status).toBe(400);
+  });
+
+  it('a present-but-invalid Origin on an AS route -> 403 (front guard)', async () => {
+    const port = await start();
+    const r = await req(port, 'GET', '/.well-known/oauth-authorization-server', { headers: { origin: 'https://evil.example' } });
+    expect(r.status).toBe(403);
+  });
+});
+
+describe('DCR /register bounds (unbounded-store DoS guard)', () => {
+  it('rejects too many redirect_uris', async () => {
+    const port = await start();
+    const uris = Array.from({ length: DCR_MAX_REDIRECT_URIS + 1 }, (_, i) => `https://c.example/cb${i}`);
+    const r = await req(port, 'POST', '/register', { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: uris }) });
+    expect(r.status).toBe(400);
+  });
+
+  it('rejects an oversized redirect_uri', async () => {
+    const port = await start();
+    const big = `https://c.example/${'a'.repeat(3000)}`;
+    const r = await req(port, 'POST', '/register', { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: [big] }) });
+    expect(r.status).toBe(400);
+  });
+
+  it('FIFO-evicts the oldest registration once at capacity (store stays bounded)', async () => {
+    const registeredClients = new Map<string, { redirect_uris: string[] }>();
+    for (let i = 0; i < DCR_MAX_CLIENTS; i++) registeredClients.set(`seed-${i}`, { redirect_uris: ['https://s.example/cb'] });
+    const port = await start({ registeredClients });
+    const reg = await req(port, 'POST', '/register', { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['https://new.example/cb'] }) });
+    expect(reg.status).toBe(201);
+    const newId = JSON.parse(reg.text).client_id as string;
+    expect(registeredClients.size).toBe(DCR_MAX_CLIENTS); // did not grow past the cap
+    expect(registeredClients.has('seed-0')).toBe(false); // oldest evicted
+    expect(registeredClients.has(newId)).toBe(true); // newest present
   });
 });

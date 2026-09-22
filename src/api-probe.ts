@@ -2,25 +2,13 @@ import { getClient } from './client.js';
 import { readToken } from './token-store.js';
 import { mapGoogleError } from './tools/_errors.js';
 import type { Account } from './accounts.js';
+import type { ApiProbeResult } from './doctor.js';
 
-// Section-6 live probe (B9/#187): one cheap authenticated read per service to
-// catch accessNotConfigured/SERVICE_DISABLED before real work. Probes are
-// selected by the GRANTED scopes on the probed account (an ungranted service
-// would only 403 with insufficient_scope, which says nothing about enablement).
-// Admin SDK is deliberately unprobed: it is role-dependent, so a 403 is
-// ambiguous. ApiProbeResult lives here because this house tip has no doctor.ts
-// (B9); doctor/diagnose wiring is not part of the isolate. Why: docs/internals.md.
-
-/** One API-enablement probe outcome for a single service (section 6). */
-export interface ApiProbeResult {
-  service: string;
-  /** discovery API id used for the per-API console deep-link, e.g. "gmail". */
-  api: string;
-  ok: boolean;
-  /** true only for accessNotConfigured / SERVICE_DISABLED (the actionable case). */
-  notEnabled?: boolean;
-  message?: string;
-}
+// Section-6 live probe (B9): one cheap authenticated read per service to catch
+// accessNotConfigured/SERVICE_DISABLED before real work. Probes are selected
+// by the GRANTED scopes on the probed account (an ungranted service would only
+// 403 with insufficient_scope, which says nothing about enablement). Admin SDK
+// is deliberately unprobed: it is role-dependent, so a 403 is ambiguous.
 
 export interface ApiProbeSpec {
   service: string;
@@ -50,6 +38,9 @@ export const API_PROBES: ApiProbeSpec[] = [
   { service: 'chat', api: 'chat', url: 'https://chat.googleapis.com/v1/spaces?pageSize=1', scopePrefixes: [`${P}chat.`] },
   { service: 'meet', api: 'meet', url: 'https://meet.googleapis.com/v2/conferenceRecords?pageSize=1', scopePrefixes: [`${P}meetings.`] },
   { service: 'forms', api: 'forms', url: `https://forms.googleapis.com/v1/forms/${BOGUS_ID}`, scopePrefixes: [`${P}forms.`], notFoundMeansEnabled: true },
+  // Probes the Admin API only: the Data API has no no-arg read (every call
+  // needs a property id), so its enablement surfaces on first report instead.
+  { service: 'analytics', api: 'analyticsadmin', url: 'https://analyticsadmin.googleapis.com/v1beta/accountSummaries?pageSize=1', scopePrefixes: [`${P}analytics`] },
 ];
 
 export function planProbes(granted: string[], probes: ApiProbeSpec[] = API_PROBES): ApiProbeSpec[] {
