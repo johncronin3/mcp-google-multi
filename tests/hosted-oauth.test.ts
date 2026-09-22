@@ -70,7 +70,8 @@ afterAll(
     new Promise<void>((resolve, reject) => {
       server.close((err) => {
         rmSync(dir, { recursive: true, force: true });
-        err ? reject(err) : resolve();
+        if (err) reject(err);
+        else resolve();
       });
     }),
 );

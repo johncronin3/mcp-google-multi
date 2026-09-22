@@ -42,7 +42,7 @@ describe('parseAccountSelector', () => {
   });
 
   it('a single unknown alias is rejected here, not left to getClient', () => {
-    expect(parseAccountSelector('bogus', ACCOUNTS)).toEqual({ ok: false, invalid: ['bogus'] });
+    expect(parseAccountSelector('bogus', ACCOUNTS)).toEqual({ ok: false, invalid: ['bogus'], reason: 'unknown' });
   });
 
   it('rejects unknown aliases with the bad tokens listed', () => {

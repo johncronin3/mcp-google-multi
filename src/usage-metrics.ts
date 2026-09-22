@@ -42,13 +42,14 @@ const ARG_KEY_RE = /^[A-Za-z][A-Za-z0-9_.]{0,63}$/;
  * by a set-equality grep test). Anything outside buckets to `other`. */
 export const KNOWN_ERROR_SLUGS: ReadonlySet<string> = new Set([
   'E_ALIAS_EXISTS', 'E_CIMD_INVALID', 'E_ENV_ACCOUNTS_MODE', 'E_MCP_TOKEN_INVALID',
-  'E_NO_DEFAULT_ACCOUNT', 'E_UNKNOWN_BUNDLE', 'E_VALIDATION', 'ambiguous',
+  'E_NO_DEFAULT_ACCOUNT', 'E_UNKNOWN_BUNDLE', 'E_VALIDATION', 'Unauthorized', 'ambiguous',
   'api_not_enabled', 'auth_required', 'bad_request', 'binary', 'binary_unsupported',
   'confirmation_declined', 'diagnose_failed', 'discovery_unavailable', 'dispatch_timeout',
   'elicitation_unsupported', 'fanout_failed', 'forbidden',
+  'grant_required', 'grant_unknown', 'hosted_set_grant_refused',
   'insufficient_scope', 'internal', 'invalid_client', 'invalid_client_metadata',
   'invalid_grant', 'invalid_params', 'invalid_query', 'invalid_request',
-  'invalid_scope', 'network_error', 'not_found', 'rate_limited',
+  'invalid_scope', 'mcp_http_unconfigured', 'network_error', 'not_found', 'rate_limited',
   'reauth_required', 'recipient_not_allowed', 'too_large', 'toolset_disabled', 'unknown_api',
   'unknown_argument', 'unknown_method', 'unsupported_grant_type', 'unsupported_type',
   'untrusted_host', 'upstream_error', 'validation_error', 'write_disabled',

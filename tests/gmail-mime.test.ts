@@ -4,7 +4,9 @@ import {
   buildReplyHeaders,
   htmlToText,
   encodeBase64Mime,
+  encodeHeaderValue,
   buildAttachmentPart,
+  buildMultipartAlternative,
   buildMultipartMixed,
   buildRfc822Message,
   localPathUnavailableMessage,
@@ -136,13 +138,6 @@ describe('buildReplyHeaders', () => {
       .toEqual({ inReplyTo: 'gmailid123', references: 'gmailid123' });
   });
 });
-
-function decodeEncodedWord(encoded: string): string {
-  const m = encoded.match(/^=\?utf-8\?B\?([A-Za-z0-9+/=]+)\?=$/);
-  if (!m) throw new Error(`Not a base64 encoded-word: ${encoded}`);
-  return Buffer.from(m[1], 'base64').toString('utf-8');
-}
-
 
 function fakePdf(): Buffer {
   return Buffer.from('%PDF-1.4\n%\xE2\xE3\xCF\xD3\nfake-pdf-bytes\n%%EOF\n');

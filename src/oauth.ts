@@ -428,7 +428,7 @@ async function tokenPost(req: IncomingMessage, res: ServerResponse): Promise<voi
 }
 
 async function registerPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: Record<string, unknown> = {};
+  let body: Record<string, unknown>;
   try {
     body = JSON.parse((await readBody(req)) || '{}') as Record<string, unknown>;
   } catch {
@@ -533,5 +533,5 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
-  json(res, 404, { error: 'Not found' });
+  json(res, 404, { error: 'not_found', message: 'Not found' });
 }

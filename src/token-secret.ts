@@ -395,7 +395,8 @@ export function parseUploadSmArgs(argv: string[]): UploadParseResult {
   }
   if (value.help) return { ok: true, value };
   if (!value.account) {
-    return { ok: false, error: 'Missing --account. Pass one GOOGLE_ACCOUNTS alias. Do not upload other aliases.' };
+    const missingAccount = 'Missing --account. Pass one GOOGLE_ACCOUNTS alias. Do not upload other aliases.';
+    return { ok: false, error: missingAccount };
   }
   return { ok: true, value };
 }

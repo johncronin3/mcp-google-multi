@@ -12,7 +12,6 @@
  *   MCP_ALLOWED_HOSTS / MCP_ALLOWED_ORIGINS — extras (comma-separated)
  *   MCP_HOSTED / K_SERVICE — hosted mode (no 8000/8787)
  */
-import { timingSafeEqual } from 'node:crypto';
 import {
   createServer,
   type IncomingMessage,
@@ -108,13 +107,6 @@ export function expectedToken(): string | null {
   return process.env.MCP_HTTP_TOKEN || process.env.MCP_API_KEY || null;
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
-}
-
 function providedBearer(req: IncomingMessage): string {
   const auth = String(req.headers.authorization || '').trim();
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
@@ -200,12 +192,12 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   }
 
   if (path !== '/mcp') {
-    json(res, 404, { error: 'Not found' });
+    json(res, 404, { error: 'not_found', message: 'Not found' });
     return;
   }
 
   if (!expectedToken()) {
-    json(res, 503, { error: 'MCP HTTP token is not configured' });
+    json(res, 503, { error: 'mcp_http_unconfigured', message: 'MCP HTTP token is not configured' });
     return;
   }
   if (!authorized(req)) {
@@ -233,7 +225,7 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   } catch (err) {
     console.error('google-multi-mcp http error:', err);
     if (!res.headersSent) {
-      json(res, 500, { error: 'MCP request failed' });
+      json(res, 500, { error: 'internal', message: 'MCP request failed' });
     }
   }
 }
