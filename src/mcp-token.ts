@@ -31,6 +31,7 @@ export interface AccessTokenParams {
   secret: Uint8Array;
   ttlSec?: number;
   iat: number; // unix seconds (injected — never Date.now() in a testable core)
+  sub: string; // 'owner' in the single-owner deployment; a tenant id under multi-tenancy
 }
 
 export async function signAccessToken(p: AccessTokenParams): Promise<string> {
@@ -38,7 +39,7 @@ export async function signAccessToken(p: AccessTokenParams): Promise<string> {
   return new SignJWT({ scope: 'mcp:use', purpose: 'mcp_access' })
     .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
     .setIssuer(p.base)
-    .setSubject('owner')
+    .setSubject(p.sub)
     .setAudience(`${p.base}/mcp`)
     .setIssuedAt(p.iat)
     .setExpirationTime(p.iat + ttl)
@@ -62,20 +63,25 @@ export async function verifyAccessToken(token: string, base: string, secret: Uin
 // --- Signed state + authorization code (self-contained artifacts) -----------
 
 export interface StatePayload {
-  flow: 'owner_gate' | 'alias_reauth';
+  flow: 'owner_gate' | 'alias_reauth' | 'alias_add';
   client_id: string;
   redirect_uri: string;
   code_challenge: string;
   client_state?: string;
   resource: string;
   alias?: string;
+  /** alias_add only: the tenant the new alias binds under. Signed server-side
+   * at mint time — never caller-supplied at /authorize or /callback. */
+  tenantId?: string;
+  /** alias_add only: scope bundles chosen when the link was minted. */
+  bundles?: string[];
 }
 
 export interface CodePayload {
   redirect_uri: string;
   code_challenge: string;
   resource: string;
-  sub: 'owner';
+  sub: string;
 }
 
 async function signArtifact(claims: Record<string, unknown>, purpose: string, base: string, secret: Uint8Array, iat: number, ttlSec: number): Promise<string> {
@@ -154,7 +160,7 @@ export class ReplayGuard {
 // --- Opaque refresh tokens (C14: rotated on every use) ----------------------
 
 export interface RefreshRecord {
-  sub: 'owner';
+  sub: string;
   issuedAt: number;
   family: string;
 }
@@ -199,19 +205,21 @@ export class RefreshStore {
     atomicWriteFileSync(this.path, encryptToken(data, this.masterKey), 0o600);
   }
 
-  issue(nowMs: number, family?: string): string {
+  issue(nowMs: number, sub: string, family?: string): string {
     return withFileLock(this.path, () => {
       const token = randomBytes(32).toString('base64url');
       const data = this.load();
-      data.active[token] = { sub: 'owner', issuedAt: nowMs, family: family ?? randomBytes(12).toString('hex') };
+      data.active[token] = { sub, issuedAt: nowMs, family: family ?? randomBytes(12).toString('hex') };
       this.save(data);
       return token;
     });
   }
 
   /** Rotate a presented refresh token; null if unknown OR if the presented
-   * token was already rotated away (reuse => the family is revoked). */
-  rotate(oldToken: string, nowMs: number): string | null {
+   * token was already rotated away (reuse => the family is revoked). The
+   * record's sub is copied forward and returned so the caller can mint the
+   * matching access token without trusting anything client-supplied. */
+  rotate(oldToken: string, nowMs: number): { token: string; sub: string } | null {
     return withFileLock(this.path, () => {
       const data = this.load();
       const rec = data.active[oldToken];
@@ -227,9 +235,28 @@ export class RefreshStore {
       delete data.active[oldToken];
       data.spent[oldToken] = rec.family;
       const next = randomBytes(32).toString('base64url');
-      data.active[next] = { sub: 'owner', issuedAt: nowMs, family: rec.family };
+      data.active[next] = { sub: rec.sub, issuedAt: nowMs, family: rec.family };
       this.save(data);
-      return next;
+      return { token: next, sub: rec.sub };
+    });
+  }
+
+  /** Drop every ACTIVE record minted under `sub` (linear scan under the store
+   * lock). Spent entries carry no sub and stay: with their families gone, a
+   * reuse finds nothing to revoke — inert by construction. Returns the number
+   * of active tokens dropped. */
+  purgeTenant(sub: string): number {
+    return withFileLock(this.path, () => {
+      const data = this.load();
+      let dropped = 0;
+      for (const [t, r] of Object.entries(data.active)) {
+        if (r.sub === sub) {
+          delete data.active[t];
+          dropped += 1;
+        }
+      }
+      if (dropped > 0) this.save(data);
+      return dropped;
     });
   }
 }

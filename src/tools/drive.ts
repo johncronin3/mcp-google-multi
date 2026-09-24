@@ -2,9 +2,9 @@ import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
 import { coerceArray, coerceBoolean, coerceNumber } from './_coerce.js';
 import { drive as driveClient, type drive_v3 } from '@googleapis/drive';
-import { accountAliasSchema, getAccountSet } from '../accounts.js';
+import { accountArgLive, getAccountSet } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
 import { handleGoogleApiError, invalidParams, safeMessage, stringifyEnvelope } from './_errors.js';
 import { openLocalReadStream, prepareLocalDest } from './_local-files.js';
 import { checkOutbound, outboundDeniedEnvelope, resolveOutboundAllowlist } from '../outbound-allowlist.js';
@@ -51,10 +51,8 @@ function deskSavePathMissing() {
   };
 }
 
-const accountEnum = accountAliasSchema.optional();
 // drive_transfer's two-account form is the sanctioned schema exception and
 // stays REQUIRED: omission must fail at the schema, not as a runtime riddle.
-const requiredAccountEnum = accountAliasSchema;
 
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
 const FALLBACK_MAX_BYTES = 1024 * 1024 * 1024; // 1GB
@@ -171,7 +169,13 @@ export function resolveShareNotification(opts: {
   return opts.sendNotification ?? true;
 }
 
-export function registerDriveTools(server: ToolRegistry): void {
+export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const requiredAccountEnum = accountArgLive(() => server.accountAliases());
+  const getClientFn = deps.getClientFn ?? getClient;
   // ─── Read / search / list ──────────────────────────────────────────────
 
   server.registerTool(
@@ -199,7 +203,7 @@ export function registerDriveTools(server: ToolRegistry): void {
             'Pass a search term, or a structured Drive query such as "mimeType = \'application/pdf\'". To browse a folder instead, use drive_list.',
           );
         }
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         const params: any = {
@@ -268,7 +272,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, maxChars, offset }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         const meta = await drive.files.get({
@@ -393,7 +397,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, folderId, maxResults, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         // Escape single quotes per Drive query syntax to prevent breaking out of the literal.
@@ -435,7 +439,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, localPath, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
@@ -482,7 +486,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, savePath, filename }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         const name = filename
@@ -534,7 +538,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, mimeType: exportMime, savePath, filename }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         let name = filename;
@@ -579,7 +583,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, name, parentFolderId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.files.create({
           requestBody: {
@@ -615,7 +619,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, newName, newParentFolderId, localPath: localPathArg, mimeType: mimeTypeArg, convertTo }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
         const requestBody: any = {};
@@ -665,7 +669,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.files.delete({ fileId, supportsAllDrives: true });
         return {
@@ -688,7 +692,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.files.update({
           fileId,
@@ -715,7 +719,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.files.update({
           fileId,
@@ -742,7 +746,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.files.emptyTrash({});
         return {
@@ -769,7 +773,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, newName, parentFolderId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.files.copy({
           fileId,
@@ -801,7 +805,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, newParentFolderId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const current = await drive.files.get({ fileId, fields: 'parents', supportsAllDrives: true });
         const res = await drive.files.update({
@@ -857,7 +861,7 @@ export function registerDriveTools(server: ToolRegistry): void {
         }
       }
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const requestBody: any = { type, role, emailAddress, domain };
         if (expirationTime) requestBody.expirationTime = expirationTime;
@@ -892,7 +896,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.permissions.list({
           fileId,
@@ -928,7 +932,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, permissionId, role, expirationTime, removeExpiration, transferOwnership }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const requestBody: any = {};
         if (role) requestBody.role = role;
@@ -964,7 +968,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, permissionId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.permissions.delete({ fileId, permissionId, supportsAllDrives: true });
         return {
@@ -995,7 +999,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, content, anchor, quotedFileContent }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const requestBody: any = { content };
         if (anchor) requestBody.anchor = anchor;
@@ -1030,7 +1034,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, includeDeleted, pageSize, pageToken, startModifiedTime }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.comments.list({
           fileId,
@@ -1062,7 +1066,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId, includeDeleted }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.comments.get({
           fileId,
@@ -1092,7 +1096,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId, content }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.comments.update({
           fileId,
@@ -1121,7 +1125,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.comments.delete({ fileId, commentId });
         return {
@@ -1150,7 +1154,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId, content, action }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const requestBody: any = { content };
         if (action) requestBody.action = action;
@@ -1185,7 +1189,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId, includeDeleted, pageSize, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.replies.list({
           fileId,
@@ -1218,7 +1222,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId, replyId, content }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.replies.update({
           fileId,
@@ -1249,7 +1253,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, commentId, replyId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.replies.delete({ fileId, commentId, replyId });
         return {
@@ -1276,7 +1280,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, pageSize, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.revisions.list({
           fileId,
@@ -1309,7 +1313,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, revisionId, keepForever, published, publishAuto, publishedOutsideDomain }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const requestBody: any = {};
         if (keepForever !== undefined) requestBody.keepForever = keepForever;
@@ -1344,7 +1348,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, revisionId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         await drive.revisions.delete({ fileId, revisionId });
         return {
@@ -1371,7 +1375,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, pageSize, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.accessproposals.list({
           fileId,
@@ -1405,7 +1409,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, fileId, proposalId, action, role, view, sendNotification }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const requestBody: any = { action };
         if (role) requestBody.role = role;
@@ -1441,7 +1445,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, pageSize, pageToken, q }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.drives.list({
           pageSize: pageSize ?? 50,
@@ -1469,7 +1473,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account, driveId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.drives.get({
           driveId,
@@ -1526,10 +1530,10 @@ export function registerDriveTools(server: ToolRegistry): void {
       }
       let activeAccount = fromAccount as Account;
       try {
-        const sourceAuth = await getClient(fromAccount as Account);
+        const sourceAuth = await getClientFn(fromAccount as Account);
         const sourceDrive = driveClient({ version: 'v3', auth: sourceAuth });
         activeAccount = toAccount as Account;
-        const targetAuth = await getClient(toAccount as Account);
+        const targetAuth = await getClientFn(toAccount as Account);
         const targetDrive = driveClient({ version: 'v3', auth: targetAuth });
         activeAccount = fromAccount as Account;
 
@@ -1642,7 +1646,7 @@ export function registerDriveTools(server: ToolRegistry): void {
     },
     async ({ account }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
         const res = await drive.about.get({
           fields: 'user,storageQuota',

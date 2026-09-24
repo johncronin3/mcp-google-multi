@@ -1,3 +1,4 @@
+import { reauthHint } from '../reauth-hint.js';
 import * as fs from 'node:fs';
 import type { ToolRegistry } from '../registry.js';
 import { getAccountSet, refreshAccountSetIfStale } from '../accounts.js';
@@ -66,7 +67,7 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
           ? 'Plaintext token.json found — run: npx mcp-google-multi migrate-tokens'
           : isHostedHttp()
             ? deskMintMessage(alias, config.email)
-            : `Run: npx mcp-google-multi auth --account ${alias}`,
+            : reauthHint(alias),
       },
       scopes: noScopes,
     };
@@ -103,7 +104,7 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
         status === 'needs_reauth'
           ? isHostedHttp()
             ? deskMintMessage(alias, config.email)
-            : `Run: npx mcp-google-multi auth --account ${alias}`
+            : reauthHint(alias)
           : missing.length > 0
             ? 'Re-auth to grant the missing scopes'
             : undefined,

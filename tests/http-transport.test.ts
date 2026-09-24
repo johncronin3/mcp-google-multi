@@ -58,6 +58,9 @@ function makeServer(): McpServer {
   s.registerTool('ping', { description: 'ping the server', inputSchema: z.object({}) }, async () => ({
     content: [{ type: 'text' as const, text: 'pong' }],
   }));
+  s.registerTool('whoami', { description: 'echo the authenticated subject', inputSchema: z.object({}) }, async (_args, ctx) => ({
+    content: [{ type: 'text' as const, text: String((ctx.http?.authInfo?.extra as { sub?: string } | undefined)?.sub ?? 'none') }],
+  }));
   s.registerTool('slow', { description: 'slow tool', inputSchema: z.object({}) }, async () => {
     await new Promise((r) => setTimeout(r, 300));
     return { content: [{ type: 'text' as const, text: 'done' }] };
@@ -146,6 +149,115 @@ describe('HttpTransportHost (BV-3: stateless dispatch)', () => {
     const json = JSON.parse(res.text);
     const names = (json.result.tools as { name: string }[]).map((t) => t.name);
     expect(names).toContain('ping');
+  });
+
+  it('stamps the authenticated sub into ctx.http.authInfo.extra for tool handlers (S1.4)', async () => {
+    const port = await startHost(() => ({ ok: true, sub: 'tenant-42' }));
+    await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT }, body: initBody });
+    const res = await request(port, 'POST', '/mcp', {
+      headers: { accept: MCP_ACCEPT },
+      body: { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'whoami', arguments: {} } },
+    });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text).result.content[0].text).toBe('tenant-42');
+  });
+
+  it('defaults the stamped sub to owner when the authenticator carries none', async () => {
+    const port = await startHost(); // default authenticator returns a bare {ok: true}
+    await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT }, body: initBody });
+    const res = await request(port, 'POST', '/mcp', {
+      headers: { accept: MCP_ACCEPT },
+      body: { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'whoami', arguments: {} } },
+    });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text).result.content[0].text).toBe('owner');
+  });
+
+  it('resolveServer routes two subjects to two distinct servers (S1.15)', async () => {
+    const named = (marker: string) => {
+      const s = new McpServer({ name: `srv-${marker}`, version: '0.0.0' });
+      s.registerTool('marker', { description: 'which server am I', inputSchema: z.object({}) }, async () => ({
+        content: [{ type: 'text' as const, text: marker }],
+      }));
+      return s;
+    };
+    const servers: Record<string, McpServer> = { 'tenant-a': named('A'), 'tenant-b': named('B') };
+    const config = { ...resolveHttpConfig({ MCP_TRANSPORT: 'http' }), port: 0 };
+    const host = new HttpTransportHost({
+      server: makeServer(),
+      config,
+      version: '9.9.9',
+      ownerConfigured: true,
+      authenticate: (req) => ({ ok: true, sub: String(req.headers['x-test-sub'] ?? '') }),
+      resolveServer: ({ sub }) => (servers[sub] ? { server: servers[sub] } : null),
+    });
+    await host.start();
+    hosts.push(host);
+    const port = host.address()!.port;
+
+    const call = async (sub: string) => {
+      await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': sub }, body: initBody });
+      const res = await request(port, 'POST', '/mcp', {
+        headers: { accept: MCP_ACCEPT, 'x-test-sub': sub },
+        body: { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'marker', arguments: {} } },
+      });
+      return { status: res.status, text: res.text };
+    };
+
+    const a = await call('tenant-a');
+    const b = await call('tenant-b');
+    expect(a.status).toBe(200);
+    expect(JSON.parse(a.text).result.content[0].text).toBe('A');
+    expect(JSON.parse(b.text).result.content[0].text).toBe('B');
+
+    // an unknown subject resolves no server: 403 tenant_not_found, never the boot server
+    const unknown = await request(port, 'POST', '/mcp', {
+      headers: { accept: MCP_ACCEPT, 'x-test-sub': 'tenant-zz' },
+      body: initBody,
+    });
+    expect(unknown.status).toBe(403);
+    expect(JSON.parse(unknown.text).error).toBe('tenant_not_found');
+  });
+
+  it('per-subject lock lanes are independent: one tenant\'s slow call never queues another\'s (S1.15)', async () => {
+    const named = (marker: string, delayMs: number) => {
+      const s = new McpServer({ name: `srv-${marker}`, version: '0.0.0' });
+      s.registerTool('work', { description: 'do work', inputSchema: z.object({}) }, async () => {
+        await new Promise((r) => setTimeout(r, delayMs));
+        return { content: [{ type: 'text' as const, text: marker }] };
+      });
+      return s;
+    };
+    const servers: Record<string, McpServer> = { slow: named('SLOW', 700), fast: named('FAST', 0) };
+    const config = { ...resolveHttpConfig({ MCP_TRANSPORT: 'http' }), port: 0 };
+    const host = new HttpTransportHost({
+      server: makeServer(),
+      config,
+      version: '9.9.9',
+      ownerConfigured: true,
+      authenticate: (req) => ({ ok: true, sub: String(req.headers['x-test-sub'] ?? '') }),
+      resolveServer: ({ sub }) => (servers[sub] ? { server: servers[sub] } : null),
+    });
+    await host.start();
+    hosts.push(host);
+    const port = host.address()!.port;
+
+    for (const sub of ['slow', 'fast']) {
+      await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': sub }, body: initBody });
+    }
+    const callWork = (sub: string) =>
+      request(port, 'POST', '/mcp', {
+        headers: { accept: MCP_ACCEPT, 'x-test-sub': sub },
+        body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'work', arguments: {} } },
+      }).then((r) => ({ sub, r }));
+
+    const slowP = callWork('slow');
+    const fastP = callWork('fast');
+    const first = await Promise.race([slowP, fastP]);
+    // under the old single global lock, fast would queue behind slow
+    expect(first.sub).toBe('fast');
+    const [slow] = await Promise.all([slowP]);
+    expect(JSON.parse(slow.r.text).result.content[0].text).toBe('SLOW');
   });
 
   it('GET /mcp is 405 (no SSE in stateless mode)', async () => {

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { ToolRegistry } from '../registry.js';
 import { getAccountSet, invalidateAccountSet } from '../accounts.js';
-import { mutateConfigFile } from '../config-file.js';
+import { ALIAS_RE, mutateConfigFile } from '../config-file.js';
 import { writeToken } from '../token-store.js';
 import { resolveScopesForAccount } from '../auth.js';
 import { BUNDLE_CATALOG, closestBundle, resolveBundleAliases } from '../scope-catalog.js';
@@ -23,8 +23,6 @@ import {
 // a CLI. Google consent reuses the loopback flow (leg C); the HTTP-transport
 // consent path (${BASE}/authorize) is owned by the OAuth AS and lands with that
 // cluster. account_add over http is gated behind it.
-
-const ALIAS_RE = /^[a-zA-Z0-9_-]+$/;
 
 export interface AddForm {
   alias: string;
@@ -180,10 +178,33 @@ function errorResult(slug: string, message: string, hint?: string, account?: str
 
 interface ConsentFailure { ok: false; slug: string; message: string; hint?: string }
 
+/** HTTP-transport consent context (S1.20): set by the HTTP bootstrap. When
+ * present, runConsent NEVER binds a server-side loopback listener — the
+ * user's browser cannot reach the daemon's loopback — and instead hands out
+ * a clientless AS consent URL. The injector decides the flow (single-owner =
+ * the legacy alias_reauth link; a tenancy host mints a signed alias_add URL). */
+export interface WizardHttpConsent {
+  mintConsentUrl: (alias: string) => Promise<string> | string;
+}
+
+let httpConsent: WizardHttpConsent | null = null;
+
+export function setWizardHttpConsent(ctx: WizardHttpConsent | null): void {
+  httpConsent = ctx;
+}
+
+function pendingText(alias: string, url: string): string {
+  return (
+    `Account "${alias}" is ready to authorize. Open this link in a browser (it belongs to whoever owns the Google account):\n${url}\n` +
+    `On completion the token is stored server-side and the account is usable immediately — no restart. ` +
+    `If the link expires, run account_reauth for a fresh one.\n${TESTING_MODE_WARNING}`
+  );
+}
+
 /** Run Google consent for `alias` and persist the token. Opens the browser via
  * URL-mode elicitation when the client supports it, else server-side + prints
  * the URL. Returns the granted-scope diff for the S4 report. */
-async function runConsent(server: McpServer, alias: string): Promise<{ ok: true; missing: string[] } | ConsentFailure> {
+async function runConsent(server: McpServer, alias: string): Promise<{ ok: true; missing: string[] } | { ok: 'pending'; url: string } | ConsentFailure> {
   const { randomBytes } = await import('node:crypto');
   const cfg = getAccountSet().configs[alias];
   if (!cfg) {
@@ -194,6 +215,29 @@ async function runConsent(server: McpServer, alias: string): Promise<{ ok: true;
       hint: 'Accounts sourced from GOOGLE_ACCOUNTS are not editable here. Run `mcp-google-multi migrate-config` to move them into config.json.',
     };
   }
+
+  // HTTP transport: consent completes OUT OF BAND at the AS /callback. Never
+  // bind a loopback listener here; try URL-mode elicitation as a convenience
+  // but surface the URL UP FRONT either way (not only on failure).
+  const http = httpConsent;
+  if (http) {
+    let url: string;
+    try {
+      url = await http.mintConsentUrl(alias);
+    } catch (e: unknown) {
+      return { ok: false, slug: 'internal', message: safeMessage(e) };
+    }
+    const caps = server.server.getClientCapabilities?.() as { elicitation?: { url?: unknown } } | undefined;
+    if (caps?.elicitation?.url !== undefined) {
+      try {
+        await server.server.elicitInput(urlElicitationParams(alias, url, randomBytes(16).toString('hex')));
+      } catch {
+        // the URL in the pending text is the recovery
+      }
+    }
+    return { ok: 'pending', url };
+  }
+
   // Bind the ephemeral loopback listener BEFORE building the auth URL: the
   // redirect URI needs the assigned port, and listening first means the
   // callback can't race the browser.
@@ -333,9 +377,18 @@ export function registerAccountWizardTools(registry: ToolRegistry, server: McpSe
         // S2: atomic write + make the alias callable without a restart (BR3).
         writeAccountRow(validated.alias, validated.email, validated.bundles, validated.admin);
         invalidateAccountSet();
+        // Live account args validate against the refreshed registry already;
+        // the list_changed nudge makes clients re-fetch tools/list, where the
+        // advertised account enums are rebuilt from the live set.
+        try {
+          server.sendToolListChanged();
+        } catch {
+          // a client that cannot receive notifications loses nothing but the nudge
+        }
 
         // S3 + S4: consent + validate.
         const consent = await runConsent(server, validated.alias);
+        if (consent.ok === 'pending') return textResult(pendingText(validated.alias, consent.url));
         if (!consent.ok) return errorResult(consent.slug, consent.message, consent.hint, validated.alias);
         // B15: offer to register the server with another MCP client.
         return textResult(
@@ -386,6 +439,7 @@ export function registerAccountWizardTools(registry: ToolRegistry, server: McpSe
           );
         }
         const consent = await runConsent(server, alias);
+        if (consent.ok === 'pending') return textResult(pendingText(alias, consent.url));
         if (!consent.ok) return errorResult(consent.slug, consent.message, consent.hint, alias);
         return textResult(s4Text(alias, consent.missing));
       } catch (e: unknown) {
@@ -437,6 +491,11 @@ export function registerAccountWizardTools(registry: ToolRegistry, server: McpSe
           const instr = renderInstruction(client, name, entry);
           if (client.managed === 'cli') {
             blocks.push(`${client.label}: run\n  ${instr.text}`);
+          } else if (a.write && mode === 'http') {
+            // Over HTTP this tool runs on the DAEMON, whose homedir is not the
+            // caller's machine: write:true would edit the operator's own client
+            // configs (a cross-tenant hazard under tenancy). Snippet only.
+            blocks.push(`${client.label}: write:true is ignored over HTTP — this tool runs on the server, not your machine. Add to ${instr.path}\n${instr.text}`);
           } else if (a.write) {
             const res = applyFileEntry(client, name, entry);
             blocks.push(

@@ -8,6 +8,7 @@ import { peekMasterKeyProvenance, deleteMasterKeyMaterial } from './master-key.j
 import { hasToken } from './token-store.js';
 import { configDir, loadConfigFile } from './config-file.js';
 import { envValueSource } from './env-load.js';
+import { reauthHint } from './reauth-hint.js';
 import { describeMetricsDir, resolveUsageMetrics, sourceLabel } from './usage-metrics.js';
 import { probeApiEnablement } from './api-probe.js';
 import { safeMessage, stringifyEnvelope } from './tools/_errors.js';
@@ -251,7 +252,7 @@ function sectionsTokensAndScopes(deps: DiagnosticsDeps, aliases: string[]): [Dia
     if (r.requestable.length > 0) {
       if (scopeVerdict === 'ok') scopeVerdict = 'warn';
       scopeLines.push(`${alias}: ${r.callable.length} callable, ${r.requestable.length} requested-not-granted`);
-      scopeHint = `Re-auth to grant missing scopes: \`npx mcp-google-multi auth --account ${alias}\`.`;
+      scopeHint = `Re-auth to grant missing scopes. ${reauthHint(alias)}`;
     } else {
       scopeLines.push(`${alias}: ${r.callable.length} callable, all profile scopes granted`);
     }
@@ -373,7 +374,14 @@ export function overallVerdict(sections: DiagnosticSection[]): Verdict {
   return worst;
 }
 
-export async function runDiagnostics(deps: DiagnosticsDeps = DEFAULT_DEPS): Promise<DiagnosticsReport> {
+export async function runDiagnostics(
+  deps: DiagnosticsDeps = DEFAULT_DEPS,
+  opts: { scope?: 'operator' | 'tenant' } = {},
+): Promise<DiagnosticsReport> {
+  // Tenant scope omits the OPERATOR sections: §3 (key provenance = box
+  // infrastructure) and §7 (its owner-gate lines print MCP_OWNER_EMAILS
+  // values — other people's addresses from a tenant's seat).
+  const tenantScope = opts.scope === 'tenant';
   const sections: DiagnosticSection[] = [];
   sections.push(sectionRuntime(deps));
 
@@ -381,7 +389,7 @@ export async function runDiagnostics(deps: DiagnosticsDeps = DEFAULT_DEPS): Prom
   sections.push(sectionConfig(deps, set));
   const aliases = set?.aliases ?? [];
 
-  sections.push(sectionKeys(deps, aliases));
+  if (!tenantScope) sections.push(sectionKeys(deps, aliases));
 
   if (aliases.length > 0) {
     const [tokens, scopes] = sectionsTokensAndScopes(deps, aliases);
@@ -389,8 +397,10 @@ export async function runDiagnostics(deps: DiagnosticsDeps = DEFAULT_DEPS): Prom
     sections.push(await sectionApiEnablement(deps, aliases));
   }
 
-  const http = await sectionHttp(deps, aliases);
-  if (http) sections.push(http);
+  if (!tenantScope) {
+    const http = await sectionHttp(deps, aliases);
+    if (http) sections.push(http);
+  }
 
   return { verdict: overallVerdict(sections), sections };
 }
@@ -412,9 +422,34 @@ export function renderDoctorText(report: DiagnosticsReport): string {
   return out.join('\n');
 }
 
-/** Mask the local-part of an email so a report never carries a full address (BR8). */
+const EMAIL_LOCAL_CHAR = /[A-Za-z0-9._%+-]/;
+const EMAIL_DOMAIN_CHAR = /[A-Za-z0-9.-]/;
+
+/** Mask the local-part of an email so a report never carries a full address
+ * (BR8). A linear scan, not a regex: the `local* @domain` pattern backtracks
+ * polynomially on long local-charset runs without an @ (CodeQL
+ * js/polynomial-redos), and report text can embed arbitrary error strings. */
 function maskEmails(text: string): string {
-  return text.replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+)/g, '$1***$2');
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '@') {
+      let j = i + 1;
+      while (j < text.length && EMAIL_DOMAIN_CHAR.test(text[j])) j += 1;
+      let k = out.length;
+      while (k > 0 && EMAIL_LOCAL_CHAR.test(out[k - 1])) k -= 1;
+      if (j > i + 1 && k < out.length) {
+        // keep the first local char, mask the rest ('*' is outside the local
+        // charset, so a masked run can never be re-masked by a later @)
+        out = `${out.slice(0, k + 1)}***${text.slice(i, j)}`;
+        i = j;
+        continue;
+      }
+    }
+    out += text[i];
+    i += 1;
+  }
+  return out;
 }
 
 /** Redacted, paste-ready bug report (BR8): verdicts + provenance labels + token
@@ -442,7 +477,10 @@ export function exitCodeFor(report: DiagnosticsReport, strict: boolean): number 
  * from already-registered services, and this runs after that), so it was
  * advertised only once something else expanded the surface. The README sends
  * people here when they are stuck, so it has to be findable. */
-export function registerDiagnoseTool(registry: ToolRegistry): void {
+export function registerDiagnoseTool(registry: ToolRegistry, ctx?: { subject: string }): void {
+  // A non-owner context gets the tenant-scoped report; the free core's single
+  // 'owner' context keeps today's full operator report.
+  const scope: 'operator' | 'tenant' = ctx && ctx.subject !== 'owner' ? 'tenant' : 'operator';
   registry.registerMeta(
     'diagnose',
     {
@@ -452,7 +490,7 @@ export function registerDiagnoseTool(registry: ToolRegistry): void {
     },
     async () => {
       try {
-        const result = await runDiagnostics();
+        const result = await runDiagnostics(undefined, { scope });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
       } catch (e: any) {
         return { content: [{ type: 'text' as const, text: stringifyEnvelope({

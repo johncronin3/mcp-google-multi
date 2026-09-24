@@ -2,6 +2,7 @@
 // First import: triggers accounts.js module load (env files + registry) before
 // anything else. Named to also pull the server-only empty-registry guard (BR-4).
 import { assertServerAccountsConfigured, getAccountSet } from './accounts.js';
+import { accountsAssertRequired, assertNoEnvAccountsMode, assertNoEnvOptionalScopesMode, isMultiTenantBoot, mtBootGates } from './boot-gates.js';
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -9,18 +10,11 @@ import path from 'node:path';
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { McpServer } from "@modelcontextprotocol/server";
 import type { Transport } from "@modelcontextprotocol/server";
-import { GENERATED_SERVICES } from './tools/generated/index.js';
-import { GENERATED_GATES, SERVICES, unknownToolMessage } from './services.js';
-import { ToolRegistry, resolveDiscoveryMode, type DiscoveryMode } from './registry.js';
-import { registerDiscoverTools } from './discover.js';
-import { registerEscapeTools } from './tools/google-api.js';
-import { registerAccountTools } from './tools/accounts-tool.js';
-import { registerGrantTools } from './tools/grant-tools.js';
-import { registerDiagnoseTool } from './doctor.js';
-import { registerAccountWizardTools } from './tools/account-wizard.js';
-import { getToolsets, toolsetEnabled } from './toolsets.js';
+import { unknownToolMessage } from './services.js';
+import { type ToolRegistry, resolveDiscoveryMode } from './registry.js';
 import { isAllowed, describePolicy } from './write-control.js';
-import { buildIdentityContext, type IdentityContext } from './identity.js';
+import { buildIdentityContext } from './identity.js';
+import { buildRegistry } from './compose.js';
 import { registerSetupPrompt } from './setup-prompt.js';
 import { applyNetTuning } from './net-tuning.js';
 import { argNormalizationEnabled, withArgNormalization, withValidationEnvelope, type StrictArgOptions } from './arg-normalize.js';
@@ -46,58 +40,6 @@ function strictArgOptions(registry: ToolRegistry, metrics: Metrics | null): Stri
     unknownTool: (name) => unknownToolMessage(registry, name),
     onDrop: metrics ? (tool, keys) => metrics.recordArgDrop(tool, keys) : undefined,
   };
-}
-
-function buildRegistry(server: McpServer, ctx: IdentityContext, mode?: DiscoveryMode, metrics: Metrics | null = null): ToolRegistry {
-  const policy = ctx.policy;
-  const registry = new ToolRegistry(server, policy, mode, metrics);
-  const toolsets = getToolsets();
-  if (toolsets !== 'all') {
-    const known = new Set([...SERVICES.map((s) => s.name), ...GENERATED_SERVICES.map((s) => s.name)]);
-    for (const requested of toolsets) {
-      if (!known.has(requested)) {
-        process.stderr.write(`GOOGLE_TOOLSETS: unknown service "${requested}" ignored\n`);
-      }
-    }
-  }
-  for (const svc of SERVICES) {
-    if (!toolsetEnabled(toolsets, svc.name)) continue;
-    if (svc.enabled && !svc.enabled()) {
-      if (toolsets !== 'all') {
-        const hint = svc.name === 'admin' ? 'set admin on an account/profile (or GOOGLE_ADMIN_ACCOUNTS)' : `add "${svc.name}" to an account's scope profile (or legacy GOOGLE_OPTIONAL_SCOPES)`;
-        process.stderr.write(`GOOGLE_TOOLSETS: "${svc.name}" requested but not enabled — ${hint}\n`);
-      }
-      continue;
-    }
-    svc.register(registry);
-  }
-  for (const gen of GENERATED_SERVICES) {
-    if (!toolsetEnabled(toolsets, gen.name)) continue;
-    const curated = SERVICES.find((s) => s.name === gen.name);
-    const gate = curated?.enabled ?? GENERATED_GATES[gen.name]?.enabled;
-    if (gate && !gate()) {
-      if (!curated && toolsets !== 'all') {
-        process.stderr.write(`GOOGLE_TOOLSETS: "${gen.name}" requested but not enabled — ${GENERATED_GATES[gen.name].hint}\n`);
-      }
-      continue;
-    }
-    gen.register(registry);
-  }
-  if (registry.services().length === 0) {
-    const known = [...new Set([...SERVICES.map((s) => s.name), ...GENERATED_SERVICES.map((s) => s.name)])].sort();
-    throw new Error(
-      `GOOGLE_TOOLSETS="${process.env.GOOGLE_TOOLSETS ?? ''}" selected no enabled services. ` +
-        `Known services: ${known.join(', ')}. ` +
-        `Note: optional services need their bundle in an account's scope profile (or legacy GOOGLE_OPTIONAL_SCOPES); admin needs an admin account/profile.`,
-    );
-  }
-  registerDiscoverTools(registry, policy);
-  registerEscapeTools(registry, policy);
-  registerAccountTools(registry);
-  registerGrantTools(registry);
-  registerDiagnoseTool(registry);
-  registerAccountWizardTools(registry, server);
-  return registry;
 }
 
 async function main() {
@@ -230,16 +172,8 @@ async function main() {
     return;
   }
 
-  // BR-4: the SERVER never boots with an empty registry. The bootstrap and
-  // diagnostic CLIs above already returned; a fresh user configures accounts
-  // (env / migrate-config / account import / auth) before the server runs.
-  assertServerAccountsConfigured();
-
-  // Resolve (or provision) the master key BEFORE serving: the hard guard is
-  // specced "fatal at startup", never mid-dispatch.
-  const { resolveMasterKey } = await import('./master-key.js');
-  resolveMasterKey();
-
+  // Transport derivation FIRST: the accounts gate below is transport-aware
+  // (a multi-tenant HTTP deploy legitimately boots with zero accounts).
   const { resolveHttpConfig, transportIncludesHttp } = await import('./http-config.js');
   let httpCfg;
   try {
@@ -250,6 +184,22 @@ async function main() {
   }
   const wantStdio = httpCfg.transport === 'stdio' || httpCfg.transport === 'both';
   const wantHttp = transportIncludesHttp(httpCfg.transport);
+
+  // BR-4: the SERVER never boots with an empty registry — stdio always, HTTP
+  // when single-owner. The bootstrap and diagnostic CLIs above already
+  // returned. A multi-tenant boot instead refuses the two process-wide env
+  // vectors that would leak one operator's accounts/scopes into every tenant.
+  const mt = isMultiTenantBoot();
+  if (accountsAssertRequired(wantStdio, mt)) assertServerAccountsConfigured();
+  if (mt) {
+    assertNoEnvAccountsMode();
+    assertNoEnvOptionalScopesMode();
+  }
+
+  // Resolve (or provision) the master key BEFORE serving: the hard guard is
+  // specced "fatal at startup", never mid-dispatch.
+  const { resolveMasterKey } = await import('./master-key.js');
+  resolveMasterKey();
 
   // Local usage metrics: fail-closed resolve, self-announcing source, null
   // when off (no wrapper, no dir, nothing initializes). One instance per
@@ -326,14 +276,22 @@ async function main() {
 
   if (wantHttp) {
     const { HttpTransportHost, parseOwnerEmails } = await import('./http-transport.js');
-    // BR3 / C13: the owner allowlist is the entire multi-tenant collapse; refuse
-    // to open an ungated HTTP endpoint.
     const owners = parseOwnerEmails(process.env);
-    if (owners.length === 0) {
-      process.stderr.write(
-        'E_OWNER_EMAILS_REQUIRED: MCP_TRANSPORT includes http but MCP_OWNER_EMAILS is empty. Set MCP_OWNER_EMAILS to the Google email(s) allowed to authenticate.\n',
-      );
-      process.exit(1);
+    const gates = mtBootGates();
+    if (gates?.multiTenant) {
+      // Same fail-fast SHAPE, different condition: an ungated HTTP endpoint
+      // must never boot; under tenancy the gate is "a valid provisioning
+      // mechanism exists", not a flat owner allowlist.
+      gates.assertProvisioningGate();
+    } else {
+      // BR3 / C13: the owner allowlist is the entire multi-tenant collapse;
+      // refuse to open an ungated HTTP endpoint.
+      if (owners.length === 0) {
+        process.stderr.write(
+          'E_OWNER_EMAILS_REQUIRED: MCP_TRANSPORT includes http but MCP_OWNER_EMAILS is empty. Set MCP_OWNER_EMAILS to the Google email(s) allowed to authenticate.\n',
+        );
+        process.exit(1);
+      }
     }
     // BR7: stateless HTTP cannot push tools/list_changed, so it forces curated.
     const configuredMode = (process.env.GOOGLE_DISCOVERY ?? '').trim().toLowerCase();
@@ -411,6 +369,13 @@ async function main() {
     // re-auth link into the AS's alias_reauth flow instead of a stdio CLI hint.
     const { setHttpReauthBase } = await import('./reauth-hint.js');
     setHttpReauthBase(httpCfg.publicUrl);
+    // Wizard consent over HTTP: hand out the clientless AS link instead of
+    // binding a loopback listener (single-owner flow; a tenancy host installs
+    // its own signed-mint context here).
+    const { setWizardHttpConsent } = await import('./tools/account-wizard.js');
+    setWizardHttpConsent({
+      mintConsentUrl: (alias) => `${httpCfg.publicUrl}/authorize?flow=alias_reauth&alias=${encodeURIComponent(alias)}`,
+    });
 
     let httpTap: ((t: Transport) => Transport) | undefined;
     if (httpMetrics) {
