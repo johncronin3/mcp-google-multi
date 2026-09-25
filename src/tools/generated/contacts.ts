@@ -2,89 +2,102 @@
 import { z } from 'zod';
 import type { ToolRegistry } from '../../registry.js';
 import { coerceArray, coerceBoolean, coerceJson } from '../_coerce.js';
-import { accountField, registerGeneratedTool } from './_shared.js';
+import { accountField, registerGeneratedTool, type ExecuteDeps } from './_shared.js';
 
-export function registerContactsGeneratedTools(registry: ToolRegistry): void {
+export function registerContactsGeneratedTools(registry: ToolRegistry, deps: ExecuteDeps = {}): void {
+  // Interned method scope sets (shared across tools; see scope-observability).
+  const S_people_v1: readonly (readonly string[])[] = [
+    ["https://www.googleapis.com/auth/contacts","https://www.googleapis.com/auth/contacts.readonly"],
+    ["https://www.googleapis.com/auth/contacts"],
+    ["https://www.googleapis.com/auth/contacts","https://www.googleapis.com/auth/contacts.other.readonly"],
+    ["https://www.googleapis.com/auth/contacts.other.readonly"],
+    ["https://www.googleapis.com/auth/directory.readonly"],
+  ];
   registerGeneratedTool(registry, {
     name: "contacts_contact_groups_batch_get",
     cud: "read",
     description: "Get a list of contact groups owned by the authenticated user by specifying a list of contact group resource names.",
-    method: { id: "people.contactGroups.batchGet", httpMethod: "GET", path: "v1/contactGroups:batchGet", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.contactGroups.batchGet", httpMethod: "GET", path: "v1/contactGroups:batchGet", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[0] },
     params: [{"field":"groupFields","api":"groupFields","location":"query"},{"field":"maxMembers","api":"maxMembers","location":"query"},{"field":"resourceNames","api":"resourceNames","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       groupFields: z.string().describe("Optional. A field mask to restrict which fields on the group are returned. Defaults to `metadata`, `groupType`, `memberCount`, and `name` if not set or set to empty. Valid fields are: * clientData * g").optional(),
       maxMembers: z.number().describe("Optional. Specifies the maximum number of members to return for each group. Defaults to 0 if not set, which will return zero members.").optional(),
       resourceNames: coerceArray(z.string()).describe("Required. The resource names of the contact groups to get. There is a maximum of 200 resource names.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_contact_groups_delete",
     cud: "delete",
     description: "Delete an existing contact group owned by the authenticated user by specifying a contact group resource name. Mutate requests for the same user should be sent s",
-    method: { id: "people.contactGroups.delete", httpMethod: "DELETE", path: "v1/{+resourceName}", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"] },
+    method: { id: "people.contactGroups.delete", httpMethod: "DELETE", path: "v1/{+resourceName}", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"], scopes: S_people_v1[1] },
     params: [{"field":"resourceName","api":"resourceName","location":"path"},{"field":"deleteContacts","api":"deleteContacts","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
-      resourceName: z.string().describe("Required. The resource name of the contact group to delete."),
+      account: accountField(registry.accountAliases()),
+      resourceName: z.string().min(1).describe("Required. The resource name of the contact group to delete."),
       deleteContacts: coerceBoolean.describe("Optional. Set to true to also delete the contacts in the specified group.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_contact_groups_members_modify",
     cud: "update",
     description: "Modify the members of a contact group owned by the authenticated user. The only system contact groups that can have members added are `contactGroups/myContacts`",
-    method: { id: "people.contactGroups.members.modify", httpMethod: "POST", path: "v1/{+resourceName}/members:modify", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"] },
+    method: { id: "people.contactGroups.members.modify", httpMethod: "POST", path: "v1/{+resourceName}/members:modify", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"], scopes: S_people_v1[1] },
     params: [{"field":"resourceName","api":"resourceName","location":"path"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
+    bodyParams: [{"field":"resourceNamesToAdd","api":"resourceNamesToAdd"},{"field":"resourceNamesToRemove","api":"resourceNamesToRemove"}],
     shape: {
-      account: accountField(),
-      resourceName: z.string().describe("Required. The resource name of the contact group to modify."),
-      body: coerceJson(z.record(z.string(), z.unknown())).describe("ModifyContactGroupMembersRequest JSON request body. Top-level fields: resourceNamesToAdd, resourceNamesToRemove."),
+      account: accountField(registry.accountAliases()),
+      resourceName: z.string().min(1).describe("Required. The resource name of the contact group to modify."),
+      resourceNamesToAdd: coerceArray(z.string()).describe("Optional. The resource names of the contact people to add in the form of `people/{person_id}`. The total number of resource names in `resource_names_to_add` and `resource_names_to_remove` must be less").optional(),
+      resourceNamesToRemove: coerceArray(z.string()).describe("Optional. The resource names of the contact people to remove in the form of `people/{person_id}`. The total number of resource names in `resource_names_to_add` and `resource_names_to_remove` must be l").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_contact_groups_update",
     cud: "update",
     description: "Update the name of an existing contact group owned by the authenticated user. Updated contact group names must be unique to the users contact groups. Attempting",
-    method: { id: "people.contactGroups.update", httpMethod: "PUT", path: "v1/{+resourceName}", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"] },
+    method: { id: "people.contactGroups.update", httpMethod: "PUT", path: "v1/{+resourceName}", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"], scopes: S_people_v1[1] },
     params: [{"field":"resourceName","api":"resourceName","location":"path"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
     shape: {
-      account: accountField(),
-      resourceName: z.string().describe("The resource name for the contact group, assigned by the server. An ASCII string, in the form of `contactGroups/{contact_group_id}`."),
+      account: accountField(registry.accountAliases()),
+      resourceName: z.string().min(1).describe("The resource name for the contact group, assigned by the server. An ASCII string, in the form of `contactGroups/{contact_group_id}`."),
       body: coerceJson(z.record(z.string(), z.unknown())).describe("UpdateContactGroupRequest JSON request body. Top-level fields: contactGroup, readGroupFields, updateGroupFields."),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_other_contacts_copy_other_contact_to_my_contacts_group",
     cud: "create",
     description: "Copies an \"Other contact\" to a new contact in the user's \"myContacts\" group Mutate requests for the same user should be sent sequentially to avoid increased lat",
-    method: { id: "people.otherContacts.copyOtherContactToMyContactsGroup", httpMethod: "POST", path: "v1/{+resourceName}:copyOtherContactToMyContactsGroup", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"] },
+    method: { id: "people.otherContacts.copyOtherContactToMyContactsGroup", httpMethod: "POST", path: "v1/{+resourceName}:copyOtherContactToMyContactsGroup", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"], scopes: S_people_v1[2] },
     params: [{"field":"resourceName","api":"resourceName","location":"path"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
+    bodyParams: [{"field":"copyMask","api":"copyMask"},{"field":"readMask","api":"readMask"},{"field":"sources","api":"sources"}],
     shape: {
-      account: accountField(),
-      resourceName: z.string().describe("Required. The resource name of the \"Other contact\" to copy."),
-      body: coerceJson(z.record(z.string(), z.unknown())).describe("CopyOtherContactToMyContactsGroupRequest JSON request body. Top-level fields: copyMask, readMask, sources."),
+      account: accountField(registry.accountAliases()),
+      resourceName: z.string().min(1).describe("Required. The resource name of the \"Other contact\" to copy."),
+      copyMask: z.string().describe("Required. A field mask to restrict which fields are copied into the new contact. Valid values are: * emailAddresses * names * phoneNumbers").optional(),
+      readMask: z.string().describe("Optional. A field mask to restrict which fields on the person are returned. Multiple fields can be specified by separating them with commas. Defaults to the copy mask with metadata and membership fiel").optional(),
+      sources: coerceArray(z.enum(["READ_SOURCE_TYPE_UNSPECIFIED","READ_SOURCE_TYPE_PROFILE","READ_SOURCE_TYPE_CONTACT","READ_SOURCE_TYPE_DOMAIN_CONTACT","READ_SOURCE_TYPE_OTHER_CONTACT"])).describe("Optional. A mask of what source types to return. Defaults to READ_SOURCE_TYPE_CONTACT and READ_SOURCE_TYPE_PROFILE if not set.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_other_contacts_list",
     cud: "read",
     description: "List all \"Other contacts\", that is contacts that are not in a contact group. \"Other contacts\" are typically auto created contacts from interactions. Sync tokens",
-    method: { id: "people.otherContacts.list", httpMethod: "GET", path: "v1/otherContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.otherContacts.list", httpMethod: "GET", path: "v1/otherContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[3] },
     params: [{"field":"pageSize","api":"pageSize","location":"query"},{"field":"pageToken","api":"pageToken","location":"query"},{"field":"readMask","api":"readMask","location":"query"},{"field":"requestSyncToken","api":"requestSyncToken","location":"query"},{"field":"sources","api":"sources","location":"query"},{"field":"syncToken","api":"syncToken","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       pageSize: z.number().describe("Optional. The number of \"Other contacts\" to include in the response. Valid values are between 1 and 1000, inclusive. Defaults to 100 if not set or set to 0.").optional(),
       pageToken: z.string().describe("Optional. A page token, received from a previous response `next_page_token`. Provide this to retrieve the subsequent page. When paginating, all other parameters provided to `otherContacts.list` must m").optional(),
       readMask: z.string().describe("Required. A field mask to restrict which fields on each person are returned. Multiple fields can be specified by separating them with commas. What values are valid depend on what ReadSourceType is use").optional(),
@@ -93,85 +106,86 @@ export function registerContactsGeneratedTools(registry: ToolRegistry): void {
       syncToken: z.string().describe("Optional. A sync token, received from a previous response `next_sync_token` Provide this to retrieve only the resources changed since the last request. When syncing, all other parameters provided to `").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_other_contacts_search",
     cud: "read",
     description: "Provides a list of contacts in the authenticated user's other contacts that matches the search query. The query matches on a contact's `names`, `emailAddresses`",
-    method: { id: "people.otherContacts.search", httpMethod: "GET", path: "v1/otherContacts:search", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.otherContacts.search", httpMethod: "GET", path: "v1/otherContacts:search", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[3] },
     params: [{"field":"pageSize","api":"pageSize","location":"query"},{"field":"query","api":"query","location":"query"},{"field":"readMask","api":"readMask","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       pageSize: z.number().describe("Optional. The number of results to return. Defaults to 10 if field is not set, or set to 0. Values greater than 30 will be capped to 30.").optional(),
       query: z.string().describe("Required. The plain-text query for the request. The query is used to match prefix phrases of the fields on a person. For example, a person with name \"foo name\" matches queries such as \"f\", \"fo\", \"foo\"").optional(),
       readMask: z.string().describe("Required. A field mask to restrict which fields on each person are returned. Multiple fields can be specified by separating them with commas. Valid values are: * emailAddresses * metadata * names * ph").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_batch_create_contacts",
     cud: "create",
     description: "Create a batch of new contacts and return the PersonResponses for the newly Mutate requests for the same user should be sent sequentially to avoid increased lat",
-    method: { id: "people.people.batchCreateContacts", httpMethod: "POST", path: "v1/people:batchCreateContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.people.batchCreateContacts", httpMethod: "POST", path: "v1/people:batchCreateContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[1] },
     params: [{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       body: coerceJson(z.record(z.string(), z.unknown())).describe("BatchCreateContactsRequest JSON request body. Top-level fields: contacts, readMask, sources."),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_batch_delete_contacts",
     cud: "delete",
     description: "Delete a batch of contacts. Any non-contact data will not be deleted. Mutate requests for the same user should be sent sequentially to avoid increased latency a",
-    method: { id: "people.people.batchDeleteContacts", httpMethod: "POST", path: "v1/people:batchDeleteContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.people.batchDeleteContacts", httpMethod: "POST", path: "v1/people:batchDeleteContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[1] },
     params: [{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
+    bodyParams: [{"field":"resourceNames","api":"resourceNames"}],
     shape: {
-      account: accountField(),
-      body: coerceJson(z.record(z.string(), z.unknown())).describe("BatchDeleteContactsRequest JSON request body. Top-level fields: resourceNames."),
+      account: accountField(registry.accountAliases()),
+      resourceNames: coerceArray(z.string()).describe("Required. The resource names of the contact to delete. It's repeatable. Allows up to 500 resource names in a single request.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_batch_update_contacts",
-    cud: "create",
+    cud: "update",
     description: "Update a batch of contacts and return a map of resource names to PersonResponses for the updated contacts. Mutate requests for the same user should be sent sequ",
-    method: { id: "people.people.batchUpdateContacts", httpMethod: "POST", path: "v1/people:batchUpdateContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.people.batchUpdateContacts", httpMethod: "POST", path: "v1/people:batchUpdateContacts", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[1] },
     params: [{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       body: coerceJson(z.record(z.string(), z.unknown())).describe("BatchUpdateContactsRequest JSON request body. Top-level fields: contacts, readMask, sources, updateMask."),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_delete_contact_photo",
     cud: "delete",
     description: "Delete a contact's photo. Mutate requests for the same user should be done sequentially to avoid // lock contention.",
-    method: { id: "people.people.deleteContactPhoto", httpMethod: "DELETE", path: "v1/{+resourceName}:deleteContactPhoto", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"] },
+    method: { id: "people.people.deleteContactPhoto", httpMethod: "DELETE", path: "v1/{+resourceName}:deleteContactPhoto", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"], scopes: S_people_v1[1] },
     params: [{"field":"resourceName","api":"resourceName","location":"path"},{"field":"personFields","api":"personFields","location":"query"},{"field":"sources","api":"sources","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
-      resourceName: z.string().describe("Required. The resource name of the contact whose photo will be deleted."),
+      account: accountField(registry.accountAliases()),
+      resourceName: z.string().min(1).describe("Required. The resource name of the contact whose photo will be deleted."),
       personFields: z.string().describe("Optional. A field mask to restrict which fields on the person are returned. Multiple fields can be specified by separating them with commas. Defaults to empty if not set, which will skip the post muta").optional(),
       sources: coerceArray(z.enum(["READ_SOURCE_TYPE_UNSPECIFIED","READ_SOURCE_TYPE_PROFILE","READ_SOURCE_TYPE_CONTACT","READ_SOURCE_TYPE_DOMAIN_CONTACT","READ_SOURCE_TYPE_OTHER_CONTACT"])).describe("Optional. A mask of what source types to return. Defaults to READ_SOURCE_TYPE_CONTACT and READ_SOURCE_TYPE_PROFILE if not set.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_list_directory_people",
     cud: "read",
     description: "Provides a list of domain profiles and domain contacts in the authenticated user's domain directory. When the `sync_token` is specified, resources deleted since",
-    method: { id: "people.people.listDirectoryPeople", httpMethod: "GET", path: "v1/people:listDirectoryPeople", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.people.listDirectoryPeople", httpMethod: "GET", path: "v1/people:listDirectoryPeople", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[4] },
     params: [{"field":"mergeSources","api":"mergeSources","location":"query"},{"field":"pageSize","api":"pageSize","location":"query"},{"field":"pageToken","api":"pageToken","location":"query"},{"field":"readMask","api":"readMask","location":"query"},{"field":"requestSyncToken","api":"requestSyncToken","location":"query"},{"field":"sources","api":"sources","location":"query"},{"field":"syncToken","api":"syncToken","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       mergeSources: coerceArray(z.enum(["DIRECTORY_MERGE_SOURCE_TYPE_UNSPECIFIED","DIRECTORY_MERGE_SOURCE_TYPE_CONTACT"])).describe("Optional. Additional data to merge into the directory sources if they are connected through verified join keys such as email addresses or phone numbers.").optional(),
       pageSize: z.number().describe("Optional. The number of people to include in the response. Valid values are between 1 and 1000, inclusive. Defaults to 100 if not set or set to 0.").optional(),
       pageToken: z.string().describe("Optional. A page token, received from a previous response `next_page_token`. Provide this to retrieve the subsequent page. When paginating, all other parameters provided to `people.listDirectoryPeople").optional(),
@@ -181,16 +195,16 @@ export function registerContactsGeneratedTools(registry: ToolRegistry): void {
       syncToken: z.string().describe("Optional. A sync token, received from a previous response `next_sync_token` Provide this to retrieve only the resources changed since the last request. When syncing, all other parameters provided to `").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_search_directory_people",
     cud: "read",
     description: "Provides a list of domain profiles and domain contacts in the authenticated user's domain directory that match the search query.",
-    method: { id: "people.people.searchDirectoryPeople", httpMethod: "GET", path: "v1/people:searchDirectoryPeople", baseUrl: "https://people.googleapis.com/", requiredParams: [] },
+    method: { id: "people.people.searchDirectoryPeople", httpMethod: "GET", path: "v1/people:searchDirectoryPeople", baseUrl: "https://people.googleapis.com/", requiredParams: [], scopes: S_people_v1[4] },
     params: [{"field":"mergeSources","api":"mergeSources","location":"query"},{"field":"pageSize","api":"pageSize","location":"query"},{"field":"pageToken","api":"pageToken","location":"query"},{"field":"query","api":"query","location":"query"},{"field":"readMask","api":"readMask","location":"query"},{"field":"sources","api":"sources","location":"query"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: false,
     shape: {
-      account: accountField(),
+      account: accountField(registry.accountAliases()),
       mergeSources: coerceArray(z.enum(["DIRECTORY_MERGE_SOURCE_TYPE_UNSPECIFIED","DIRECTORY_MERGE_SOURCE_TYPE_CONTACT"])).describe("Optional. Additional data to merge into the directory sources if they are connected through verified join keys such as email addresses or phone numbers.").optional(),
       pageSize: z.number().describe("Optional. The number of people to include in the response. Valid values are between 1 and 500, inclusive. Defaults to 100 if not set or set to 0.").optional(),
       pageToken: z.string().describe("Optional. A page token, received from a previous response `next_page_token`. Provide this to retrieve the subsequent page. When paginating, all other parameters provided to `SearchDirectoryPeople` mus").optional(),
@@ -199,19 +213,22 @@ export function registerContactsGeneratedTools(registry: ToolRegistry): void {
       sources: coerceArray(z.enum(["DIRECTORY_SOURCE_TYPE_UNSPECIFIED","DIRECTORY_SOURCE_TYPE_DOMAIN_CONTACT","DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"])).describe("Required. Directory sources to return.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
   registerGeneratedTool(registry, {
     name: "contacts_people_update_contact_photo",
     cud: "update",
     description: "Update a contact's photo. Mutate requests for the same user should be sent sequentially to avoid increased latency and failures.",
-    method: { id: "people.people.updateContactPhoto", httpMethod: "PATCH", path: "v1/{+resourceName}:updateContactPhoto", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"] },
+    method: { id: "people.people.updateContactPhoto", httpMethod: "PATCH", path: "v1/{+resourceName}:updateContactPhoto", baseUrl: "https://people.googleapis.com/", requiredParams: ["resourceName"], scopes: S_people_v1[1] },
     params: [{"field":"resourceName","api":"resourceName","location":"path"},{"field":"fields","api":"fields","location":"query"}],
     hasBody: true,
+    bodyParams: [{"field":"personFields","api":"personFields"},{"field":"photoBytes","api":"photoBytes"},{"field":"sources","api":"sources"}],
     shape: {
-      account: accountField(),
-      resourceName: z.string().describe("Required. Person resource name"),
-      body: coerceJson(z.record(z.string(), z.unknown())).describe("UpdateContactPhotoRequest JSON request body. Top-level fields: personFields, photoBytes, sources."),
+      account: accountField(registry.accountAliases()),
+      resourceName: z.string().min(1).describe("Required. Person resource name"),
+      personFields: z.string().describe("Optional. A field mask to restrict which fields on the person are returned. Multiple fields can be specified by separating them with commas. Defaults to empty if not set, which will skip the post muta").optional(),
+      photoBytes: z.string().describe("Required. Raw photo bytes").optional(),
+      sources: coerceArray(z.enum(["READ_SOURCE_TYPE_UNSPECIFIED","READ_SOURCE_TYPE_PROFILE","READ_SOURCE_TYPE_CONTACT","READ_SOURCE_TYPE_DOMAIN_CONTACT","READ_SOURCE_TYPE_OTHER_CONTACT"])).describe("Optional. A mask of what source types to return. Defaults to READ_SOURCE_TYPE_CONTACT and READ_SOURCE_TYPE_PROFILE if not set.").optional(),
       fields: z.string().optional().describe('Response field mask.'),
     },
-  });
+  }, deps);
 }

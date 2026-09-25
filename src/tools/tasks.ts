@@ -2,14 +2,18 @@ import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
 import { coerceBoolean } from './_coerce.js';
 import { tasks as tasksClient } from '@googleapis/tasks';
-import { ACCOUNTS } from '../accounts.js';
+import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
-import { handleGoogleApiError } from './_errors.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
+import { handleGoogleApiError, invalidParams } from './_errors.js';
 
-const accountEnum = z.enum(ACCOUNTS);
 
-export function registerTasksTools(server: ToolRegistry): void {
+export function registerTasksTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const getClientFn = deps.getClientFn ?? getClient;
   // ─── Tasklists ─────────────────────────────────────────────────────────
 
   server.registerTool(
@@ -24,7 +28,7 @@ export function registerTasksTools(server: ToolRegistry): void {
     },
     async ({ account, maxResults, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasklists.list({
           maxResults: maxResults ?? 100,
@@ -45,12 +49,12 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Get a single tasklist by ID',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
       },
     },
     async ({ account, tasklistId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasklists.get({ tasklist: tasklistId });
         return {
@@ -73,7 +77,7 @@ export function registerTasksTools(server: ToolRegistry): void {
     },
     async ({ account, title }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasklists.insert({
           requestBody: { title },
@@ -93,13 +97,13 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Rename a tasklist (PATCH semantics)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
         title: z.string().describe('New title'),
       },
     },
     async ({ account, tasklistId, title }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasklists.patch({
           tasklist: tasklistId,
@@ -120,12 +124,12 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Delete a tasklist and every task inside it',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
       },
     },
     async ({ account, tasklistId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         await tasks.tasklists.delete({ tasklist: tasklistId });
         return {
@@ -145,7 +149,7 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'List tasks within a tasklist with rich filters',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
         maxResults: z.number().min(1).max(100).optional(),
         pageToken: z.string().optional(),
         showCompleted: coerceBoolean.optional().describe('Include completed tasks (default: true)'),
@@ -161,7 +165,7 @@ export function registerTasksTools(server: ToolRegistry): void {
     },
     async ({ account, tasklistId, ...params }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasks.list({
           tasklist: tasklistId,
@@ -182,13 +186,13 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Get a single task',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
-        taskId: z.string().describe('Task ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
+        taskId: z.string().min(1).describe('Task ID'),
       },
     },
     async ({ account, tasklistId, taskId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasks.get({ tasklist: tasklistId, task: taskId });
         return {
@@ -206,7 +210,7 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Create a new task. Use parent to nest under another task, previous to position after a sibling.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
         title: z.string().describe('Task title'),
         notes: z.string().optional().describe('Task description'),
         due: z.string().optional().describe('Due date in RFC 3339 (e.g. 2026-06-15T00:00:00.000Z)'),
@@ -217,7 +221,7 @@ export function registerTasksTools(server: ToolRegistry): void {
     },
     async ({ account, tasklistId, title, notes, due, status, parent, previous }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const requestBody: any = { title };
         if (notes !== undefined) requestBody.notes = notes;
@@ -245,8 +249,8 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Update a task (PATCH semantics — only supplied fields change)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
-        taskId: z.string().describe('Task ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
+        taskId: z.string().min(1).describe('Task ID'),
         title: z.string().optional(),
         notes: z.string().optional(),
         due: z.string().optional().describe('RFC 3339'),
@@ -255,7 +259,7 @@ export function registerTasksTools(server: ToolRegistry): void {
     },
     async ({ account, tasklistId, taskId, title, notes, due, status }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const requestBody: any = {};
         if (title !== undefined) requestBody.title = title;
@@ -264,7 +268,11 @@ export function registerTasksTools(server: ToolRegistry): void {
         if (status !== undefined) requestBody.status = status;
 
         if (Object.keys(requestBody).length === 0) {
-          return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'No fields to update' }) }], isError: true };
+          return invalidParams(
+            account as Account,
+            'No fields to update: every optional field was omitted, so the request would have been a no-op.',
+            'Pass at least one of: title, notes, due, status.',
+          );
         }
 
         const res = await tasks.tasks.patch({
@@ -287,13 +295,13 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Delete a task',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
-        taskId: z.string().describe('Task ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
+        taskId: z.string().min(1).describe('Task ID'),
       },
     },
     async ({ account, tasklistId, taskId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         await tasks.tasks.delete({ tasklist: tasklistId, task: taskId });
         return {
@@ -311,8 +319,8 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Reposition a task: change its parent, move it after a sibling, or move it to another tasklist',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Source tasklist ID'),
-        taskId: z.string().describe('Task ID'),
+        tasklistId: z.string().min(1).describe('Source tasklist ID'),
+        taskId: z.string().min(1).describe('Task ID'),
         parent: z.string().optional().describe('New parent task ID'),
         previous: z.string().optional().describe('New sibling to position after'),
         destinationTasklist: z.string().optional().describe('Move to a different tasklist'),
@@ -320,7 +328,7 @@ export function registerTasksTools(server: ToolRegistry): void {
     },
     async ({ account, tasklistId, taskId, parent, previous, destinationTasklist }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         const res = await tasks.tasks.move({
           tasklist: tasklistId,
@@ -344,12 +352,12 @@ export function registerTasksTools(server: ToolRegistry): void {
       description: 'Permanently delete every completed task in a tasklist',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        tasklistId: z.string().describe('Tasklist ID'),
+        tasklistId: z.string().min(1).describe('Tasklist ID'),
       },
     },
     async ({ account, tasklistId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const tasks = tasksClient({ version: 'v1', auth });
         await tasks.tasks.clear({ tasklist: tasklistId });
         return {

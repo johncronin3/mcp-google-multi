@@ -12,14 +12,13 @@
  *   MCP_ALLOWED_HOSTS / MCP_ALLOWED_ORIGINS — extras (comma-separated)
  *   MCP_HOSTED / K_SERVICE — hosted mode (no 8000/8787)
  */
-import { timingSafeEqual } from 'node:crypto';
 import {
   createServer,
   type IncomingMessage,
   type RequestListener,
   type ServerResponse,
 } from 'node:http';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { buildGoogleMcpServer } from './index.js';
 import {
   DEFAULT_PUBLIC_MCP_HOST,
@@ -108,13 +107,6 @@ export function expectedToken(): string | null {
   return process.env.MCP_HTTP_TOKEN || process.env.MCP_API_KEY || null;
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
-}
-
 function providedBearer(req: IncomingMessage): string {
   const auth = String(req.headers.authorization || '').trim();
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
@@ -169,7 +161,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
   const mcp = buildGoogleMcpServer();
   const pub = publicMcpHost();
   // Some SDK versions treat missing Origin as invalid when allowedOrigins is set.
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new NodeStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableDnsRebindingProtection: true,
     allowedHosts: [hostHeader, pub, `${pub}:443`, 'localhost', '127.0.0.1', '[::1]'],
@@ -200,12 +192,12 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   }
 
   if (path !== '/mcp') {
-    json(res, 404, { error: 'Not found' });
+    json(res, 404, { error: 'not_found', message: 'Not found' });
     return;
   }
 
   if (!expectedToken()) {
-    json(res, 503, { error: 'MCP HTTP token is not configured' });
+    json(res, 503, { error: 'mcp_http_unconfigured', message: 'MCP HTTP token is not configured' });
     return;
   }
   if (!authorized(req)) {
@@ -233,7 +225,7 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   } catch (err) {
     console.error('google-multi-mcp http error:', err);
     if (!res.headersSent) {
-      json(res, 500, { error: 'MCP request failed' });
+      json(res, 500, { error: 'internal', message: 'MCP request failed' });
     }
   }
 }

@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ACCOUNT_CONFIG } from '../src/accounts.js';
+import { getAccountSet } from '../src/accounts.js';
+const ACCOUNT_CONFIG = getAccountSet().configs;
 import { encryptToken, snapshotEncFile, writeToken, resetTokenOverlayForTests } from '../src/token-store.js';
 import {
   assertEncFileShape,

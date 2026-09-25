@@ -117,10 +117,8 @@ export function parseProveArgs(argv: string[]): ProveParseResult {
     };
   }
   if (!value.alias) {
-    return {
-      ok: false,
-      error: 'Missing --alias. Pass one account alias (or --account). Do not prove other aliases.',
-    };
+    const missingAlias = 'Missing --alias. Pass one account alias (or --account). Do not prove other aliases.';
+    return { ok: false, error: missingAlias };
   }
   return { ok: true, value };
 }

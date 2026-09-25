@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { OAuth2Client } from 'googleapis-common';
 import { attachRefreshPersist } from '../src/client.js';
 import { setTokenSecretWriterForTests } from '../src/token-secret.js';
-import { ACCOUNT_CONFIG } from '../src/accounts.js';
+import { getAccountSet } from '../src/accounts.js';
+const ACCOUNT_CONFIG = getAccountSet().configs;
 import {
   readToken,
   resetTokenOverlayForTests,

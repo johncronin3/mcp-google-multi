@@ -1,32 +1,30 @@
 import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
-import { coerceArray, coerceBoolean, coerceJson } from './_coerce.js';
+import { coerceArray, coerceBoolean, coerceJson, coerceNumber } from './_coerce.js';
 import { gmail as gmailClient } from '@googleapis/gmail';
 import { drive as driveClient } from '@googleapis/drive';
-import { ACCOUNTS } from '../accounts.js';
+import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
-import { handleGoogleApiError } from './_errors.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
+import { handleGoogleApiError, invalidParams, mapGoogleError } from './_errors.js';
+import { buildReplyHeaders, composeRaw, renderMarkdown, htmlToMarkdown, HeaderInjectionError, localPathUnavailableMessage, type ComposeAttachment } from './gmail-mime.js';
 import {
   deskSavePathRequiredMessage,
   hostedBytesPayload,
   isHostedHttp,
   mcpJsonResult,
 } from '../hosted.js';
-import {
-  buildRfc822Message,
-  buildReplyHeaders,
-  htmlToText,
-  localPathUnavailableMessage,
-  type MimeAttachment,
-} from './gmail-mime.js';
-import mime from 'mime-types';
+import { hostFilesRefused, prepareLocalDest } from './_local-files.js';
+import { checkOutbound } from '../outbound-allowlist.js';
+import addressparser from 'nodemailer/lib/addressparser/index.js';
+import { lookup as lookupMime } from 'mime-types';
+import { configDir } from '../config-file.js';
+import { getTokenDir } from '../accounts.js';
 import { sliceClean } from '../trim.js';
 import type { GmailMessageHeader, GmailMessageFull, GmailAttachment } from '../types.js';
 import * as path from 'path';
 import * as fs from 'fs';
 
-const accountEnum = z.enum(ACCOUNTS);
 
 function getHeader(
   headers: { name?: string | null; value?: string | null }[] | undefined,
@@ -53,18 +51,22 @@ function collectTextParts(part: any, plain: string[], html: string[], topLevel =
 function decodeBody(
   payload: any,
   rawHtml = false,
-): { body: string; bodyOrigin?: 'text/plain' | 'text/html' } {
+): { body: string; bodyFormat: 'plain' | 'markdown' | 'html' } {
   const plain: string[] = [];
   const html: string[] = [];
   collectTextParts(payload, plain, html, true);
   // Concatenating every plain leaf keeps forwarded/mixed messages whole;
   // any plain content beats HTML because alternatives duplicate the same body.
-  if (plain.length > 0) return { body: plain.join('\n\n'), bodyOrigin: 'text/plain' };
+  // A plain leaf is returned verbatim (byte-identical to v5).
+  if (plain.length > 0) return { body: plain.join('\n\n'), bodyFormat: 'plain' };
   if (html.length > 0) {
     const joined = html.join('\n\n');
-    return { body: rawHtml ? joined : htmlToText(joined), bodyOrigin: 'text/html' };
+    if (rawHtml) return { body: joined, bodyFormat: 'html' };
+    // HTML-only -> Markdown (D6). turndown failure degrades to plain text.
+    const { text, ok } = htmlToMarkdown(joined);
+    return { body: text, bodyFormat: ok ? 'markdown' : 'plain' };
   }
-  return { body: '' };
+  return { body: '', bodyFormat: 'plain' };
 }
 
 function getAttachments(payload: any): GmailAttachment[] {
@@ -90,30 +92,394 @@ function getAttachments(payload: any): GmailAttachment[] {
   return attachments;
 }
 
-async function resolveReplyHeaders(
+// A8 reply auto-fill: parse an RFC 5322 address header into lowercased
+// addr-specs (+ display names) using nodemailer's bundled addressparser, which
+// already rides the A4 compose dep. Groups are flattened; entries without an
+// address are dropped.
+interface ParsedAddress { address: string; name: string }
+function parseAddresses(headerValue: string): ParsedAddress[] {
+  if (!headerValue) return [];
+  const out: ParsedAddress[] = [];
+  const walk = (entries: any[]): void => {
+    for (const e of entries) {
+      if (e?.group) walk(e.group);
+      else if (e?.address) out.push({ address: String(e.address).trim(), name: String(e.name ?? '').trim() });
+    }
+  };
+  walk(addressparser(headerValue));
+  return out;
+}
+const normAddr = (a: string): string => a.trim().toLowerCase();
+/** Rebuild a comma-separated address header; composeRaw/MailComposer re-encodes
+ * names (RFC 2047) and the A4 CRLF pre-check applies, so derived recipients get
+ * the same header-injection guard as caller-supplied ones. */
+function formatAddresses(list: ParsedAddress[]): string {
+  return list.map((a) => (a.name ? `${a.name} <${a.address}>` : a.address)).join(', ');
+}
+
+/** Re: prefix unless the subject already carries one (case-insensitive, after
+ * trimming); never double-prefix. */
+export function deriveReplySubject(sourceSubject: string): string {
+  const s = sourceSubject.trim();
+  return /^re:/i.test(s) ? s : `Re: ${s}`;
+}
+
+// The account's own-address set (primary + Gmail send-as aliases) used to
+// exclude the caller from reply-all. Send-as rarely changes, so memoize per
+// process; a stale miss only costs one extra self-copy, never a wrong send.
+// Keyed by alias AND mailbox: two contexts can share an alias name.
+const ownAddressCache = new Map<string, Promise<Set<string>>>();
+function getOwnAddresses(gmail: any, account: string, primaryEmail: string): Promise<Set<string>> {
+  const key = `${account} ${normAddr(primaryEmail)}`;
+  let cached = ownAddressCache.get(key);
+  if (!cached) {
+    cached = (async () => {
+      const set = new Set<string>([normAddr(primaryEmail)]);
+      try {
+        const res = await gmail.users.settings.sendAs.list({ userId: 'me' });
+        for (const entry of res.data.sendAs ?? []) {
+          if (entry.sendAsEmail) set.add(normAddr(entry.sendAsEmail));
+        }
+      } catch {
+        // insufficient_scope / 5xx: degrade to the primary alone, never block the send.
+      }
+      return set;
+    })();
+    ownAddressCache.set(key, cached);
+  }
+  return cached;
+}
+
+interface ReplyDerivation {
+  inReplyTo: string;
+  references: string;
+  sourceFound: boolean;
+  to?: string;
+  cc?: string;
+  subject?: string;
+}
+
+/** Fetch the reply source once and derive threading headers plus (auto-fill)
+ * to/cc/subject. On any fetch failure, degrade to the API id for threading and
+ * report sourceFound:false so the caller can decide (per A8 error dispositions). */
+export async function resolveReply(
   gmail: any,
+  account: string,
+  primaryEmail: string,
   replyToMessageId: string,
-): Promise<{ inReplyTo: string; references: string }> {
+  replyAll: boolean,
+): Promise<ReplyDerivation> {
+  let headers: any[] | undefined;
   try {
     const meta = await gmail.users.messages.get({
       userId: 'me',
       id: replyToMessageId,
       format: 'metadata',
-      metadataHeaders: ['Message-ID', 'References'],
+      metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Message-ID', 'References'],
     });
-    const headers = meta.data.payload?.headers;
-    return buildReplyHeaders(
-      replyToMessageId,
-      getHeader(headers, 'Message-ID'),
-      getHeader(headers, 'References'),
-    );
+    headers = meta.data.payload?.headers;
   } catch {
     // Degrade to the API id (pre-lookup behavior) rather than blocking the send.
-    return { inReplyTo: replyToMessageId, references: replyToMessageId };
+    return { inReplyTo: replyToMessageId, references: replyToMessageId, sourceFound: false };
   }
+
+  const threading = buildReplyHeaders(
+    replyToMessageId,
+    getHeader(headers, 'Message-ID'),
+    getHeader(headers, 'References'),
+  );
+
+  const own = await getOwnAddresses(gmail, account, primaryEmail);
+  const fromList = parseAddresses(getHeader(headers, 'From'));
+  const toList = parseAddresses(getHeader(headers, 'To'));
+  const ccList = parseAddresses(getHeader(headers, 'Cc'));
+
+  // Replying to your own sent mail: From is self, so reply to the original To.
+  const fromIsSelf = fromList.length > 0 && fromList.every((a) => own.has(normAddr(a.address)));
+  const derivedToList = fromIsSelf ? toList : fromList;
+  const derivedTo = formatAddresses(derivedToList);
+
+  let derivedCc: string | undefined;
+  if (replyAll) {
+    const toAddrs = new Set(derivedToList.map((a) => normAddr(a.address)));
+    const seen = new Set<string>();
+    const ccOut: ParsedAddress[] = [];
+    for (const a of [...toList, ...ccList]) {
+      const key = normAddr(a.address);
+      if (own.has(key) || toAddrs.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      ccOut.push(a);
+    }
+    if (ccOut.length > 0) derivedCc = formatAddresses(ccOut);
+  }
+
+  return {
+    ...threading,
+    sourceFound: true,
+    to: derivedTo || undefined,
+    cc: derivedCc,
+    subject: deriveReplySubject(getHeader(headers, 'Subject')),
+  };
 }
 
 const BODY_CAP_CHARS = 50_000;
+// gmail_read_batch aggregate ceiling: a batch of up to 100 messages must never
+// blow the context window, so the summed serialized output is bounded here
+// (matches the tool's anthropic/maxResultSizeChars hint). Per-message bodies are
+// still individually capped at BODY_CAP_CHARS first.
+const BATCH_MAX_RESULT_CHARS = 100_000;
+// Gmail's messages.send raw/JSON path rejects messages near ~25 MB (the wire
+// message is base64-encoded, ~+33% over the raw bytes), so cap the ESTIMATED
+// ENCODED total there rather than the spec's nominal 35 MB raw (spike/live
+// correction — a 35 MB raw payload is ~47 MB on the wire and Gmail 400s it).
+const GMAIL_MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+const estimateEncoded = (rawBytes: number) => Math.ceil((rawBytes * 4) / 3);
+
+const attachmentNameFields = {
+  filename: z.string().optional().describe('MIME filename; defaults to the source name'),
+  contentType: z.string().optional().describe('MIME type; defaults to a lookup on the filename'),
+};
+const attachmentSchema = z
+  .array(
+    z.union([
+      z.object({
+        path: z.string().describe('Absolute local path to the file to attach (desk only; hosted Cloud Run cannot see laptop paths)'),
+        ...attachmentNameFields,
+      }),
+      z.object({
+        driveFileId: z.string().describe('Drive file ID — hosted-safe; Cloud Run fetches bytes via Drive API on this account'),
+        ...attachmentNameFields,
+      }),
+      z.object({
+        messageId: z.string().describe('Gmail message ID to copy an attachment from'),
+        attachmentId: z.string().describe('Gmail attachment ID from gmail_read'),
+        ...attachmentNameFields,
+      }),
+    ]),
+  )
+  .optional()
+  .describe('Files to attach: { path } on desk, or hosted-safe { driveFileId } / { messageId, attachmentId }');
+
+type SendAttachment = {
+  path?: string;
+  filename?: string;
+  contentType?: string;
+  driveFileId?: string;
+  messageId?: string;
+  attachmentId?: string;
+};
+
+/** Reads attachment files into buffers (THIS server reads them, never
+ * MailComposer), enforces absolute-path + total-size guards, and derives the
+ * MIME filename via basename so a caller name can't inject path separators. */
+// Deny reading anything inside the server's own secret dirs — mailing out
+// master.key / <alias>.enc / mcp-jwt.key would be a full-account-takeover
+// exfil channel (this same server also reads untrusted mail/drive content, so
+// a prompt-injected attach path is a real confused-deputy vector).
+function isInside(dir: string, target: string): boolean {
+  let d = path.resolve(dir);
+  let t = path.resolve(target);
+  // Windows path comparison is case-insensitive; without folding, a
+  // drive-letter/casing difference makes path.relative report "outside".
+  if (process.platform === 'win32') {
+    d = d.toLowerCase();
+    t = t.toLowerCase();
+  }
+  const rel = path.relative(d, t);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/** Deny if realTarget resolves inside `dir` (both realpath'd so a symlinked
+ * dir or 8.3/extended-prefix form can't slip past). */
+async function isInsideRealDir(dir: string, realTarget: string): Promise<boolean> {
+  let realDir: string;
+  try {
+    realDir = await fs.promises.realpath(dir);
+  } catch {
+    return false; // dir does not exist → target cannot be inside it
+  }
+  return isInside(realDir, realTarget);
+}
+
+export async function readAttachments(
+  raw: Array<{ path: string; filename?: string; contentType?: string }> | undefined,
+  bodyBytes: number,
+): Promise<ComposeAttachment[] | undefined> {
+  if (!raw || raw.length === 0) return undefined;
+  const denied = [configDir(), getTokenDir()];
+  const out: ComposeAttachment[] = [];
+  let total = bodyBytes;
+  for (const a of raw) {
+    if (!path.isAbsolute(a.path)) {
+      throw new GmailComposeError('validation_error', `attachment path must be absolute: ${path.basename(a.path)}`);
+    }
+    // Resolve symlinks BEFORE any confinement check, or a symlink defeats it.
+    let real: string;
+    try {
+      real = await fs.promises.realpath(a.path);
+    } catch {
+      throw new GmailComposeError('E_ATTACHMENT_NOT_FOUND', `attachment not found or unreadable: ${path.basename(a.path)}`);
+    }
+    for (const d of denied) {
+      if (await isInsideRealDir(d, real)) {
+        throw new GmailComposeError('E_ATTACHMENT_FORBIDDEN', `refusing to attach a file inside the server's config/token directory: ${path.basename(a.path)}`);
+      }
+    }
+    // stat BEFORE read: reject non-regular files (a FIFO would block readFile
+    // forever) and over-cap files without buffering them.
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(real);
+    } catch {
+      throw new GmailComposeError('E_ATTACHMENT_NOT_FOUND', `attachment not found or unreadable: ${path.basename(a.path)}`);
+    }
+    if (!stat.isFile()) {
+      throw new GmailComposeError('validation_error', `attachment is not a regular file: ${path.basename(a.path)}`);
+    }
+    total += stat.size;
+    if (estimateEncoded(total) > GMAIL_MAX_MESSAGE_BYTES) {
+      throw new GmailComposeError('E_ATTACHMENT_TOO_LARGE', `attachments + body exceed Gmail's ~${Math.round(GMAIL_MAX_MESSAGE_BYTES / 1024 / 1024)}MB message limit once encoded (estimated ${Math.round(estimateEncoded(total) / 1024 / 1024)}MB)`);
+    }
+    const content = await fs.promises.readFile(real);
+    const filename = path.basename(a.filename ?? a.path);
+    out.push({
+      filename,
+      content,
+      contentType: a.contentType || lookupMime(filename) || 'application/octet-stream',
+    });
+  }
+  return out;
+}
+
+/** Tagged compose-time failure; the handlers map it to an isError envelope.
+ * `category` is the taxonomy error field (default validation_error); reply
+ * auto-fill raises it as not_found when a source message can't be fetched. */
+class GmailComposeError extends Error {
+  constructor(public slug: string, message: string, public category: string = 'validation_error') {
+    super(message);
+  }
+}
+
+function asDownloadBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (typeof data === 'string') return Buffer.from(data, 'binary');
+  throw new Error('Drive files.get alt=media returned no binary data');
+}
+
+function findAttachmentMeta(payload: any, attachmentId: string): { filename: string; mimeType: string } | undefined {
+  if (payload?.body?.attachmentId === attachmentId) {
+    return { filename: payload.filename || 'attachment', mimeType: payload.mimeType || 'application/octet-stream' };
+  }
+  for (const part of payload?.parts ?? []) {
+    const found = findAttachmentMeta(part, attachmentId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+async function resolveRemoteAttachment(gmail: any, drive: any, spec: SendAttachment): Promise<ComposeAttachment> {
+  if (spec.driveFileId) {
+    const meta = await drive.files.get({
+      fileId: spec.driveFileId,
+      fields: 'id,name,mimeType',
+      supportsAllDrives: true,
+    });
+    const name = meta.data.name ?? 'attachment';
+    const mimeType = meta.data.mimeType ?? 'application/octet-stream';
+    if (typeof mimeType === 'string' && mimeType.startsWith('application/vnd.google-apps.')) {
+      throw new GmailComposeError(
+        'validation_error',
+        `Drive file "${name}" is a Google Workspace native type (${mimeType}); files.get alt=media cannot download it. Export a binary and attach that file id instead.`,
+      );
+    }
+    const res = await drive.files.get(
+      { fileId: spec.driveFileId, alt: 'media', supportsAllDrives: true },
+      { responseType: 'arraybuffer' },
+    );
+    const filename = spec.filename || name;
+    return {
+      filename,
+      content: asDownloadBuffer(res.data),
+      contentType: spec.contentType || mimeType,
+    };
+  }
+  if (spec.messageId && spec.attachmentId) {
+    let filename = spec.filename;
+    let contentType = spec.contentType;
+    if (!filename || !contentType) {
+      const msg = await gmail.users.messages.get({ userId: 'me', id: spec.messageId, format: 'full' });
+      const meta = findAttachmentMeta(msg.data.payload, spec.attachmentId);
+      filename = filename || meta?.filename || 'attachment';
+      contentType = contentType || meta?.mimeType || 'application/octet-stream';
+    }
+    const res = await gmail.users.messages.attachments.get({
+      userId: 'me',
+      messageId: spec.messageId,
+      id: spec.attachmentId,
+    });
+    const raw = res.data.data;
+    if (!raw) throw new GmailComposeError('validation_error', 'No attachment data returned');
+    return { filename: filename || 'attachment', content: Buffer.from(raw, 'base64url'), contentType: contentType || 'application/octet-stream' };
+  }
+  throw new GmailComposeError('validation_error', 'Each attachment needs exactly one source: path, driveFileId, or messageId+attachmentId');
+}
+
+/** Path attachments keep the desk guards in readAttachments. Drive and Gmail
+ * copies are the hosted path (Cloud Run has no laptop disk). */
+async function collectAttachments(
+  gmail: any,
+  auth: any,
+  raw: SendAttachment[] | undefined,
+  bodyBytes: number,
+): Promise<ComposeAttachment[] | undefined> {
+  if (!raw?.length) return undefined;
+  for (const a of raw) {
+    if (a.path && isHostedHttp()) {
+      throw new GmailComposeError('validation_error', localPathUnavailableMessage(a.path));
+    }
+  }
+  const pathItems = raw.filter((a): a is SendAttachment & { path: string } => Boolean(a.path));
+  const remoteItems = raw.filter((a) => !a.path);
+  const files = await readAttachments(pathItems, bodyBytes);
+  let total = bodyBytes + (files ?? []).reduce((n, f) => n + f.content.length, 0);
+  const extra: ComposeAttachment[] = [];
+  if (remoteItems.length > 0) {
+    const drive = driveClient({ version: 'v3', auth });
+    for (const spec of remoteItems) {
+      const part = await resolveRemoteAttachment(gmail, drive, spec);
+      total += part.content.length;
+      if (estimateEncoded(total) > GMAIL_MAX_MESSAGE_BYTES) {
+        throw new GmailComposeError(
+          'E_ATTACHMENT_TOO_LARGE',
+          `attachments + body exceed Gmail's ~${Math.round(GMAIL_MAX_MESSAGE_BYTES / 1024 / 1024)}MB message limit once encoded`,
+        );
+      }
+      extra.push(part);
+    }
+  }
+  const all = [...(files ?? []), ...extra];
+  return all.length > 0 ? all : undefined;
+}
+
+/** Maps compose-time (non-Google) failures to an isError envelope;
+ * returns null for anything else so the Google error mapper handles it. */
+function composeErrorResult(error: unknown, account: Account) {
+  const slug =
+    error instanceof HeaderInjectionError ? 'E_HEADER_INJECTION'
+    : error instanceof GmailComposeError ? error.slug
+    : null;
+  if (!slug) return null;
+  const category = error instanceof GmailComposeError ? error.category : 'validation_error';
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({ error: category, slug, message: (error as Error).message, retriable: false, account }),
+    }],
+    isError: true,
+  };
+}
 
 export function parseMessage(
   msg: any,
@@ -121,7 +487,7 @@ export function parseMessage(
   opts?: { rawHtml?: boolean },
 ): GmailMessageFull {
   const headers = msg.payload?.headers ?? [];
-  const { body, bodyOrigin } = decodeBody(msg.payload, opts?.rawHtml === true);
+  const { body, bodyFormat } = decodeBody(msg.payload, opts?.rawHtml === true);
   const capped = bodyCap !== undefined && body.length > bodyCap;
   const messageIdHeader = getHeader(headers, 'Message-ID');
   const inReplyTo = getHeader(headers, 'In-Reply-To');
@@ -135,7 +501,7 @@ export function parseMessage(
     cc: getHeader(headers, 'Cc'),
     date: getHeader(headers, 'Date'),
     body: capped ? sliceClean(body, bodyCap) : body,
-    ...(bodyOrigin ? { bodyOrigin } : {}),
+    bodyFormat,
     ...(capped ? { bodyTruncated: true, bodyTotalChars: body.length } : {}),
     ...(messageIdHeader ? { messageIdHeader } : {}),
     ...(inReplyTo ? { inReplyTo } : {}),
@@ -146,221 +512,149 @@ export function parseMessage(
   };
 }
 
-type AttachmentSpec = {
-  driveFileId?: string;
-  messageId?: string;
-  attachmentId?: string;
-  path?: string;
-  filename?: string;
-  mimeType?: string;
-};
-
-const attachmentSpecSchema = z.object({
-  driveFileId: z.string().optional()
-    .describe('Drive file ID — hosted-safe; Cloud Run fetches bytes via Drive API on this account'),
-  messageId: z.string().optional()
-    .describe('Gmail message ID to copy an attachment from (requires attachmentId)'),
-  attachmentId: z.string().optional()
-    .describe('Gmail attachment ID from gmail_read (requires messageId)'),
-  path: z.string().optional()
-    .describe('Absolute path on the MCP host disk. Desktop-only; hosted Cloud Run cannot see laptop paths'),
-  filename: z.string().optional().describe('Override filename on the MIME part'),
-  mimeType: z.string().optional().describe('Override MIME type'),
-}).superRefine((val, ctx) => {
-  const hasDrive = Boolean(val.driveFileId);
-  const hasPath = Boolean(val.path);
-  const hasGmail = Boolean(val.messageId) || Boolean(val.attachmentId);
-  const n = Number(hasDrive) + Number(hasPath) + Number(hasGmail);
-  if (n !== 1) {
-    ctx.addIssue({
-      code: 'custom',
-      message: 'Each attachment needs exactly one source: driveFileId, path, or messageId+attachmentId',
-    });
-    return;
-  }
-  if (hasGmail && (!val.messageId || !val.attachmentId)) {
-    ctx.addIssue({
-      code: 'custom',
-      message: 'Gmail copy attachments require both messageId and attachmentId',
-    });
-  }
-});
-
-const attachmentsField = coerceJson(z.array(attachmentSpecSchema)).optional()
-  .describe(
-    'Optional attachments. Hosted: pass driveFileId (Drive is the hosted path) or messageId+attachmentId. ' +
-    'path is desktop-only; hosted Cloud Run cannot see laptop paths.',
-  );
-
-function asBuffer(data: unknown): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (data instanceof ArrayBuffer) return Buffer.from(data);
-  if (ArrayBuffer.isView(data)) {
-    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  }
-  if (typeof data === 'string') return Buffer.from(data, 'binary');
-  throw new Error('Drive files.get alt=media returned no binary data');
-}
-
-function findAttachmentMeta(
-  payload: any,
-  attachmentId: string,
-): { filename: string; mimeType: string } | undefined {
-  if (payload?.body?.attachmentId === attachmentId) {
-    return {
-      filename: payload.filename || 'attachment',
-      mimeType: payload.mimeType || 'application/octet-stream',
-    };
-  }
-  for (const part of payload?.parts ?? []) {
-    const found = findAttachmentMeta(part, attachmentId);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-async function resolveOneAttachment(
+/**
+ * A9 gmail_read_batch core: fetch N ids with bounded parallelism, parse each,
+ * and bound the aggregate output. Order is preserved by input index. A per-id
+ * failure becomes a `{ id, error }` entry; an account-wide auth/scope failure
+ * is rethrown so the caller maps it to a whole-call isError. Returns the
+ * ordered per-id entries followed by a trailing counts summary.
+ */
+export async function readBatch(
   gmail: any,
-  drive: any,
-  spec: AttachmentSpec,
-): Promise<MimeAttachment> {
-  if (spec.path) {
-    if (isHostedHttp()) {
-      throw new Error(localPathUnavailableMessage(spec.path));
-    }
-    try {
-      await fs.promises.access(spec.path, fs.constants.R_OK);
-    } catch {
-      throw new Error(localPathUnavailableMessage(spec.path));
-    }
-    const data = await fs.promises.readFile(spec.path);
-    const filename = spec.filename || path.basename(spec.path);
-    const looked = mime.lookup(spec.path);
-    const mimeType = spec.mimeType || (looked || 'application/octet-stream');
-    return { filename, mimeType, data };
-  }
-
-  if (spec.driveFileId) {
-    const meta = await drive.files.get({
-      fileId: spec.driveFileId,
-      fields: 'id,name,mimeType',
-      supportsAllDrives: true,
-    });
-    const name = meta.data.name ?? 'attachment';
-    const mimeType = meta.data.mimeType ?? 'application/octet-stream';
-    if (typeof mimeType === 'string' && mimeType.startsWith('application/vnd.google-apps.')) {
-      throw new Error(
-        `Drive file "${name}" is a Google Workspace native type (${mimeType}); ` +
-          'files.get alt=media cannot download it. Export a binary (drive_export) and attach that file id instead.',
-      );
-    }
-    const res = await drive.files.get(
-      { fileId: spec.driveFileId, alt: 'media', supportsAllDrives: true },
-      { responseType: 'arraybuffer' },
-    );
-    return {
-      filename: spec.filename || name,
-      mimeType: spec.mimeType || mimeType,
-      data: asBuffer(res.data),
-    };
-  }
-
-  if (spec.messageId && spec.attachmentId) {
-    let filename = spec.filename;
-    let mimeType = spec.mimeType;
-    if (!filename || !mimeType) {
-      const msg = await gmail.users.messages.get({
-        userId: 'me',
-        id: spec.messageId,
-        format: 'full',
-      });
-      const meta = findAttachmentMeta(msg.data.payload, spec.attachmentId);
-      filename = filename || meta?.filename || 'attachment';
-      mimeType = mimeType || meta?.mimeType || 'application/octet-stream';
-    }
-    const res = await gmail.users.messages.attachments.get({
-      userId: 'me',
-      messageId: spec.messageId,
-      id: spec.attachmentId,
-    });
-    const raw = res.data.data;
-    if (!raw) throw new Error('No attachment data returned');
-    return {
-      filename,
-      mimeType,
-      data: Buffer.from(raw, 'base64url'),
-    };
-  }
-
-  throw new Error('Each attachment needs exactly one source: driveFileId, path, or messageId+attachmentId');
-}
-
-async function resolveAttachments(
-  gmail: any,
-  auth: any,
-  specs: AttachmentSpec[] | undefined,
-): Promise<MimeAttachment[]> {
-  if (!specs?.length) return [];
-  const drive = driveClient({ version: 'v3', auth });
-  const out: MimeAttachment[] = [];
-  for (const spec of specs) {
-    out.push(await resolveOneAttachment(gmail, drive, spec));
-  }
-  return out;
-}
-
-async function composeEncodedRaw(
   account: Account,
-  gmail: any,
-  auth: any,
-  args: {
-    to: string;
-    subject: string;
-    body: string;
-    htmlBody?: string;
-    cc?: string;
-    replyToMessageId?: string;
-    attachments?: AttachmentSpec[];
-  },
-): Promise<string> {
-  const config = (await import('../accounts.js')).ACCOUNT_CONFIG[account];
-  let inReplyTo: string | undefined;
-  let references: string | undefined;
-  if (args.replyToMessageId) {
-    const h = await resolveReplyHeaders(gmail, args.replyToMessageId);
-    inReplyTo = h.inReplyTo;
-    references = h.references;
+  ids: string[],
+  full: boolean,
+  rawHtml: boolean,
+): Promise<any[]> {
+  if (ids.length === 0) {
+    throw new GmailComposeError('validation_error', '`ids` must be a non-empty array of 1..100 message IDs.');
   }
-  const attachments = await resolveAttachments(gmail, auth, args.attachments);
-  const rawMessage = buildRfc822Message({
-    from: config.email,
-    to: args.to,
-    subject: args.subject,
-    body: args.body,
-    htmlBody: args.htmlBody,
-    cc: args.cc,
-    inReplyTo,
-    references,
-    attachments,
-  });
-  return Buffer.from(rawMessage, 'utf-8').toString('base64url');
+  if (ids.length > 100) {
+    throw new GmailComposeError('validation_error', `\`ids\` accepts at most 100 message IDs per call (got ${ids.length}).`);
+  }
+
+  const cap = full ? undefined : BODY_CAP_CHARS;
+  const CHUNK_SIZE = 10;
+  const entries: any[] = new Array(ids.length);
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+    const slice = ids.slice(i, i + CHUNK_SIZE);
+    const settled = await Promise.all(slice.map(async (id, j) => {
+      try {
+        const res = await gmail.users.messages.get({ userId: 'me', id, format: 'full' });
+        return { idx: i + j, id, ok: true as const, data: res.data };
+      } catch (err: any) {
+        return { idx: i + j, id, ok: false as const, err };
+      }
+    }));
+    for (const s of settled) {
+      if (s.ok) {
+        entries[s.idx] = parseMessage(s.data, cap, { rawHtml });
+        ok++;
+      } else {
+        const env = mapGoogleError(s.err, account);
+        // Auth/scope problems are account-wide, not id-specific: fail the whole
+        // batch rather than emit N identical per-item errors.
+        if (env.error === 'auth_required' || env.error === 'insufficient_scope' || env.error === 'invalid_scope') {
+          throw s.err;
+        }
+        const { account: _dropped, ...itemError } = env;
+        entries[s.idx] = { id: s.id, error: itemError };
+        failed++;
+      }
+    }
+  }
+
+  // Aggregate guard: walk in order, accumulating serialized size. Once the
+  // running total would exceed the maxResultSizeChars budget, cap this and every
+  // later success body so a big batch never blows the context window.
+  let running = 0;
+  let truncatedAny = false;
+  let exhausted = false;
+  for (const e of entries) {
+    if (!e || e.error) {
+      running += JSON.stringify(e ?? {}).length;
+      continue;
+    }
+    const body: string = e.body ?? '';
+    if (exhausted) {
+      if (body.length > 0) {
+        if (!e.bodyTruncated) e.bodyTotalChars = body.length;
+        e.body = '';
+        e.bodyTruncated = true;
+        truncatedAny = true;
+      }
+      running += JSON.stringify(e).length;
+      continue;
+    }
+    const serialized = JSON.stringify(e).length;
+    if (running + serialized > BATCH_MAX_RESULT_CHARS) {
+      const envelope = serialized - body.length; // non-body overhead of this entry
+      const remaining = Math.max(0, BATCH_MAX_RESULT_CHARS - running - envelope);
+      if (!e.bodyTruncated) e.bodyTotalChars = body.length;
+      e.body = sliceClean(body, Math.min(body.length, remaining));
+      e.bodyTruncated = true;
+      truncatedAny = true;
+      exhausted = true;
+      running += JSON.stringify(e).length;
+    } else {
+      running += serialized;
+    }
+  }
+
+  const summary = { counts: { ok, failed }, ...(truncatedAny ? { truncated: true } : {}) };
+  return [...entries, summary];
 }
 
-export function registerGmailTools(server: ToolRegistry): void {
+/** Compact gmail_search row: just the pick-one-message selection signal, with
+ * the snippet flattened to one bounded line. Pure. */
+export function compactMessageRow(m: GmailMessageHeader): { id: string; from: string; subject: string; date: string; snippet: string } {
+  const snippet = m.snippet.replace(/\s+/g, ' ').trim();
+  return {
+    id: m.id,
+    from: m.from,
+    subject: m.subject,
+    date: m.date,
+    snippet: snippet.length > 120 ? `${snippet.slice(0, 119)}…` : snippet,
+  };
+}
+
+export function registerGmailTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const getClientFn = deps.getClientFn ?? getClient;
+  const localFiles = deps.localFiles ?? true;
+  const registerHostFileTool = localFiles ? server.registerTool : (() => undefined) as unknown as typeof server.registerTool;
   server.registerTool(
     'gmail_search',
     {
-      description: 'Search messages in a Gmail account',
+      description:
+        'Search messages in a Gmail account. Returns compact rows (id, from, subject, date, snippet); ' +
+        'pass full=true for threadId, to, labelIds and the untruncated snippet.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         query: z.string().describe('Gmail search syntax, e.g. "from:monaam is:unread"'),
-        maxResults: z.number().min(1).max(100).default(20).optional()
+        maxResults: coerceNumber(z.number().min(1).max(100)).optional()
           .describe('Max results to return (default: 20, max: 100)'),
+        full: coerceBoolean.optional().describe('Return the full row shape instead of the compact default'),
       },
     },
-    async ({ account, query, maxResults }) => {
+    async ({ account, query, maxResults, full }) => {
       try {
-        const auth = await getClient(account as Account);
+        // Gmail treats a blank `q` as no filter, so a caller passing an unset
+        // variable got the whole mailbox back as if it had matched.
+        if (query.trim() === '') {
+          return invalidParams(
+            account as Account,
+            '`query` is empty, and Gmail reads an empty query as "match everything".',
+            'Pass a real Gmail search term such as "is:unread" or "from:someone@example.com". Returning the whole mailbox for a blank query would look like a successful search.',
+          );
+        }
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
 
         const listRes = await gmail.users.messages.list({
@@ -398,21 +692,27 @@ export function registerGmailTools(server: ToolRegistry): void {
           }
         }
 
+        // Search is a pick-one-message step ~always followed by gmail_read;
+        // the compact row is the selection signal, the rest was measured burn
+        // (p90 14.4k chars per call). full=true restores the pre-6.0 shape.
+        const rows = full === true ? results : results.map(compactMessageRow);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(rows, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
   server.registerTool(
     'gmail_read',
     {
+      _meta: { 'anthropic/maxResultSizeChars': 50_000 },
       description: 'Read a full Gmail message by ID (body capped at 50k chars unless full=true)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        messageId: z.string().describe('Gmail message ID'),
+        messageId: z.string().min(1).describe('Gmail message ID'),
         full: coerceBoolean.optional().describe('Return the entire body without the character cap'),
         rawHtml: coerceBoolean.optional()
           .describe('Return the HTML body unconverted instead of the plain-text rendering (HTML-only messages)'),
@@ -420,7 +720,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, messageId, full, rawHtml }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
 
         const res = await gmail.users.messages.get({
@@ -434,17 +734,19 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
   server.registerTool(
     'gmail_read_thread',
     {
+      _meta: { 'anthropic/maxResultSizeChars': 50_000 },
       description: 'Read all messages in a Gmail thread (bodies capped at 50k chars each unless full=true). mode=summary returns headers + snippets only.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        threadId: z.string().describe('Gmail thread ID'),
+        threadId: z.string().min(1).describe('Gmail thread ID'),
         full: coerceBoolean.optional().describe('Return entire bodies without the character cap'),
         rawHtml: coerceBoolean.optional()
           .describe('Return HTML bodies unconverted instead of the plain-text rendering (HTML-only messages)'),
@@ -454,7 +756,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, threadId, full, rawHtml, mode }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
 
         if (mode === 'summary') {
@@ -489,35 +791,113 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(messages, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
+      }
+    },
+  );
+  server.registerTool(
+    'gmail_read_batch',
+    {
+      _meta: { 'anthropic/maxResultSizeChars': BATCH_MAX_RESULT_CHARS },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+      description: 'Read many Gmail messages by ID in one call, collapsing the search→read triage loop. Bodies are capped at 50k chars each (unless full=true) and the aggregate output is bounded. Returns one ordered entry per id plus a trailing counts summary; a single failed id does NOT fail the batch.',
+      inputSchema: {
+        account: accountEnum.describe('Google account alias'),
+        ids: coerceArray(z.string()).describe('Gmail message IDs to read (1..100). Comma-separated string or JSON array.'),
+        full: coerceBoolean.optional().describe('Return entire bodies without the per-message 50k character cap'),
+        rawHtml: coerceBoolean.optional()
+          .describe('Return HTML bodies unconverted instead of the plain-text rendering (HTML-only messages)'),
+      },
+    },
+    async ({ account, ids, full, rawHtml }) => {
+      try {
+        const auth = await getClientFn(account as Account);
+        const gmail = gmailClient({ version: 'v1', auth });
+        const result = await readBatch(gmail, account as Account, (ids as string[]) ?? [], full === true, rawHtml === true);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (error: any) {
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
   server.registerTool(
     'gmail_send',
     {
-      description: 'Send an email from a Gmail account, optionally with attachments',
+      description: 'Send an email from a Gmail account',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        to: z.string().describe('Recipient(s), comma-separated'),
-        subject: z.string().describe('Email subject'),
-        body: z.string().describe('Plain text body (always required; also used as fallback when htmlBody is set)'),
+        to: z.string().optional().describe('Recipient(s), comma-separated. Optional when replyToMessageId is set (derived from the source); a supplied value wins.'),
+        subject: z.string().optional().describe('Email subject. Optional when replyToMessageId is set (derived as "Re: ..."); a supplied value wins.'),
+        body: z.string().describe('Email body as Markdown (headings, links, lists, tables, blockquotes). Rendered to HTML for the rich part; the Markdown source is the plain-text part.'),
         htmlBody: z.string().optional()
-          .describe('Optional HTML body. When set, sends multipart/alternative so HTML-capable clients render the rich version. Use bare tags only: <p>, <a>, <br>, <strong>, <em>, <ul><li>.'),
-        cc: z.string().optional().describe('CC recipients, comma-separated'),
+          .describe('REMOVED in v6: author Markdown in `body` instead; for literal HTML (e.g. inline color) pass `allowRawHtml: true`. Passing htmlBody now errors.'),
+        allowRawHtml: z.boolean().optional()
+          .describe('When true, raw HTML in `body` passes through into the HTML part instead of being escaped. Default false (HTML is shown literally).'),
+        cc: z.string().optional().describe('CC recipients, comma-separated. With replyToMessageId + replyAll, derived from the source minus your own addresses; a supplied value wins.'),
         replyToMessageId: z.string().optional()
-          .describe('Message ID to reply to (sets In-Reply-To and References headers)'),
+          .describe('Message ID to reply to. Sets In-Reply-To/References and, unless overridden, derives to/subject (and cc when replyAll) from the source, so you need not read it first.'),
+        replyAll: coerceBoolean.optional()
+          .describe('With replyToMessageId: include the source To+Cc (minus your own addresses) in cc. Default false (reply to sender only).'),
         replyToThreadId: z.string().optional()
           .describe('Thread ID to send the message in'),
-        attachments: attachmentsField,
+        ...(localFiles ? { attachments: coerceJson(attachmentSchema) } : {}),
       },
     },
-    async ({ account, to, subject, body, htmlBody, cc, replyToMessageId, replyToThreadId, attachments }) => {
+    async ({ account, to, subject, body, htmlBody, allowRawHtml, cc, replyToMessageId, replyAll, replyToThreadId, attachments }) => {
+      if (!localFiles && (attachments as unknown[] | undefined)?.length) return hostFilesRefused(account, 'attachments');
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
-        const encoded = await composeEncodedRaw(account as Account, gmail, auth, {
-          to, subject, body, htmlBody, cc, replyToMessageId, attachments,
+        const config = server.accountSet().configs[account as Account];
+
+        if (htmlBody !== undefined) {
+          throw new GmailComposeError('E_HTMLBODY_REMOVED', 'htmlBody was removed in v6: author Markdown in `body`; for literal HTML pass `allowRawHtml: true`.');
+        }
+        const reply = replyToMessageId
+          ? await resolveReply(gmail, account as Account, config.email, replyToMessageId, replyAll === true)
+          : undefined;
+        // Caller value > derived value. A missing source with no caller `to`
+        // means we cannot address the reply: fail rather than silently drop it.
+        if (reply && !reply.sourceFound && to === undefined) {
+          throw new GmailComposeError('E_REPLY_SOURCE_NOT_FOUND', `reply source message ${replyToMessageId} not found; recipients could not be derived and no \`to\` was provided.`, 'not_found');
+        }
+        const finalTo = to ?? reply?.to;
+        const finalSubject = subject ?? reply?.subject;
+        const finalCc = cc ?? reply?.cc;
+        if (finalTo === undefined || finalTo === '') {
+          throw new GmailComposeError('E_MISSING_RECIPIENT', '`to` is required (or set replyToMessageId to derive it from the source).');
+        }
+        if (finalSubject === undefined) {
+          throw new GmailComposeError('E_MISSING_SUBJECT', '`subject` is required (or set replyToMessageId to derive it from the source).');
+        }
+        // After derivation so reply-autofilled recipients are gated too.
+        const outbound = checkOutbound(
+          'gmail recipient',
+          [...parseAddresses(finalTo), ...parseAddresses(finalCc ?? '')].map((a) => a.address),
+          account as Account,
+        );
+        if (outbound) return outbound;
+        const html = renderMarkdown(body, allowRawHtml === true);
+        const files = await collectAttachments(
+          gmail,
+          auth,
+          attachments as SendAttachment[] | undefined,
+          Buffer.byteLength(body ?? '') + Buffer.byteLength(html),
+        );
+        const encoded = await composeRaw({
+          from: config.email,
+          to: finalTo,
+          subject: finalSubject,
+          text: body,
+          html,
+          cc: finalCc,
+          inReplyTo: reply?.inReplyTo,
+          references: reply?.references,
+          attachments: files,
         });
 
         const sendParams: any = {
@@ -538,11 +918,12 @@ export function registerGmailTools(server: ToolRegistry): void {
           }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
-  server.registerTool(
+  registerHostFileTool(
     'gmail_download_attachment',
     {
       description:
@@ -551,18 +932,17 @@ export function registerGmailTools(server: ToolRegistry): void {
         'Use gmail_read first to get the attachmentId.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        messageId: z.string().describe('The Gmail message ID'),
-        attachmentId: z.string().describe('The attachment ID from gmail_read response'),
+        messageId: z.string().min(1).describe('The Gmail message ID'),
+        attachmentId: z.string().min(1).describe('The attachment ID from gmail_read response'),
         filename: z.string().describe('Filename to save as (e.g. report.xlsx)'),
-        savePath: z.string().optional().describe(
-          'Desk only: absolute directory path to save into (e.g. /home/user/Downloads). ' +
-          'Ignored on hosted Cloud Run — bytes are returned in the tool result.',
+        savePath: z.string().min(1).optional().describe(
+          'Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result.',
         ),
       },
     },
     async ({ account, messageId, attachmentId, filename, savePath }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
 
         const res = await gmail.users.messages.attachments.get({
@@ -576,64 +956,107 @@ export function registerGmailTools(server: ToolRegistry): void {
 
         const buffer = Buffer.from(data, 'base64url');
         const safeName = path.basename(filename);
-        const looked = mime.lookup(safeName);
-        const mimeType = (looked || 'application/octet-stream') as string;
-
         if (isHostedHttp()) {
+          const looked = lookupMime(safeName);
           return mcpJsonResult(
             hostedBytesPayload({
               filename: safeName,
-              mimeType,
+              mimeType: typeof looked === 'string' ? looked : 'application/octet-stream',
               data: buffer,
               savePathProvided: Boolean(savePath),
             }),
           );
         }
-
         if (!savePath) {
           return {
             isError: true as const,
             content: [{ type: 'text' as const, text: deskSavePathRequiredMessage() }],
           };
         }
-
-        // Strip path components so callers can't escape savePath via "../".
-        const fullPath = path.join(savePath, safeName);
+        const fullPath = prepareLocalDest(savePath, safeName);
         await fs.promises.writeFile(fullPath, buffer, { mode: 0o600 });
 
         return {
           content: [{ type: 'text' as const, text: `Saved to ${fullPath} (${buffer.length} bytes)` }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
   server.registerTool(
     'gmail_create_draft',
     {
-      description: 'Create a Gmail draft without sending, optionally with attachments',
+      description: 'Create a Gmail draft without sending',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        to: z.string().describe('Recipient(s), comma-separated'),
-        subject: z.string().describe('Email subject'),
-        body: z.string().describe('Plain text body (always required; also used as fallback when htmlBody is set)'),
+        to: z.string().optional().describe('Recipient(s), comma-separated. Optional when replyToMessageId is set (derived from the source); a supplied value wins.'),
+        subject: z.string().optional().describe('Email subject. Optional when replyToMessageId is set (derived as "Re: ..."); a supplied value wins.'),
+        body: z.string().describe('Email body as Markdown (headings, links, lists, tables, blockquotes). Rendered to HTML for the rich part; the Markdown source is the plain-text part.'),
         htmlBody: z.string().optional()
-          .describe('Optional HTML body. When set, drafts as multipart/alternative so HTML-capable clients render the rich version. Use bare tags only: <p>, <a>, <br>, <strong>, <em>, <ul><li>.'),
-        cc: z.string().optional().describe('CC recipients, comma-separated'),
+          .describe('REMOVED in v6: author Markdown in `body` instead; for literal HTML (e.g. inline color) pass `allowRawHtml: true`. Passing htmlBody now errors.'),
+        allowRawHtml: z.boolean().optional()
+          .describe('When true, raw HTML in `body` passes through into the HTML part instead of being escaped. Default false (HTML is shown literally).'),
+        cc: z.string().optional().describe('CC recipients, comma-separated. With replyToMessageId + replyAll, derived from the source minus your own addresses; a supplied value wins.'),
         replyToMessageId: z.string().optional()
-          .describe('Message ID to reply to (sets In-Reply-To and References headers)'),
+          .describe('Message ID to reply to. Sets In-Reply-To/References and, unless overridden, derives to/subject (and cc when replyAll) from the source, so you need not read it first.'),
+        replyAll: coerceBoolean.optional()
+          .describe('With replyToMessageId: include the source To+Cc (minus your own addresses) in cc. Default false (reply to sender only).'),
         replyToThreadId: z.string().optional()
           .describe('Thread ID to associate the draft with'),
-        attachments: attachmentsField,
+        ...(localFiles ? { attachments: coerceJson(attachmentSchema) } : {}),
       },
     },
-    async ({ account, to, subject, body, htmlBody, cc, replyToMessageId, replyToThreadId, attachments }) => {
+    async ({ account, to, subject, body, htmlBody, allowRawHtml, cc, replyToMessageId, replyAll, replyToThreadId, attachments }) => {
+      if (!localFiles && (attachments as unknown[] | undefined)?.length) return hostFilesRefused(account, 'attachments');
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
-        const encoded = await composeEncodedRaw(account as Account, gmail, auth, {
-          to, subject, body, htmlBody, cc, replyToMessageId, attachments,
+        const config = server.accountSet().configs[account as Account];
+
+        if (htmlBody !== undefined) {
+          throw new GmailComposeError('E_HTMLBODY_REMOVED', 'htmlBody was removed in v6: author Markdown in `body`; for literal HTML pass `allowRawHtml: true`.');
+        }
+        const reply = replyToMessageId
+          ? await resolveReply(gmail, account as Account, config.email, replyToMessageId, replyAll === true)
+          : undefined;
+        if (reply && !reply.sourceFound && to === undefined) {
+          throw new GmailComposeError('E_REPLY_SOURCE_NOT_FOUND', `reply source message ${replyToMessageId} not found; recipients could not be derived and no \`to\` was provided.`, 'not_found');
+        }
+        const finalTo = to ?? reply?.to;
+        const finalSubject = subject ?? reply?.subject;
+        const finalCc = cc ?? reply?.cc;
+        if (finalTo === undefined || finalTo === '') {
+          throw new GmailComposeError('E_MISSING_RECIPIENT', '`to` is required (or set replyToMessageId to derive it from the source).');
+        }
+        if (finalSubject === undefined) {
+          throw new GmailComposeError('E_MISSING_SUBJECT', '`subject` is required (or set replyToMessageId to derive it from the source).');
+        }
+        // After derivation so reply-autofilled recipients are gated too.
+        const outbound = checkOutbound(
+          'gmail recipient',
+          [...parseAddresses(finalTo), ...parseAddresses(finalCc ?? '')].map((a) => a.address),
+          account as Account,
+        );
+        if (outbound) return outbound;
+        const html = renderMarkdown(body, allowRawHtml === true);
+        const files = await collectAttachments(
+          gmail,
+          auth,
+          attachments as SendAttachment[] | undefined,
+          Buffer.byteLength(body ?? '') + Buffer.byteLength(html),
+        );
+        const encoded = await composeRaw({
+          from: config.email,
+          to: finalTo,
+          subject: finalSubject,
+          text: body,
+          html,
+          cc: finalCc,
+          inReplyTo: reply?.inReplyTo,
+          references: reply?.references,
+          attachments: files,
         });
 
         const draftParams: any = {
@@ -660,7 +1083,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -671,14 +1095,14 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Add or remove labels on a Gmail message. Use system label IDs like STARRED, UNREAD, INBOX, TRASH, or custom label IDs from gmail_list_labels.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        messageId: z.string().describe('Gmail message ID'),
+        messageId: z.string().min(1).describe('Gmail message ID'),
         addLabelIds: coerceArray(z.string()).optional().describe('Label IDs to add'),
         removeLabelIds: coerceArray(z.string()).optional().describe('Label IDs to remove'),
       },
     },
     async ({ account, messageId, addLabelIds, removeLabelIds }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.messages.modify({
           userId: 'me',
@@ -692,7 +1116,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -703,19 +1128,20 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Move a Gmail message to Trash (recoverable)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        messageId: z.string().describe('Gmail message ID'),
+        messageId: z.string().min(1).describe('Gmail message ID'),
       },
     },
     async ({ account, messageId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.messages.trash({ userId: 'me', id: messageId });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -726,19 +1152,20 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Permanently and irreversibly delete a Gmail message. No recovery possible.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        messageId: z.string().describe('Gmail message ID'),
+        messageId: z.string().min(1).describe('Gmail message ID'),
       },
     },
     async ({ account, messageId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         await gmail.users.messages.delete({ userId: 'me', id: messageId });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ deleted: true, messageId }, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -756,7 +1183,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, messageIds, addLabelIds, removeLabelIds }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         await gmail.users.messages.batchModify({
           userId: 'me',
@@ -770,7 +1197,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify({ modified: messageIds.length }, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -786,7 +1214,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, messageIds }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         await gmail.users.messages.batchDelete({
           userId: 'me',
@@ -796,7 +1224,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify({ deleted: messageIds.length }, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -814,7 +1243,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, maxResults, query }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.drafts.list({
           userId: 'me',
@@ -825,7 +1254,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data.drafts ?? [], null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -836,12 +1266,12 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Read the full content of a specific Gmail draft',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        draftId: z.string().describe('Draft ID'),
+        draftId: z.string().min(1).describe('Draft ID'),
       },
     },
     async ({ account, draftId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.drafts.get({
           userId: 'me',
@@ -852,7 +1282,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -863,12 +1294,12 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Send an existing Gmail draft by its draft ID',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        draftId: z.string().describe('Draft ID to send'),
+        draftId: z.string().min(1).describe('Draft ID to send'),
       },
     },
     async ({ account, draftId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.drafts.send({
           userId: 'me',
@@ -878,7 +1309,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -893,14 +1325,15 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.labels.list({ userId: 'me' });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data.labels ?? [], null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -911,7 +1344,7 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Create a new custom Gmail label',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        name: z.string().describe('Label name, e.g. "Ideacrafters/ComptaLegal"'),
+        name: z.string().describe('Label name, e.g. "Work/Projects" (nested labels use "/")'),
         messageListVisibility: z.enum(['show', 'hide']).optional()
           .describe('Whether messages with this label show in message list (default: show)'),
         labelListVisibility: z.enum(['labelShow', 'labelShowIfUnread', 'labelHide']).optional()
@@ -920,7 +1353,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, name, messageListVisibility, labelListVisibility }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.labels.create({
           userId: 'me',
@@ -934,7 +1367,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -945,19 +1379,20 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Permanently delete a Gmail label and remove it from all messages',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        labelId: z.string().describe('Label ID to delete'),
+        labelId: z.string().min(1).describe('Label ID to delete'),
       },
     },
     async ({ account, labelId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         await gmail.users.labels.delete({ userId: 'me', id: labelId });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ deleted: true, labelId }, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -972,14 +1407,15 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.getProfile({ userId: 'me' });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -990,7 +1426,7 @@ export function registerGmailTools(server: ToolRegistry): void {
       description: 'Get all mailbox changes since a given historyId. Useful for detecting new emails since last check.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        startHistoryId: z.string().describe('History ID from a previous gmail_get_profile or gmail_read response'),
+        startHistoryId: z.string().min(1).describe('History ID from a previous gmail_get_profile or gmail_read response'),
         maxResults: z.number().min(1).max(500).default(100).optional()
           .describe('Max results to return (default: 100)'),
         historyTypes: coerceArray(z.enum(['messageAdded', 'messageDeleted', 'labelAdded', 'labelRemoved'])).optional()
@@ -999,7 +1435,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, startHistoryId, maxResults, historyTypes }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.history.list({
           userId: 'me',
@@ -1011,7 +1447,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -1026,14 +1463,15 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.settings.getVacation({ userId: 'me' });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );
@@ -1055,7 +1493,7 @@ export function registerGmailTools(server: ToolRegistry): void {
     },
     async ({ account, enableAutoReply, responseSubject, responseBodyPlainText, startTime, endTime, restrictToContacts, restrictToDomain }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
         const res = await gmail.users.settings.updateVacation({
           userId: 'me',
@@ -1073,7 +1511,8 @@ export function registerGmailTools(server: ToolRegistry): void {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
       } catch (error: any) {
-        return handleGmailError(error, account as Account);
+        const mapped = composeErrorResult(error, account as Account);
+        return mapped ?? handleGmailError(error, account as Account);
       }
     },
   );

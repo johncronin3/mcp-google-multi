@@ -1,27 +1,31 @@
 import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
 import { forms as formsClient } from '@googleapis/forms';
-import { ACCOUNTS } from '../accounts.js';
+import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
 import { coerceArray, coerceBoolean, coerceJson } from './_coerce.js';
 
-const accountEnum = z.enum(ACCOUNTS);
 
-export function registerFormsTools(server: ToolRegistry): void {
+export function registerFormsTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
     'forms_get',
     {
       description: 'Get a Google Form (definition: questions, sections, settings). Requires forms.body scope.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        formId: z.string().describe('Form ID'),
+        formId: z.string().min(1).describe('Form ID'),
       },
     },
     async ({ account, formId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const res = await forms.forms.get({ formId });
         return {
@@ -39,7 +43,7 @@ export function registerFormsTools(server: ToolRegistry): void {
       description: 'List form responses. Requires forms.responses.readonly scope.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        formId: z.string().describe('Form ID'),
+        formId: z.string().min(1).describe('Form ID'),
         pageSize: z.number().min(1).max(1000).optional().describe('Default: 100; max 1000. Responses can be large.'),
         pageToken: z.string().optional(),
         filter: z.string().optional().describe('Filter expression (e.g. "timestamp > 2026-01-01T00:00:00Z")'),
@@ -47,7 +51,7 @@ export function registerFormsTools(server: ToolRegistry): void {
     },
     async ({ account, formId, pageSize, pageToken, filter }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const res = await forms.forms.responses.list({
           formId,
@@ -70,13 +74,13 @@ export function registerFormsTools(server: ToolRegistry): void {
       description: 'Get a single form response by ID',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        formId: z.string().describe('Form ID'),
-        responseId: z.string().describe('Response ID'),
+        formId: z.string().min(1).describe('Form ID'),
+        responseId: z.string().min(1).describe('Response ID'),
       },
     },
     async ({ account, formId, responseId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const res = await forms.forms.responses.get({ formId, responseId });
         return {
@@ -94,12 +98,12 @@ export function registerFormsTools(server: ToolRegistry): void {
       description: 'List Pub/Sub watches on a form (notifications for new responses or schema changes)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        formId: z.string().describe('Form ID'),
+        formId: z.string().min(1).describe('Form ID'),
       },
     },
     async ({ account, formId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const res = await forms.forms.watches.list({ formId });
         return {
@@ -123,7 +127,7 @@ export function registerFormsTools(server: ToolRegistry): void {
     },
     async ({ account, title, documentTitle }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const res = await forms.forms.create({
           requestBody: { info: { title, documentTitle } },
@@ -145,10 +149,12 @@ export function registerFormsTools(server: ToolRegistry): void {
   server.registerTool(
     'forms_batch_update',
     {
+      // Insert/append-capable or non-convergent: a retry duplicates content.
+      annotations: { idempotentHint: false },
       description: 'Generic forms.batchUpdate pass-through: add/edit/delete questions, update form info and settings. See https://developers.google.com/workspace/forms/api/reference/rest/v1/forms/request',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        formId: z.string().describe('Form ID'),
+        formId: z.string().min(1).describe('Form ID'),
         requests: coerceArray(coerceJson(z.record(z.string(), z.unknown())))
           .describe('Array of Request objects, each with one request-type key like {createItem: {...}}'),
         includeFormInResponse: coerceBoolean.optional().describe('Return the updated form in the response'),
@@ -160,7 +166,7 @@ export function registerFormsTools(server: ToolRegistry): void {
     },
     async ({ account, formId, requests, includeFormInResponse, writeControl }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const res = await forms.forms.batchUpdate({
           formId,
@@ -185,14 +191,14 @@ export function registerFormsTools(server: ToolRegistry): void {
       description: 'Publish/unpublish a form and toggle whether it accepts responses (legacy forms without publish state are not supported)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        formId: z.string().describe('Form ID'),
+        formId: z.string().min(1).describe('Form ID'),
         isPublished: coerceBoolean.describe('Form is published and reachable by responders'),
         isAcceptingResponses: coerceBoolean.optional().describe('Form accepts responses (requires published; default: follows isPublished)'),
       },
     },
     async ({ account, formId, isPublished, isAcceptingResponses }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const forms = formsClient({ version: 'v1', auth });
         const updateMask = ['publishState.isPublished'];
         if (isAcceptingResponses !== undefined) updateMask.push('publishState.isAcceptingResponses');

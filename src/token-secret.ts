@@ -4,7 +4,7 @@
  * Never logs token / enc payload / MASTER_KEY. See docs/internals.md.
  */
 
-import { ACCOUNTS, ACCOUNT_CONFIG } from './accounts.js';
+import { ACCOUNTS, getAccountSet } from './accounts.js';
 import { isHostedHttp } from './hosted.js';
 import {
   adoptTokenOverlay,
@@ -395,7 +395,8 @@ export function parseUploadSmArgs(argv: string[]): UploadParseResult {
   }
   if (value.help) return { ok: true, value };
   if (!value.account) {
-    return { ok: false, error: 'Missing --account. Pass one GOOGLE_ACCOUNTS alias. Do not upload other aliases.' };
+    const missingAccount = 'Missing --account. Pass one GOOGLE_ACCOUNTS alias. Do not upload other aliases.';
+    return { ok: false, error: missingAccount };
   }
   return { ok: true, value };
 }
@@ -437,7 +438,7 @@ export async function runUploadSmCli(
     io.error(`Unknown account "${alias}". Valid aliases: ${ACCOUNTS.join(', ')}`);
     return 1;
   }
-  if (!ACCOUNT_CONFIG[alias]) {
+  if (!getAccountSet().configs[alias]) {
     io.error(`Unknown account "${alias}".`);
     return 1;
   }
