@@ -332,11 +332,48 @@ v6 adds a package `exports` map. The supported programmatic entry points are
 declared explicitly (`mcp-google-multi/identity`, `/compose`, `/registry`,
 `/oauth-as`, `/accounts`, `/token-store`, `/http-transport`, `/http-config`,
 `/client`, `/config-file`, `/fs-atomic`, `/master-key`, `/mcp-token`,
-`/boot-gates`, `/tenant-purge`, `/doctor`). Any OTHER deep import into `dist/` (previously unrestricted, e.g.
+`/boot-gates`, `/tenant-purge`, `/doctor`, `/write-control`,
+`/scope-catalog`, `/auth`). Any OTHER deep import into `dist/` (previously unrestricted, e.g.
 `mcp-google-multi/dist/trim.js`) now fails with
 `ERR_PACKAGE_PATH_NOT_EXPORTED`. The CLI (`npx mcp-google-multi ...`) and the
 MCP server entry are unaffected. If you relied on an undeclared deep import,
 open an issue naming the module so it can be promoted to a declared entry.
+
+`buildRegistry(server, ctx)` resolves every registered tool through `ctx`:
+the client, token reads, account emails (the From header, `drive_transfer`'s
+share target), scope hints, `account_list` and `diagnose`. Only the owner
+context from `buildIdentityContext()` (see `isOwnerContext`) gets the account
+wizard and the tools that read or write the server's own disk
+(`drive_upload`, `drive_download`, `drive_export`, `gmail_download_attachment`,
+`drive_update`'s `localPath`, `gmail_send`/`gmail_create_draft` attachments);
+a context built any other way is served without them. `registerDiagnoseTool`
+now takes `{ subject, accounts, getClient, tokenStore }` (an `IdentityContext`
+satisfies it), and `ToolRegistry#accountSet()` is new. `/write-control`
+exports `resolvePolicy`, `isAllowed` and the `Policy` type for callers that
+build their own context. `owner` is now a reserved tenant id: the tenant
+path helpers in `/config-file` (`tenantTokenDir`, `tenantConfigFilePath`,
+`ensureTenantDirs`) reject it with `E_TENANT_ID_INVALID`. The free core's
+single-owner behavior is unchanged.
+
+`HttpHostOptions.resolveServer` now returns a `ServerTarget`: the server plus
+the per-request hooks bound to that server's registry (`argShapeFor`,
+`strictArgs`, `validationEnvelope`). With a resolver, only the target's hooks
+apply; the host-level ones describe the boot server alone. `requestHooksFor(registry, ctx)`
+in `/compose` builds those hooks for one registry, exactly as both built-in
+transports do; the metrics observers (`metricsTap`, `onArgRename`) stay
+host-wide. Dispatch is serialized per resolved server, so a resolver may map
+several subjects to one server safely.
+
+`/oauth-as`: `/callback` now awaits `bindTenantAlias`. A binder that returns
+`{ refused: { slug, message } }` gets a 403 with that slug (a slug that is not
+a bare identifier renders as `access_denied`); a throw or a rejection is still
+a 500 `E_ALIAS_ADD_FAILED`. Its argument type is exported as `TenantAliasBind`
+and the refusal as `AliasBindRefusal`. `mintFlowState`, `StatePayload` and
+`TenantAliasBind` gain an optional signed `nonce`, and `buildGoogleAuthUrl`
+now receives the signed `bundles`. `verifiedEmailFromIdToken` is exported.
+`/scope-catalog` (`BUNDLE_CATALOG`, `isKnownBundle`, `resolveBundleAliases`, `closestBundle`)
+and `/auth` (`BASE_SCOPES`, `resolveScopesForAccount`) are new declared
+entries.
 
 ## 5. Auth changes
 

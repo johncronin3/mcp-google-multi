@@ -27,6 +27,9 @@
     "./boot-gates": "./dist/boot-gates.js",
     "./tenant-purge": "./dist/tenant-purge.js",
     "./doctor": "./dist/doctor.js",
+    "./write-control": "./dist/write-control.js",
+    "./scope-catalog": "./dist/scope-catalog.js",
+    "./auth": "./dist/auth.js",
     "./package.json": "./package.json"
   },
   "files": [

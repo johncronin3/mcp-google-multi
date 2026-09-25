@@ -35,6 +35,25 @@ describe('package exports map (S1.13)', () => {
     expect(pkg.files).toEqual(['dist']);
   });
 
+  it('./write-control is declared: a caller building its own context can resolve a Policy', async () => {
+    expect(pkg.exports['./write-control']).toBe('./dist/write-control.js');
+    const m = await import('../src/write-control.js');
+    expect(typeof m.resolvePolicy).toBe('function');
+    expect(typeof m.isAllowed).toBe('function');
+  });
+
+  it('./scope-catalog and ./auth are declared: a tenant link can compute the same scopes core resolves', async () => {
+    expect(pkg.exports['./scope-catalog']).toBe('./dist/scope-catalog.js');
+    expect(pkg.exports['./auth']).toBe('./dist/auth.js');
+    const catalog = await import('../src/scope-catalog.js');
+    expect(typeof catalog.resolveBundleAliases).toBe('function');
+    expect(typeof catalog.closestBundle).toBe('function');
+    expect(typeof catalog.BUNDLE_CATALOG).toBe('object');
+    const auth = await import('../src/auth.js');
+    expect(Array.isArray(auth.BASE_SCOPES)).toBe(true);
+    expect(typeof auth.resolveScopesForAccount).toBe('function');
+  });
+
   it('the 6 EE-facing entry points from the build plan are all declared', () => {
     for (const key of ['./identity', './compose', './oauth-as', './accounts', './token-store', './http-transport']) {
       expect(pkg.exports[key], key).toBeTruthy();

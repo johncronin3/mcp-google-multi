@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { loadEnvFiles } from './env-load.js';
 import { ALIAS_RE, CONFIG_VERSION, configDir, configFilePath, failStartup, isReservedAlias, loadConfigFile, mutateConfigFile } from './config-file.js';
 import type { ConfigFile } from './config-file.js';
-import { BUNDLE_CATALOG, closestBundle, resolveBundleAliases } from './scope-catalog.js';
+import { closestBundle, isKnownBundle, resolveBundleAliases } from './scope-catalog.js';
 import type { ScopeProfile } from './scope-catalog.js';
 
 const envLoad = loadEnvFiles();
@@ -131,7 +131,9 @@ export function resolveAccounts(
   env: NodeJS.ProcessEnv = process.env,
   filePath = configFilePath(),
   onInvalid: 'exit' | 'throw' = 'exit',
-  opts: { tokenDir?: string } = {},
+  // emptyOk: zero accounts is a valid set, not an error, even with 'throw'
+  // (a context that has linked nothing yet). An invalid file still fails.
+  opts: { tokenDir?: string; emptyOk?: boolean } = {},
 ): AccountSet {
   const dir = opts.tokenDir ?? tokenDir;
   const adminEnv = parseCsv(env.GOOGLE_ADMIN_ACCOUNTS);
@@ -154,7 +156,7 @@ export function resolveAccounts(
           '"admin" is not a global bundle: grant it per account via GOOGLE_ADMIN_ACCOUNTS or an "admin: true" scope profile.',
         );
       }
-      if (!(bundle in BUNDLE_CATALOG)) {
+      if (!isKnownBundle(bundle)) {
         const hint = closestBundle(bundle);
         fail(
           'E_UNKNOWN_BUNDLE',
@@ -199,7 +201,7 @@ export function resolveAccounts(
     // empty (BR-4), enforced by assertServerAccountsConfigured() in index.ts.
     // The dispatch-path reload ('throw') still throws so a mid-session emptied
     // config.json keeps the last-good registry (BR-7) instead of dropping tools.
-    if (onInvalid === 'throw') {
+    if (onInvalid === 'throw' && !opts.emptyOk) {
       throw new Error(`E_NO_ACCOUNTS_CONFIGURED: ${noAccountsMessage()}`);
     }
     return {
@@ -219,7 +221,7 @@ export function resolveAccounts(
   for (const [name, profile] of Object.entries(config?.scopeProfiles ?? {})) {
     const bundles = resolveBundleAliases(profile.bundles);
     for (const bundle of bundles) {
-      if (!(bundle in BUNDLE_CATALOG)) {
+      if (!isKnownBundle(bundle)) {
         const hint = closestBundle(bundle);
         fail(
           'E_UNKNOWN_BUNDLE',

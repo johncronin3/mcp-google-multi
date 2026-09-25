@@ -1,6 +1,6 @@
 import type { AccountSet } from './accounts.js';
 import { getAccountSet, getTokenDir, refreshAccountSetIfStale } from './accounts.js';
-import { getClient, makeGetClient } from './client.js';
+import { attachRefreshPersist, getClient, makeGetClient } from './client.js';
 import { createTokenStore, hasToken, readToken, updateToken, writeToken } from './token-store.js';
 import { resolvePolicy, type Policy, type Transport } from './write-control.js';
 
@@ -24,6 +24,16 @@ export interface IdentityContext {
   };
 }
 
+// Only buildIdentityContext mints the owner brand. The subject string alone
+// never unlocks the owner-only surfaces (account wizard, host-file tools, the
+// operator diagnose report): a hand-built context claiming 'owner' stays a
+// non-owner context.
+const ownerContexts = new WeakSet<object>();
+
+export function isOwnerContext(ctx: object | undefined): boolean {
+  return ctx !== undefined && ownerContexts.has(ctx);
+}
+
 export function buildIdentityContext(
   env: NodeJS.ProcessEnv = process.env,
   opts: { transport?: Transport } = {},
@@ -31,8 +41,12 @@ export function buildIdentityContext(
   // Real closures over the single-owner state (the SAME factories EE
   // instantiates per tenant), bound here to the global registry + token dir —
   // behavior-identical to the module-level functions for the free core.
-  const tokenStore = createTokenStore(getTokenDir());
-  return {
+  const diskStore = createTokenStore(getTokenDir());
+  // Module readToken sees the hosted in-memory overlay. createTokenStore reads
+  // disk only, so a refresh persisted to Secret Manager (and not to *.enc)
+  // would be invisible on the next owner call.
+  const tokenStore = { ...diskStore, readToken };
+  const ctx: IdentityContext = {
     subject: 'owner',
     // Live getter: the seam must always see the current registry, never a
     // snapshot pinned from before a wizard mutation or cross-process reload.
@@ -47,7 +61,12 @@ export function buildIdentityContext(
       readToken: tokenStore.readToken,
       updateToken: tokenStore.updateToken,
       refreshIfStale: refreshAccountSetIfStale,
+      // Handlers now resolve ctx.getClient. The owner still fail-closes
+      // refresh through Secret Manager before adopting rotated credentials.
+      attachRefresh: attachRefreshPersist,
     }),
     tokenStore,
   };
+  ownerContexts.add(ctx);
+  return ctx;
 }
