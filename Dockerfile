@@ -1,4 +1,6 @@
-# google-multi Streamable HTTP MCP — Cloud Run
+# House Cloud Run entry (dist/http.js via docker/entrypoint.sh).
+# Bakissation's distroless MCP_TRANSPORT=http image is not used here: it would
+# boot HttpTransportHost instead of house src/http.ts.
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./

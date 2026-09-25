@@ -155,6 +155,17 @@ describe('google-multi HTTP MCP', () => {
     expect(JSON.parse(text).error).toBe('Unauthorized');
   });
 
+  it('well-known OAuth AS is unauthenticated 200', async () => {
+    const { status, text } = await request({
+      method: 'GET',
+      path: '/.well-known/oauth-authorization-server',
+      skipAuth: true,
+      token: null,
+    });
+    expect(status).toBe(200);
+    expect(JSON.parse(text).authorization_endpoint).toContain('/oauth/authorize');
+  });
+
   it('tools/list names set_grant', async () => {
     const init = await postMcp({});
     expect(init.status).toBe(200);

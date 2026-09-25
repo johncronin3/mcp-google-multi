@@ -2,23 +2,43 @@
 /**
  * Streamable HTTP MCP for google-multi (Grok Bot / xAI remote MCP).
  *
+ * Layer 2: MCP_HTTP_TOKEN (static Bearer for CLI/Hermes, or Grok OAuth wrapper).
+ * Layer 3: session grant restored from JWT `gname` (no sticky sessions).
+ * Layer 1: never reminted here — missing Google tokens fail closed (desk-mint).
+ *
  * Env:
  *   PORT, MCP_HTTP_TOKEN / MCP_API_KEY
  *   MCP_PUBLIC_HOST — Cloud Run hostname (required for public Host)
  *   MCP_ALLOWED_HOSTS / MCP_ALLOWED_ORIGINS — extras (comma-separated)
+ *   MCP_HOSTED / K_SERVICE — hosted mode (no 8000/8787)
  */
-import { timingSafeEqual } from 'node:crypto';
 import {
   createServer,
   type IncomingMessage,
   type RequestListener,
   type ServerResponse,
 } from 'node:http';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { buildGoogleMcpServer } from './index.js';
+import {
+  DEFAULT_PUBLIC_MCP_HOST,
+  EXTRA_PUBLIC_HOSTS,
+  assertHostedListenPort,
+  csvEnvList,
+  isHostedHttp,
+  issuer,
+  publicMcpHost,
+} from './hosted.js';
+import {
+  accessGrantName,
+  bearerIsValid,
+  handleOAuth,
+  isJwtAccessToken,
+  isOAuthPath,
+} from './oauth.js';
+import { jwtAccessGrantGate, resolveGrantByName, runWithGrant } from './session-grant.js';
 
-export const DEFAULT_PUBLIC_MCP_HOST = 'google-multi-mcp-tdhsljvruq-uc.a.run.app';
-const EXTRA_PUBLIC_HOSTS = ['google-multi-mcp-794931160113.us-central1.run.app'];
+export { DEFAULT_PUBLIC_MCP_HOST, publicMcpHost };
 
 const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]'];
 const GROK_ORIGINS = [
@@ -28,19 +48,16 @@ const GROK_ORIGINS = [
   'https://x.ai',
 ];
 
-function csvEnv(name: string): string[] {
-  return (process.env[name] || '')
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean);
-}
-
-export function publicMcpHost(): string {
-  return (process.env.MCP_PUBLIC_HOST || DEFAULT_PUBLIC_MCP_HOST).trim();
-}
-
 function allowedHostnames(): string[] {
-  return [...new Set([publicMcpHost(), DEFAULT_PUBLIC_MCP_HOST, ...EXTRA_PUBLIC_HOSTS, ...LOCAL_HOSTS, ...csvEnv('MCP_ALLOWED_HOSTS')])];
+  return [
+    ...new Set([
+      publicMcpHost(),
+      DEFAULT_PUBLIC_MCP_HOST,
+      ...EXTRA_PUBLIC_HOSTS,
+      ...LOCAL_HOSTS,
+      ...csvEnvList('MCP_ALLOWED_HOSTS'),
+    ]),
+  ];
 }
 
 function allowedOrigins(): string[] {
@@ -52,7 +69,7 @@ function allowedOrigins(): string[] {
       'http://127.0.0.1',
       'http://[::1]',
       ...GROK_ORIGINS,
-      ...csvEnv('MCP_ALLOWED_ORIGINS'),
+      ...csvEnvList('MCP_ALLOWED_ORIGINS'),
     ]),
   ];
 }
@@ -70,9 +87,7 @@ function hostnameOf(hostHeader: string): string | null {
 function hostAllowed(hostHeader: string): boolean {
   const hostname = hostnameOf(hostHeader);
   if (!hostname) return false;
-  const allowed = new Set(
-    allowedHostnames().map((h) => h.replace(/^\[/, '').replace(/\]$/, '')),
-  );
+  const allowed = new Set(allowedHostnames().map((h) => h.replace(/^\[/, '').replace(/\]$/, '')));
   const normalized = hostname.replace(/^\[/, '').replace(/\]$/, '');
   return allowed.has(hostname) || allowed.has(normalized);
 }
@@ -92,25 +107,21 @@ export function expectedToken(): string | null {
   return process.env.MCP_HTTP_TOKEN || process.env.MCP_API_KEY || null;
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
+function providedBearer(req: IncomingMessage): string {
+  const auth = String(req.headers.authorization || '').trim();
+  const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
+  const header = String(req.headers['x-mcp-api-key'] || '').trim();
+  return bearer || header;
 }
 
 function authorized(req: IncomingMessage): boolean {
   const expected = expectedToken();
   if (!expected) return false;
-  const auth = String(req.headers.authorization || '').trim();
-  const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
-  const header = String(req.headers['x-mcp-api-key'] || '').trim();
-  const provided = bearer || header;
-  return Boolean(provided && safeEqual(provided, expected));
+  return bearerIsValid(providedBearer(req), expected);
 }
 
-function json(res: ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, { 'content-type': 'application/json' });
+function json(res: ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>) {
+  res.writeHead(status, { 'content-type': 'application/json', ...extraHeaders });
   res.end(JSON.stringify(body));
 }
 
@@ -119,10 +130,45 @@ function plain(res: ServerResponse, status: number, body: string) {
   res.end(body);
 }
 
+function unauthorized(res: ServerResponse): void {
+  const metadata = `${issuer()}/.well-known/oauth-protected-resource`;
+  json(
+    res,
+    401,
+    { error: 'Unauthorized' },
+    { 'WWW-Authenticate': `Bearer realm="google-multi-mcp", resource_metadata="${metadata}"` },
+  );
+}
+
 export function createHttpRequestListener(): RequestListener {
   return (req, res) => {
     void dispatchHttp(req, res);
   };
+}
+
+async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const hostHeader = String(req.headers.host || '');
+  if (!hostAllowed(hostHeader)) {
+    plain(res, 421, 'Invalid Host header');
+    return;
+  }
+  const originHeader = String(req.headers.origin || '');
+  if (originHeader && !originAllowed(originHeader)) {
+    plain(res, 403, 'Invalid Origin header');
+    return;
+  }
+
+  const mcp = buildGoogleMcpServer();
+  const pub = publicMcpHost();
+  // Some SDK versions treat missing Origin as invalid when allowedOrigins is set.
+  const transport = new NodeStreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableDnsRebindingProtection: true,
+    allowedHosts: [hostHeader, pub, `${pub}:443`, 'localhost', '127.0.0.1', '[::1]'],
+    ...(originHeader ? { allowedOrigins: [...allowedOrigins(), originHeader] } : {}),
+  });
+  await mcp.connect(transport);
+  await transport.handleRequest(req, res);
 }
 
 async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -135,61 +181,63 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
       service: 'google-multi-mcp',
       transport: 'streamable-http',
       mcp: '/mcp',
+      oauth: '/.well-known/oauth-authorization-server',
     });
+    return;
+  }
+
+  if (isOAuthPath(path)) {
+    await handleOAuth(req, res, url);
     return;
   }
 
   if (path !== '/mcp') {
-    json(res, 404, { error: 'Not found' });
+    json(res, 404, { error: 'not_found', message: 'Not found' });
     return;
   }
 
   if (!expectedToken()) {
-    json(res, 503, { error: 'MCP HTTP token is not configured' });
+    json(res, 503, { error: 'mcp_http_unconfigured', message: 'MCP HTTP token is not configured' });
     return;
   }
   if (!authorized(req)) {
-    json(res, 401, { error: 'Unauthorized' });
+    unauthorized(res);
     return;
   }
 
-  const hostHeader = String(req.headers.host || '');
-  if (!hostAllowed(hostHeader)) {
-    plain(res, 421, 'Invalid Host header');
-    return;
-  }
-  const originHeader = String(req.headers.origin || '');
-  if (originHeader && !originAllowed(originHeader)) {
-    plain(res, 403, 'Invalid Origin header');
+  const token = providedBearer(req);
+  const jwt = isJwtAccessToken(token);
+  const grantName = jwt ? accessGrantName(token) : undefined;
+  const tokenGrant = grantName ? resolveGrantByName(grantName) : null;
+  // Fail at the HTTP gate when enforced JWT lacks a resolvable gname — see docs/internals.md (session grants).
+  const gate = jwt ? jwtAccessGrantGate(grantName, tokenGrant) : null;
+  if (gate) {
+    json(res, 403, gate);
     return;
   }
 
   try {
-    const mcp = buildGoogleMcpServer();
-    const pub = publicMcpHost();
-    // Some SDK versions treat missing Origin as invalid when allowedOrigins is set.
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableDnsRebindingProtection: true,
-      allowedHosts: [hostHeader, pub, `${pub}:443`, 'localhost', '127.0.0.1', '[::1]'],
-      ...(originHeader
-        ? { allowedOrigins: [...allowedOrigins(), originHeader] }
-        : {}),
-    });
-    await mcp.connect(transport);
-    await transport.handleRequest(req, res);
+    if (jwt) {
+      await runWithGrant(tokenGrant, () => handleMcp(req, res));
+    } else {
+      await handleMcp(req, res);
+    }
   } catch (err) {
     console.error('google-multi-mcp http error:', err);
     if (!res.headersSent) {
-      json(res, 500, { error: 'MCP request failed' });
+      json(res, 500, { error: 'internal', message: 'MCP request failed' });
     }
   }
 }
 
 export function listenHttp(port = Number(process.env.PORT || 8080)) {
+  assertHostedListenPort(port);
   const server = createServer(createHttpRequestListener());
   server.listen(port, '0.0.0.0', () => {
-    console.error(`google-multi MCP HTTP listening on :${port}  POST/GET /mcp`);
+    const mode = isHostedHttp() ? 'hosted' : 'desk';
+    console.error(
+      `google-multi MCP HTTP listening on :${port} (${mode})  POST/GET /mcp  OAuth /.well-known + /oauth/*`,
+    );
   });
   return server;
 }

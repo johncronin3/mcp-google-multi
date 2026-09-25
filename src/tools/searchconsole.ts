@@ -3,14 +3,18 @@ import { z } from 'zod';
 import { coerceArray, coerceJson } from './_coerce.js';
 import { searchconsole as searchconsoleClient } from '@googleapis/searchconsole';
 import { webmasters as webmastersClient } from '@googleapis/webmasters';
-import { ACCOUNTS } from '../accounts.js';
+import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
 import { handleGoogleApiError } from './_errors.js';
 
-const accountEnum = z.enum(ACCOUNTS);
 
-export function registerSearchConsoleTools(server: ToolRegistry): void {
+export function registerSearchConsoleTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const getClientFn = deps.getClientFn ?? getClient;
   // ─── Sites ───────────────────────────────────────────────
 
   server.registerTool(
@@ -23,7 +27,7 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
     },
     async ({ account }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         const res = await wm.sites.list();
         return {
@@ -41,12 +45,12 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Get details for a specific site (property) in Google Search Console',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL exactly as it appears in Search Console (e.g. "https://example.com/" or "sc-domain:example.com")'),
+        siteUrl: z.string().min(1).describe('Site URL exactly as it appears in Search Console (e.g. "https://example.com/" or "sc-domain:example.com")'),
       },
     },
     async ({ account, siteUrl }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         const res = await wm.sites.get({ siteUrl });
         return {
@@ -64,12 +68,12 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Add a site (property) to Google Search Console. You still need to verify ownership separately.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL to add (e.g. "https://example.com/" or "sc-domain:example.com")'),
+        siteUrl: z.string().min(1).describe('Site URL to add (e.g. "https://example.com/" or "sc-domain:example.com")'),
       },
     },
     async ({ account, siteUrl }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         await wm.sites.add({ siteUrl });
         return {
@@ -87,12 +91,12 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Remove a site (property) from Google Search Console',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL to remove'),
+        siteUrl: z.string().min(1).describe('Site URL to remove'),
       },
     },
     async ({ account, siteUrl }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         await wm.sites.delete({ siteUrl });
         return {
@@ -112,12 +116,12 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'List all sitemaps submitted for a site in Google Search Console',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL (e.g. "https://example.com/" or "sc-domain:example.com")'),
+        siteUrl: z.string().min(1).describe('Site URL (e.g. "https://example.com/" or "sc-domain:example.com")'),
       },
     },
     async ({ account, siteUrl }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         const res = await wm.sitemaps.list({ siteUrl });
         return {
@@ -135,13 +139,13 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Get details for a specific sitemap submitted to Google Search Console',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL'),
+        siteUrl: z.string().min(1).describe('Site URL'),
         feedpath: z.string().describe('Full URL of the sitemap (e.g. "https://example.com/sitemap.xml")'),
       },
     },
     async ({ account, siteUrl, feedpath }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         const res = await wm.sitemaps.get({ siteUrl, feedpath });
         return {
@@ -159,13 +163,13 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Submit a sitemap to Google Search Console for a site',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL'),
+        siteUrl: z.string().min(1).describe('Site URL'),
         feedpath: z.string().describe('Full URL of the sitemap to submit (e.g. "https://example.com/sitemap.xml")'),
       },
     },
     async ({ account, siteUrl, feedpath }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         await wm.sitemaps.submit({ siteUrl, feedpath });
         return {
@@ -183,13 +187,13 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Delete a sitemap from Google Search Console',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL'),
+        siteUrl: z.string().min(1).describe('Site URL'),
         feedpath: z.string().describe('Full URL of the sitemap to delete'),
       },
     },
     async ({ account, siteUrl, feedpath }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
         await wm.sitemaps.delete({ siteUrl, feedpath });
         return {
@@ -209,7 +213,7 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Query Google Search Console search analytics data. Returns clicks, impressions, CTR, and position for your site. Supports filtering by query, page, country, device, search type, and date range.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL (e.g. "https://example.com/" or "sc-domain:example.com")'),
+        siteUrl: z.string().min(1).describe('Site URL (e.g. "https://example.com/" or "sc-domain:example.com")'),
         startDate: z.string().describe('Start date (YYYY-MM-DD). Data is available starting ~3 days ago.'),
         endDate: z.string().describe('End date (YYYY-MM-DD)'),
         dimensions: coerceArray(z.enum(['query', 'page', 'country', 'device', 'searchAppearance', 'date'])).optional()
@@ -237,7 +241,7 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
     },
     async ({ account, siteUrl, startDate, endDate, dimensions, type, dimensionFilterGroups, rowLimit, startRow, aggregationType, dataState }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const wm = webmastersClient({ version: 'v3', auth });
 
         const requestBody: any = { startDate, endDate };
@@ -274,14 +278,14 @@ export function registerSearchConsoleTools(server: ToolRegistry): void {
       description: 'Inspect a URL using the Google Search Console URL Inspection API. Returns indexing status, crawl info, rich results, AMP status, and mobile usability for a specific URL.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        siteUrl: z.string().describe('Site URL as registered in Search Console (e.g. "https://example.com/" or "sc-domain:example.com")'),
-        inspectionUrl: z.string().describe('The fully-qualified URL to inspect (must be under the siteUrl property)'),
+        siteUrl: z.string().min(1).describe('Site URL as registered in Search Console (e.g. "https://example.com/" or "sc-domain:example.com")'),
+        inspectionUrl: z.string().min(1).describe('The fully-qualified URL to inspect (must be under the siteUrl property)'),
         languageCode: z.string().optional().describe('BCP-47 language code for localized results (e.g. "en-US", "fr")'),
       },
     },
     async ({ account, siteUrl, inspectionUrl, languageCode }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const searchconsole = searchconsoleClient({ version: 'v1', auth });
 
         const res = await searchconsole.urlInspection.index.inspect({

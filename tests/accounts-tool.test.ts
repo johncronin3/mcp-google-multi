@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { deriveAccountHealth, type AccountHealthDeps } from '../src/tools/accounts-tool.js';
+import { setHttpReauthBase } from '../src/reauth-hint.js';
 import { resolveScopesForAccount } from '../src/auth.js';
 
 const ALIAS = 'test';
@@ -17,11 +18,27 @@ function deps(overrides: Partial<AccountHealthDeps>): AccountHealthDeps {
 }
 
 describe('deriveAccountHealth', () => {
+  it('missing-token hint becomes an AS re-auth link over HTTP (S1.18)', () => {
+    setHttpReauthBase('https://mcp.example.com');
+    try {
+      const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false }));
+      expect(h.token.hint).toContain('https://mcp.example.com/authorize?flow=alias_reauth&alias=test');
+      expect(h.token.hint).not.toContain('npx mcp-google-multi');
+    } finally {
+      setHttpReauthBase(null);
+    }
+  });
+
   it('reports missing with an auth hint when no token file exists', () => {
     const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false }));
     expect(h.token.status).toBe('missing');
     expect(h.token.hint).toContain('auth --account test');
-    expect(h.scopes).toEqual({ configured: CONFIGURED.length, granted: 0, missing: CONFIGURED });
+    expect(h.scopes).toMatchObject({ configured: CONFIGURED.length, granted: 0 });
+    // B3 extension: missing kept for v5 consumers, now sorted; three-state
+    // breakdown present.
+    expect(h.scopes.missing).toEqual([...CONFIGURED].sort());
+    expect(h.scopes.requestable).toEqual([...CONFIGURED].sort());
+    expect(h.scopes.callable).toEqual([]);
     expect(h.email).toBe('test@example.com');
   });
 
@@ -58,7 +75,7 @@ describe('deriveAccountHealth', () => {
     expect(h.token.status).toBe('ok');
     expect(h.token.expiryDate).toBe(new Date(NOW + 60_000).toISOString());
     expect(h.scopes.granted).toBe(2);
-    expect(h.scopes.missing).toEqual(CONFIGURED.slice(2));
+    expect(h.scopes.missing).toEqual([...CONFIGURED.slice(2)].sort());
   });
 
   it('reports expired_refreshable when expired but a refresh token exists', () => {
