@@ -6,12 +6,13 @@
 // an `authenticate` for POST /mcp. All Google/CIMD I/O is injectable so the
 // whole surface is exercised by an offline harness.
 
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIPv4 } from 'node:net';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AuthOutcome, RouteHandler } from './http-transport.js';
 import {
   signAccessToken, verifyAccessToken, signState, verifyState, signAuthzCode, verifyAuthzCode,
+  signReauthLink, verifyReauthLink,
   signPending, verifyPending,
   ReplayGuard, RefreshStore, STATE_TTL_DEFAULT, CODE_TTL_DEFAULT, ACCESS_TTL_DEFAULT,
   type StatePayload,
@@ -31,6 +32,10 @@ const DCR_MAX_URI_LEN = 2048;
 export interface GoogleExchangeResult {
   tokens: Record<string, unknown>;
   email?: string;
+  /** Google's stable account id; unlike the address it is never reassigned. */
+  sub?: string;
+  /** Google Workspace hosted domain; absent for a consumer account. */
+  hd?: string;
 }
 
 export interface AuthServerConfig {
@@ -42,10 +47,10 @@ export interface AuthServerConfig {
   accessTtlSec?: number;
   masterKey: string;
   refreshStorePath: string;
-  /** Default true. The clientless alias-only `flow=alias_reauth` link carries
+  /** Default true. The clientless `flow=alias_reauth` link names an alias with
    * no tenant binding, so a multi-tenant deployment sets false: with several
    * tenants an alias name alone is ambiguous and the branch becomes a
-   * cross-tenant re-auth vector. Server-minted signed flows are unaffected. */
+   * cross-tenant re-auth vector. Server-minted alias_add flows are unaffected. */
   legacyAliasReauth?: boolean;
 }
 
@@ -58,6 +63,7 @@ export interface TenantAliasBind {
   bundles?: string[];
   nonce?: string;
   tokens: Record<string, unknown>;
+  sub?: string;
 }
 
 /** A binder's deliberate refusal (policy, not failure): /callback answers 403
@@ -66,18 +72,36 @@ export interface AliasBindRefusal {
   refused: { slug: string; message: string };
 }
 
-/** Only trust the id_token email when Google marks it verified (#8). The token
- * comes straight from Google's token endpoint, so its claims are read unsigned. */
-export function verifiedEmailFromIdToken(idToken?: string | null): string | undefined {
+export interface GoogleIdentity {
+  email?: string;
+  sub?: string;
+  hd?: string;
+}
+
+const OIDC_SUB = /^[\x21-\x7e]{1,255}$/;
+const HOSTED_DOMAIN = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+/** Only trust the id_token identity when Google marks the email verified (#8).
+ * The token comes straight from Google's token endpoint, so its claims are
+ * read unsigned. A malformed sub or hd is dropped, never passed on. */
+export function verifiedIdentityFromIdToken(idToken?: string | null): GoogleIdentity | undefined {
   if (!idToken) return undefined;
   try {
     const [, payload] = idToken.split('.');
-    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8')) as { email?: string; email_verified?: boolean | string };
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8')) as { email?: string; email_verified?: boolean | string; sub?: unknown; hd?: unknown };
     const verified = claims.email_verified === true || claims.email_verified === 'true';
-    return verified ? claims.email : undefined;
+    if (!verified) return undefined;
+    const identity: GoogleIdentity = { email: claims.email };
+    if (typeof claims.sub === 'string' && OIDC_SUB.test(claims.sub)) identity.sub = claims.sub;
+    if (typeof claims.hd === 'string' && claims.hd.length <= 253 && HOSTED_DOMAIN.test(claims.hd)) identity.hd = claims.hd;
+    return identity;
   } catch {
     return undefined;
   }
+}
+
+export function verifiedEmailFromIdToken(idToken?: string | null): string | undefined {
+  return verifiedIdentityFromIdToken(idToken)?.email;
 }
 
 export interface AuthServerDeps {
@@ -85,11 +109,17 @@ export interface AuthServerDeps {
   /** Exchange a Google auth code at `${base}/callback` for tokens (+ owner email). */
   exchangeCode?: (code: string, flow: StatePayload['flow']) => Promise<GoogleExchangeResult>;
   /** Build the Google authorization URL (redirect back to `${base}/callback`).
-   *  The impl chooses scope/prompt/login_hint from the flow: owner_gate =
-   *  `openid email` + select_account; alias_reauth = the alias's resource scopes
-   *  + consent. */
+   *  The impl chooses scope/prompt from the flow: owner_gate = `openid email`
+   *  + select_account; alias_reauth = the alias's resource scopes + select_account
+   *  consent, and no login_hint (the link needs no authentication). */
   buildGoogleAuthUrl?: (opts: { flow: StatePayload['flow']; alias?: string; state: string; bundles?: string[] }) => string;
   writeToken?: (alias: string, tokens: Record<string, unknown>) => void;
+  /** Scopes the alias asked for that `grantedScope` lacks, so the alias_reauth
+   * completion page can say what Google's granular consent left out. */
+  missingScopes?: (alias: string, grantedScope: string | undefined) => string[];
+  /** Whether a readable token is stored for the alias; a narrower re-auth
+   * grant keeps it rather than replace it. */
+  hasToken?: (alias: string) => boolean;
   registeredClients?: Map<string, { redirect_uris: string[] }>;
   replayGuard?: ReplayGuard;
   refreshStore?: RefreshStore;
@@ -100,13 +130,22 @@ export interface AuthServerDeps {
   aliasEmail?: (alias: string) => string | undefined;
   /** Map a verified sign-in email to the subject its tokens are minted under.
    * Default = the MCP_OWNER_EMAILS allowlist -> {sub:'owner'}; null = denied.
-   * The tenant resolver (invite claim / email->tenant lookup) plugs in here. */
-  resolveSubject?: (email: string) => { sub: string } | null;
+   * The tenant resolver (invite claim / email->tenant lookup) plugs in here.
+   * `identity` carries Google's `sub` and `hd` when the exchange returned
+   * them, so a resolver can key on the stable account id rather than an
+   * address that can be reassigned. */
+  resolveSubject?: (email: string, identity?: { sub?: string; hd?: string }) => { sub: string } | null;
   /** alias_add completion: persist the new alias's config row and tokens under
    * its tenant. /callback awaits it only after a successful Google exchange.
    * A returned refusal answers 403 with its slug; a throw or rejection answers
    * 500 E_ALIAS_ADD_FAILED. */
   bindTenantAlias?: (bind: TenantAliasBind) => void | AliasBindRefusal | Promise<void | AliasBindRefusal>;
+  /** False for a subject this host no longer serves (a multi-tenant host that
+   * removed or suspended it): /token then issues and rotates nothing for it
+   * (400 invalid_grant; a rotated sub's refresh tokens are dropped). A throw
+   * means the answer is unknown right now: 503 temporarily_unavailable, and
+   * the presented refresh token is not spent. Absent: every subject is active. */
+  subjectActive?: (sub: string) => boolean;
 }
 
 export interface AuthServer {
@@ -116,7 +155,12 @@ export interface AuthServer {
    * (`${base}/authorize?flow=...&state=<signed>`). The tenantId/bundles ride
    * INSIDE the signed state, so nothing at /authorize or /callback trusts a
    * caller-supplied identity. Inert unless something calls it. */
-  mintFlowState: (opts: { flow: 'alias_add' | 'alias_reauth'; alias: string; tenantId?: string; bundles?: string[]; nonce?: string }) => Promise<string>;
+  mintFlowState: (opts: { flow: 'alias_add'; alias: string; tenantId?: string; bundles?: string[]; nonce?: string }) => Promise<string>;
+  /** The owner's re-auth link for `alias`: HMAC-signed, expiring, not single
+   * use (a chat client may prefetch it). /authorize refuses any alias_reauth
+   * request without a valid one, so an unauthenticated caller can neither
+   * start a re-auth nor learn which aliases exist or what they hold. */
+  reauthLink: (alias: string) => string;
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -133,8 +177,14 @@ function errorPage(res: ServerResponse, status: number, slug: string, message: s
   return true;
 }
 
-function redirect(res: ServerResponse, location: string): true {
-  res.writeHead(302, { Location: location });
+class SubjectCheckUnavailable extends Error {}
+
+function subjectUnavailable(res: ServerResponse): true {
+  return json(res, 503, { error: 'temporarily_unavailable', message: 'the sign-in could not be checked right now; retry shortly' }, { 'Retry-After': '5' });
+}
+
+function redirect(res: ServerResponse, location: string, extraHeaders: Record<string, string> = {}): true {
+  res.writeHead(302, { Location: location, ...extraHeaders });
   res.end();
   return true;
 }
@@ -169,6 +219,41 @@ export function redirectAllowed(redirectUri: string, docRedirectUris: string[]):
     // any loopback host + any port + same scheme + same path
     return isLoopbackHostname(du.hostname) && du.protocol === r.protocol && du.pathname === r.pathname;
   });
+}
+
+// The owner_gate browser binding (docs/internals.md). One cookie per flow, so
+// two sign-ins started in one browser do not overwrite each other. __Host-
+// requires Secure, which an http base (the loopback owner) cannot rely on in
+// every browser, so an http base gets a plain host-only name instead.
+const BIND_HASH = /^[A-Za-z0-9_-]{43}$/;
+
+function bindCookieName(base: string, bind: string): string {
+  return `${base.startsWith('https:') ? '__Host-' : ''}mgm-og-${bind.slice(0, 16)}`;
+}
+
+function bindCookieAttrs(base: string, maxAge: number): string {
+  return `Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${base.startsWith('https:') ? '; Secure' : ''}`;
+}
+
+function readCookie(req: IncomingMessage, name: string): string | undefined {
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return undefined;
+}
+
+function sha256Url(value: string): string {
+  return createHash('sha256').update(value).digest('base64url');
+}
+
+function browserBinding(req: IncomingMessage, base: string, bind: unknown): 'ok' | 'missing' | 'mismatch' {
+  if (typeof bind !== 'string' || !BIND_HASH.test(bind)) return 'missing';
+  const value = readCookie(req, bindCookieName(base, bind));
+  if (!value) return 'missing';
+  const got = createHash('sha256').update(value).digest();
+  const want = Buffer.from(bind, 'base64url');
+  return got.length === want.length && timingSafeEqual(got, want) ? 'ok' : 'mismatch';
 }
 
 function pkceS256(verifier: string): string {
@@ -298,11 +383,20 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
   }
 
   async function toGoogle(res: ServerResponse, sp: StatePayload): Promise<true> {
+    // H4 F1: without this, a Google URL minted here and forwarded to someone
+    // else signs THEM in and hands their subject to the starting client.
+    const headers: Record<string, string> = {};
+    if (sp.flow === 'owner_gate') {
+      const value = randomBytes(32).toString('base64url');
+      const bind = sha256Url(value);
+      sp = { ...sp, bind };
+      headers['Set-Cookie'] = `${bindCookieName(base, bind)}=${value}; ${bindCookieAttrs(base, STATE_TTL_DEFAULT)}`;
+    }
     const state = await signState(sp, base, secret, nowSec());
     const authUrl = deps.buildGoogleAuthUrl
       ? deps.buildGoogleAuthUrl({ flow: sp.flow, alias: sp.alias, state, bundles: sp.bundles })
       : `https://accounts.google.com/o/oauth2/v2/auth?state=${encodeURIComponent(state)}`;
-    return redirect(res, authUrl);
+    return redirect(res, authUrl, headers);
   }
 
   // GET /authorize (validate + interstitial for DCR clients); POST /authorize
@@ -319,6 +413,11 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       try {
         pending = await verifyPending(form.pending ?? '', base, secret);
       } catch {
+        return errorPage(res, 400, 'E_STATE_INVALID', 'the approval is invalid or expired');
+      }
+      // Only the client leg signs pendings, and it is always the owner sign-in;
+      // a pending signed before that rule (flow=alias_reauth) is refused here.
+      if (pending.flow !== 'owner_gate') {
         return errorPage(res, 400, 'E_STATE_INVALID', 'the approval is invalid or expired');
       }
       if (!replay.consume(pending.jti, STATE_TTL_DEFAULT * 1000, now())) {
@@ -362,17 +461,20 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     // In-call re-auth (BV-1): a user-clicked `flow=alias_reauth` link has NO
     // client leg — no code is delivered to any client, the refreshed token is
     // written server-side for the alias — so it skips the client_id/redirect/
-    // PKCE requirements. Safe because /callback binds the completing Google
-    // identity to the alias's configured email before writing anything.
-    if (q.get('flow') === 'alias_reauth' && aliasParam && !clientId) {
+    // PKCE requirements. The link must be one this server signed (reauthLink),
+    // and /callback still binds the completing identity to the alias's email.
+    if (q.get('flow') === 'alias_reauth' && !clientId) {
       if (config.legacyAliasReauth === false) {
         // Alias-only, tenant-ambiguous: disabled on multi-tenant deployments.
         return errorPage(res, 403, 'E_LEGACY_REAUTH_DISABLED', 'alias re-auth links are disabled on this deployment; ask the server for a fresh account link');
       }
-      if (!deps.aliasEmail?.(aliasParam)) {
-        return errorPage(res, 400, 'invalid_request', `unknown account "${aliasParam}"`);
+      const alias = verifyReauthLink(base, secret, { alias: aliasParam ?? '', exp: q.get('exp') ?? '', sig: q.get('sig') ?? '' }, nowSec());
+      // One answer for an unsigned, forged, expired or stale link, so a
+      // request the server did not issue learns nothing about its aliases.
+      if (!alias || !deps.aliasEmail?.(alias)) {
+        return errorPage(res, 400, 'E_STATE_INVALID', 'this re-auth link is invalid or expired; ask the server for a fresh one');
       }
-      return toGoogle(res, { flow: 'alias_reauth', client_id: '', redirect_uri: '', code_challenge: '', resource, alias: aliasParam });
+      return toGoogle(res, { flow: 'alias_reauth', client_id: '', redirect_uri: '', code_challenge: '', resource, alias });
     }
 
     if (!clientId) return json(res, 400, { error: 'invalid_request', message: 'client_id required', iss: base }, issHeader);
@@ -392,14 +494,16 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       return json(res, 400, { error: 'invalid_request', message: `resource must be ${resource}`, iss: base }, issHeader);
     }
     // (5) only after full validation do we build the request artifact.
+    // A client leg is always the owner sign-in. Re-auth has its own signed
+    // link: accepting flow=alias_reauth here let any client (a self-registered
+    // one, or a public CIMD client_id) start it and read the alias's scopes.
     const statePayload: StatePayload = {
-      flow: (q.get('flow') as StatePayload['flow']) === 'alias_reauth' ? 'alias_reauth' : 'owner_gate',
+      flow: 'owner_gate',
       client_id: clientId,
       redirect_uri: redirectUri,
       code_challenge: codeChallenge,
       client_state: clientState,
       resource,
-      alias: q.get('alias') ?? undefined,
     };
     // Confused-deputy defense (#3): a self-registered DCR client can pick an
     // arbitrary redirect_uri, so before we send the owner to Google (whose
@@ -409,7 +513,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     // cannot forge, so there is nothing to spoof.
     if (client.dcr) {
       const pendingToken = await signPending(statePayload, base, secret, nowSec());
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "frame-ancestors 'none'", 'X-Frame-Options': 'DENY' });
       res.end(
         `<!doctype html><meta charset=utf-8><title>Authorize access</title>` +
           `<body style="font-family:system-ui,sans-serif;max-width:36em;margin:3em auto;line-height:1.5">` +
@@ -438,13 +542,26 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     if (!replay.consume(st.jti, STATE_TTL_DEFAULT * 1000, now())) {
       return errorPage(res, 400, 'E_STATE_INVALID', 'state has already been used (replay)');
     }
+    // After the spend, so a refused callback URL cannot be replayed from the
+    // browser that holds the cookie; before the exchange and resolveSubject.
+    if (st.flow === 'owner_gate') {
+      const binding = browserBinding(req, base, st.bind);
+      if (binding !== 'ok') {
+        log(`callback refused flow=owner_gate: browser binding ${binding}`);
+        return errorPage(res, 400, 'E_BROWSER_MISMATCH', 'finish the sign-in in the browser that started it; start again from your app');
+      }
+      res.setHeader('Set-Cookie', `${bindCookieName(base, st.bind ?? '')}=; ${bindCookieAttrs(base, 0)}`);
+    }
     if (!code) return errorPage(res, 400, 'invalid_request', 'missing code');
 
     let exchanged: GoogleExchangeResult;
     try {
       exchanged = deps.exchangeCode ? await deps.exchangeCode(code, st.flow) : { tokens: {} };
     } catch (e) {
-      return errorPage(res, 400, 'invalid_grant', `Google code exchange failed: ${(e as Error).message}`);
+      // The detail can name proxies and hosts; it goes to the log, not the browser.
+      const detail = e instanceof Error ? e.message : typeof e === 'string' ? e : 'non-Error rejection';
+      log(`callback exchange failed flow=${st.flow}: ${detail.replace(/[\r\n]+/g, ' ')}`);
+      return errorPage(res, 400, 'invalid_grant', 'Google could not complete the sign-in; start again from your app');
     }
 
     if (st.flow === 'alias_add') {
@@ -454,7 +571,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       if (!boundEmail) return errorPage(res, 403, 'access_denied', 'Google did not return an email for the signed-in account');
       let refusal: AliasBindRefusal['refused'] | undefined;
       try {
-        const out = await deps.bindTenantAlias({ tenantId: st.tenantId, alias: st.alias, email: boundEmail, bundles: st.bundles, nonce: st.nonce, tokens: exchanged.tokens });
+        const out = await deps.bindTenantAlias({ tenantId: st.tenantId, alias: st.alias, email: boundEmail, bundles: st.bundles, nonce: st.nonce, tokens: exchanged.tokens, sub: exchanged.sub });
         refusal = (out as AliasBindRefusal | undefined)?.refused;
       } catch (e) {
         // Any rejection reason, even none, must still reach this answer.
@@ -487,10 +604,34 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
         log(`alias_reauth identity mismatch for "${st.alias}" (got ${gotEmail || 'none'})`);
         return errorPage(res, 403, 'access_denied', 'the Google account you signed in with is not the one configured for this alias');
       }
+      // A completion without a refresh token (a Google URL built without
+      // offline access, say) would replace a working credential with one that
+      // dies within the hour. Keep the stored token instead.
+      const refreshToken = exchanged.tokens.refresh_token;
+      if (typeof refreshToken !== 'string' || refreshToken === '') {
+        log(`alias_reauth for "${st.alias}" returned no refresh token; stored token kept`);
+        return errorPage(res, 400, 'E_REAUTH_INCOMPLETE', 'Google did not return a long-lived token, so the stored one was kept. Open the re-auth link again and approve access.');
+      }
+      const granted = typeof exchanged.tokens.scope === 'string' ? exchanged.tokens.scope : undefined;
+      const missing = deps.missingScopes?.(st.alias, granted) ?? [];
+      const listed = missing.map((m) => `<code>${escapeHtml(m)}</code>`).join(', ');
+      // A narrower grant replaces nothing that works. The link can be reused
+      // for an hour and the Google URL's scope is not signed, so a narrower
+      // grant is not necessarily the account holder's choice.
+      if (missing.length > 0 && deps.hasToken?.(st.alias)) {
+        log(`alias_reauth for "${st.alias}" granted ${missing.length} fewer scope(s); stored token kept`);
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end(`<!doctype html><meta charset=utf-8><p>E_SCOPE_NOT_GRANTED: Google did not grant ${missing.length} requested scope(s): ${listed}, so the stored access for "${escapeHtml(st.alias)}" was kept. Ask for a fresh re-auth link and leave every box ticked.</p>`);
+        return true;
+      }
       deps.writeToken?.(st.alias, exchanged.tokens);
       log(`callback ok flow=alias_reauth alias=${st.alias}`);
+      // With no stored token a partial grant still beats none; say what is missing.
+      const gap = missing.length
+        ? `<p>Google did not grant ${missing.length} requested scope(s): ${listed}. Ask for a fresh re-auth link and leave every box ticked to restore them.</p>`
+        : '';
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(`<!doctype html><meta charset=utf-8><p>Re-authenticated "${escapeHtml(st.alias)}". You can close this window.</p>`);
+      res.end(`<!doctype html><meta charset=utf-8><p>Re-authenticated "${escapeHtml(st.alias)}". You can close this window.</p>${gap}`);
       return true;
     }
 
@@ -499,7 +640,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     // signed into the authz code and flows into every token minted from it.
     const email = (exchanged.email ?? '').toLowerCase();
     const iss = encodeURIComponent(base);
-    const subject = email ? resolveSubject(email) : null;
+    const subject = email ? resolveSubject(email, { sub: exchanged.sub, hd: exchanged.hd }) : null;
     if (!subject) {
       const sep = st.redirect_uri.includes('?') ? '&' : '?';
       const s = st.client_state ? `&state=${encodeURIComponent(st.client_state)}` : '';
@@ -546,12 +687,45 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
         return json(res, 400, { error: 'invalid_grant', message: 'PKCE verification failed' });
       }
       const access = await signAccessToken({ base, secret, iat: nowSec(), ttlSec: accessTtl, sub: code.sub });
+      if (deps.subjectActive) {
+        let active: boolean;
+        try {
+          active = deps.subjectActive(code.sub);
+        } catch (e) {
+          log(`token deferred grant=authorization_code: subject check failed: ${e instanceof Error ? e.message : 'non-Error throw'}`);
+          return subjectUnavailable(res);
+        }
+        if (!active) {
+          log('token refused grant=authorization_code: subject inactive');
+          return json(res, 400, { error: 'invalid_grant', message: 'the subject is no longer provisioned' });
+        }
+      }
       const refreshToken = refresh.issue(now(), code.sub);
       log('token issued grant=authorization_code');
       return json(res, 200, { access_token: access, token_type: 'Bearer', expires_in: accessTtl, refresh_token: refreshToken, scope: 'mcp:use' });
     }
     if (grant === 'refresh_token') {
-      const next = refresh.rotate(form.refresh_token ?? '', now());
+      const subjectActive = deps.subjectActive;
+      const accept = subjectActive
+        ? (sub: string): boolean => {
+            let active: boolean;
+            try {
+              active = subjectActive(sub);
+            } catch (e) {
+              throw new SubjectCheckUnavailable('subject check failed', { cause: e });
+            }
+            if (!active) log('token refused grant=refresh_token: subject inactive');
+            return active;
+          }
+        : undefined;
+      let next: ReturnType<RefreshStore['rotate']>;
+      try {
+        next = refresh.rotate(form.refresh_token ?? '', now(), accept);
+      } catch (e) {
+        if (!(e instanceof SubjectCheckUnavailable)) throw e;
+        log(`token deferred grant=refresh_token: subject check failed: ${e.cause instanceof Error ? e.cause.message : 'non-Error throw'}`);
+        return subjectUnavailable(res);
+      }
       if (!next) return json(res, 400, { error: 'invalid_grant', message: 'unknown or rotated refresh token' });
       const access = await signAccessToken({ base, secret, iat: nowSec(), ttlSec: accessTtl, sub: next.sub });
       log('token issued grant=refresh_token');
@@ -614,6 +788,9 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
   };
 
   const mintFlowState: AuthServer['mintFlowState'] = async ({ flow, alias, tenantId, bundles, nonce }) => {
+    // /authorize has a signed branch for alias_add only; anything else minted
+    // here would be a state no route verifies the way its flow needs.
+    if (flow !== 'alias_add') throw new Error(`mintFlowState supports alias_add only, not ${String(flow)}`);
     const state = await signState(
       { flow, client_id: '', redirect_uri: '', code_challenge: '', resource, alias, tenantId, bundles, nonce },
       base,
@@ -623,5 +800,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     return `${base}/authorize?flow=${flow}&state=${encodeURIComponent(state)}`;
   };
 
-  return { routes, authenticate, mintFlowState };
+  const reauthLink: AuthServer['reauthLink'] = (alias) => `${base}/authorize?flow=alias_reauth&${signReauthLink(base, secret, alias, nowSec())}`;
+
+  return { routes, authenticate, mintFlowState, reauthLink };
 }

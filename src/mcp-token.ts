@@ -4,7 +4,7 @@
 // the opaque rotated refresh-token store. Keyed by the provisioned MCP_JWT_KEY
 // (B5), so tokens survive a restart as long as the key persists.
 
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { SignJWT, jwtVerify } from 'jose';
 import { deriveKey, encryptToken, decryptToken } from './token-store.js';
@@ -35,6 +35,7 @@ export interface AccessTokenParams {
 }
 
 export async function signAccessToken(p: AccessTokenParams): Promise<string> {
+  if (typeof p.sub !== 'string' || p.sub === '') throw new Error('signAccessToken: sub must be a non-empty string');
   const ttl = p.ttlSec ?? ACCESS_TTL_DEFAULT;
   return new SignJWT({ scope: 'mcp:use', purpose: 'mcp_access' })
     .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
@@ -57,7 +58,8 @@ export interface AccessClaims {
 export async function verifyAccessToken(token: string, base: string, secret: Uint8Array): Promise<AccessClaims> {
   const { payload } = await jwtVerify(token, secret, { issuer: base, audience: `${base}/mcp` });
   if (payload.purpose !== 'mcp_access') throw new Error('wrong token purpose');
-  return { sub: String(payload.sub), scope: String(payload.scope ?? ''), jti: String(payload.jti ?? '') };
+  if (typeof payload.sub !== 'string' || payload.sub === '') throw new Error('access token has no subject');
+  return { sub: payload.sub, scope: String(payload.scope ?? ''), jti: String(payload.jti ?? '') };
 }
 
 // --- Signed state + authorization code (self-contained artifacts) -----------
@@ -78,6 +80,9 @@ export interface StatePayload {
   /** alias_add only: an opaque value the minting caller chose, signed like
    * tenantId and handed back to its binder (e.g. a server-side link record). */
   nonce?: string;
+  /** owner_gate only: base64url sha256 of the browser-binding cookie the
+   * Google redirect set; /callback refuses a browser that lacks it. */
+  bind?: string;
 }
 
 export interface CodePayload {
@@ -109,6 +114,39 @@ export function signState(payload: StatePayload, base: string, secret: Uint8Arra
 
 export async function verifyState(token: string, base: string, secret: Uint8Array): Promise<StatePayload & { jti: string }> {
   return (await verifyArtifact(token, 'mcp_state', base, secret)) as unknown as StatePayload & { jti: string };
+}
+
+// --- alias_reauth link -------------------------------------------------------
+
+/** A re-auth link is handed out in a tool error, so it has to survive until
+ * the user clicks it; an hour, not the 10-minute state TTL. */
+export const REAUTH_LINK_TTL_SEC = 3600;
+
+function reauthMac(base: string, secret: Uint8Array, alias: string, exp: number): Buffer {
+  // The newline-separated input can never be a JWT signing input (two
+  // base64url segments and one dot), so the shared key stays unambiguous.
+  return createHmac('sha256', secret).update(`alias_reauth\n${base}\n${alias}\n${exp}`).digest();
+}
+
+/** Query string of a server-issued alias_reauth link: the alias, an expiry and
+ * an HMAC over both. Synchronous, so the error hints that carry it stay so. */
+export function signReauthLink(base: string, secret: Uint8Array, alias: string, nowSec: number): string {
+  const exp = nowSec + REAUTH_LINK_TTL_SEC;
+  return `alias=${encodeURIComponent(alias)}&exp=${exp}&sig=${reauthMac(base, secret, alias, exp).toString('base64url')}`;
+}
+
+/** The alias a link was issued for, or null when it is missing, forged or expired. */
+export function verifyReauthLink(
+  base: string,
+  secret: Uint8Array,
+  params: { alias: string; exp: string; sig: string },
+  nowSec: number,
+): string | null {
+  const exp = Number(params.exp);
+  if (!params.alias || !/^\d+$/.test(params.exp) || exp < nowSec) return null;
+  const want = reauthMac(base, secret, params.alias, exp);
+  const got = Buffer.from(params.sig, 'base64url');
+  return got.length === want.length && timingSafeEqual(got, want) ? params.alias : null;
 }
 
 /** A pending-authorization artifact for the DCR consent interstitial (same
@@ -170,6 +208,17 @@ export interface RefreshRecord {
 
 const SPENT_CAP = 2000;
 
+function ownEntries(o: unknown): [string, unknown][] {
+  // An own `__proto__` key (JSON.parse makes one) would set the prototype when copied.
+  return o !== null && typeof o === 'object' && !Array.isArray(o) ? Object.entries(o).filter(([k]) => k !== '__proto__') : [];
+}
+
+function isLegacyRecord(r: unknown): r is RefreshRecord {
+  if (r === null || typeof r !== 'object') return false;
+  const x = r as Record<string, unknown>;
+  return typeof x.sub === 'string' && x.sub !== '' && typeof x.family === 'string' && typeof x.issuedAt === 'number' && Number.isFinite(x.issuedAt);
+}
+
 interface RefreshData {
   active: Record<string, RefreshRecord>;
   /** rotated-away token -> family, for reuse detection (OAuth 2.1 §4.14). */
@@ -190,20 +239,57 @@ export class RefreshStore {
   ) {}
 
   private load(): RefreshData {
-    if (!existsSync(this.path)) return { active: {}, spent: {} };
+    const data: RefreshData = { active: {}, spent: {} };
+    if (!existsSync(this.path)) return data;
+    let d: Partial<Record<keyof RefreshData, unknown>>;
     try {
-      const d = decryptToken(readFileSync(this.path, 'utf-8'), this.masterKey) as unknown as Partial<RefreshData>;
-      return { active: d.active ?? {}, spent: d.spent ?? {} };
+      d = decryptToken(readFileSync(this.path, 'utf-8'), this.masterKey) as unknown as typeof d;
     } catch {
-      return { active: {}, spent: {} };
+      return data;
     }
+    // Only well-formed own entries survive, so no lookup can land on an
+    // inherited key or a record without a subject.
+    for (const [t, r] of ownEntries(d?.active)) {
+      if (isLegacyRecord(r)) data.active[t] = { sub: r.sub, issuedAt: r.issuedAt, family: r.family };
+    }
+    for (const [t, fam] of ownEntries(d?.spent)) if (typeof fam === 'string') data.spent[t] = fam;
+    return data;
   }
 
   private save(data: RefreshData): void {
-    // bound the spent set (drop oldest-inserted) so it can't grow forever.
-    const keys = Object.keys(data.spent);
-    if (keys.length > SPENT_CAP) {
-      for (const k of keys.slice(0, keys.length - SPENT_CAP)) delete data.spent[k];
+    // A family with no active token has nothing left to revoke. Over the cap,
+    // the subject holding the most spent tokens loses its oldest (ties: the
+    // oldest entry), so a subject's rotations, across all its families, only
+    // push out its own history (docs/internals.md). Insertion order = rotation
+    // order.
+    const owner = new Map<string, string>();
+    for (const r of Object.values(data.active)) owner.set(r.family, r.sub);
+    const order = Object.keys(data.spent);
+    const held = new Map<string, { at: number[]; head: number }>();
+    let total = 0;
+    order.forEach((t, i) => {
+      const sub = owner.get(data.spent[t]);
+      if (sub === undefined) {
+        delete data.spent[t];
+        return;
+      }
+      const h = held.get(sub);
+      if (h) h.at.push(i);
+      else held.set(sub, { at: [i], head: 0 });
+      total += 1;
+    });
+    while (total > SPENT_CAP) {
+      let most = { at: [] as number[], head: 0 };
+      let mostN = 0;
+      for (const h of held.values()) {
+        const n = h.at.length - h.head;
+        if (n > mostN || (n === mostN && n > 0 && h.at[h.head] < most.at[most.head])) {
+          most = h;
+          mostN = n;
+        }
+      }
+      delete data.spent[order[most.at[most.head++]]];
+      total -= 1;
     }
     atomicWriteFileSync(this.path, encryptToken(data, this.masterKey), 0o600);
   }
@@ -221,18 +307,28 @@ export class RefreshStore {
   /** Rotate a presented refresh token; null if unknown OR if the presented
    * token was already rotated away (reuse => the family is revoked). The
    * record's sub is copied forward and returned so the caller can mint the
-   * matching access token without trusting anything client-supplied. */
-  rotate(oldToken: string, nowMs: number): { token: string; sub: string } | null {
+   * matching access token without trusting anything client-supplied.
+   *
+   * `accept` (optional) is called inside the store lock, before any mutation,
+   * with the record's sub. false: every active record of that sub is dropped
+   * and null returned. A throw: nothing is mutated and the error propagates,
+   * so the presented token stays valid. Absent: unchanged. */
+  rotate(oldToken: string, nowMs: number, accept?: (sub: string) => boolean): { token: string; sub: string } | null {
     return withFileLock(this.path, () => {
       const data = this.load();
-      const rec = data.active[oldToken];
+      const rec = Object.hasOwn(data.active, oldToken) ? data.active[oldToken] : undefined;
       if (!rec) {
         // Reuse of a rotated-away token signals theft: revoke the whole family.
-        const fam = data.spent[oldToken];
+        const fam = Object.hasOwn(data.spent, oldToken) ? data.spent[oldToken] : undefined;
         if (fam) {
           for (const [t, r] of Object.entries(data.active)) if (r.family === fam) delete data.active[t];
           this.save(data);
         }
+        return null;
+      }
+      if (accept && !accept(rec.sub)) {
+        for (const [t, r] of Object.entries(data.active)) if (r.sub === rec.sub) delete data.active[t];
+        this.save(data);
         return null;
       }
       delete data.active[oldToken];
@@ -245,9 +341,8 @@ export class RefreshStore {
   }
 
   /** Drop every ACTIVE record minted under `sub` (linear scan under the store
-   * lock). Spent entries carry no sub and stay: with their families gone, a
-   * reuse finds nothing to revoke — inert by construction. Returns the number
-   * of active tokens dropped. */
+   * lock); the save then drops the spent entries of every family left with no
+   * active token. Returns the number of active tokens dropped. */
   purgeTenant(sub: string): number {
     return withFileLock(this.path, () => {
       const data = this.load();
