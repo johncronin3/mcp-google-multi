@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
-import { signAccessToken, jwtSecretFrom } from '../src/mcp-token.js';
+import { signAccessToken, jwtSecretFrom, signReauthLink } from '../src/mcp-token.js';
 
 // S1.23: the ONE multi-process smoke. Every other HTTP test drives
 // HttpTransportHost in-process; the real index.ts HTTP bootstrap (env gates ->
@@ -142,13 +142,21 @@ describe('index.ts HTTP bootstrap smoke (S1.23, subprocess)', () => {
     expect(init.status).toBe(200);
     expect(JSON.parse(init.text).result.serverInfo.name).toBe('mcp-google-multi');
 
-    // 5. clientless /authorize mints a signed state and 302s toward Google
-    //    (URL built, never fetched)
-    const authz = await request(port, 'GET', '/authorize?flow=alias_reauth&alias=test');
+    // 5. an unsigned re-auth link is refused; the server-signed one (same
+    //    provisioned key) mints a signed state and 302s toward Google (URL
+    //    built, never fetched)
+    const bare = await request(port, 'GET', '/authorize?flow=alias_reauth&alias=test');
+    expect(bare.status).toBe(400);
+    expect(bare.text).toContain('E_STATE_INVALID');
+    const signed = signReauthLink(publicUrl, jwtSecretFrom(JWT_KEY), 'test', Math.floor(Date.now() / 1000));
+    const authz = await request(port, 'GET', `/authorize?flow=alias_reauth&${signed}`);
     expect(authz.status).toBe(302);
     const loc = String(authz.headers.location);
     expect(loc).toContain('accounts.google.com');
     expect(loc).toContain('state=');
+    // the unauthenticated link must not disclose the alias's address
+    expect(new URL(loc).searchParams.get('login_hint')).toBeNull();
+    expect(new URL(loc).searchParams.get('prompt')).toBe('select_account consent');
 
     // 6. /token rejects garbage without touching the network
     const badGrant = await request(port, 'POST', '/token', {

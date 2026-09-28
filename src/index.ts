@@ -292,8 +292,10 @@ async function main() {
     const { jwtSecretFrom } = await import('./mcp-token.js');
     const { resolveJwtKey, resolveMasterKeyForDispatch } = await import('./master-key.js');
     const { OAuth2Client } = await import('googleapis-common');
-    const { writeToken } = await import('./token-store.js');
+    const { readToken, writeToken } = await import('./token-store.js');
     const { resolveScopesForAccount } = await import('./auth.js');
+    const { ownerAuthUrlOptions } = await import('./oauth-consent.js');
+    const { scopeGrantDiff, setWizardHttpConsent } = await import('./tools/account-wizard.js');
     const { configDir } = await import('./config-file.js');
     const { getAccountSet } = await import('./accounts.js');
     const googleClient = () =>
@@ -310,20 +312,8 @@ async function main() {
         refreshStorePath: path.join(configDir(), 'mcp-tokens.enc'),
       },
       {
-        buildGoogleAuthUrl: ({ flow, alias, state }) => {
-          if (flow === 'alias_reauth' && alias) {
-            const cfg = getAccountSet().configs[alias];
-            // openid+email so /callback can bind the returned identity to the alias.
-            return googleClient().generateAuthUrl({
-              access_type: 'offline',
-              prompt: 'consent',
-              scope: [...new Set([...resolveScopesForAccount(alias), 'openid', 'email'])],
-              login_hint: cfg?.email,
-              state,
-            });
-          }
-          return googleClient().generateAuthUrl({ scope: ['openid', 'email'], prompt: 'select_account', state });
-        },
+        buildGoogleAuthUrl: ({ flow, alias, state }) =>
+          googleClient().generateAuthUrl(ownerAuthUrlOptions({ flow, alias, state }, (a) => resolveScopesForAccount(a))),
         exchangeCode: async (code, flow) => {
           const { tokens } = await googleClient().getToken(code);
           const email = verifiedEmailFromIdToken(tokens.id_token ?? undefined);
@@ -332,20 +322,25 @@ async function main() {
           return { tokens: flow === 'owner_gate' ? {} : (tokens as Record<string, unknown>), email };
         },
         writeToken: (alias, tokens) => writeToken(alias, tokens),
+        missingScopes: (alias, granted) => scopeGrantDiff(resolveScopesForAccount(alias), granted),
+        hasToken: (alias) => {
+          try {
+            return readToken(alias) != null;
+          } catch {
+            return false; // undecryptable: nothing usable to keep
+          }
+        },
         aliasEmail: (alias) => getAccountSet().configs[alias]?.email,
         log: (l) => process.stderr.write(`[as] ${l}\n`),
       },
     );
-    // BV-1: over HTTP, a dead/missing per-account token surfaces a clickable
-    // re-auth link into the AS's alias_reauth flow instead of a stdio CLI hint.
-    const { setHttpReauthBase } = await import('./reauth-hint.js');
-    setHttpReauthBase(httpCfg.publicUrl);
-    // Wizard consent over HTTP: hand out the clientless AS link instead of
+    // BV-1: over HTTP, a dead/missing per-account token surfaces a clickable,
+    // signed re-auth link into the AS's alias_reauth flow instead of a CLI hint.
+    const { setHttpReauthLink } = await import('./reauth-hint.js');
+    setHttpReauthLink((alias) => authServer.reauthLink(alias));
+    // Wizard consent over HTTP: hand out the same signed link instead of
     // binding a loopback listener.
-    const { setWizardHttpConsent } = await import('./tools/account-wizard.js');
-    setWizardHttpConsent({
-      mintConsentUrl: (alias) => `${httpCfg.publicUrl}/authorize?flow=alias_reauth&alias=${encodeURIComponent(alias)}`,
-    });
+    setWizardHttpConsent({ mintConsentUrl: (alias) => authServer.reauthLink(alias) });
 
     let httpTap: ((t: Transport) => Transport) | undefined;
     if (httpMetrics) {
