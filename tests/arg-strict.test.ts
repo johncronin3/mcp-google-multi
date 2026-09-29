@@ -14,7 +14,7 @@ import { editDistance, SUGGEST_MAX_INPUT } from '../src/scope-catalog.js';
 const DRIVE_CREATE_FOLDER = ['account', 'name', 'parentFolderId'];
 const DRIVE_LIST = ['account', 'folderId', 'maxResults', 'pageToken'];
 const DRIVE_MOVE = ['account', 'fileId', 'newParentFolderId'];
-const DRIVE_UPLOAD = ['account', 'localPath', 'filename', 'mimeType', 'convertTo', 'parentFolderId'];
+const DRIVE_UPLOAD = ['account', 'localPath', 'contentBase64', 'content', 'filename', 'mimeType', 'convertTo', 'parentFolderId'];
 
 describe('unknownArgMode', () => {
   it('defaults to reject: a silent drop reads to the client as success', () => {

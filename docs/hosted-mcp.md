@@ -143,3 +143,14 @@ On Cloud Run (`MCP_HOSTED` / `K_SERVICE`), these tools return file bytes in the 
 
 Shape: `{ filename, mimeType, size, encoding: "base64", data }`. Desk/stdio still requires `savePath` and writes locally. If a caller passes `savePath` while hosted, it is ignored (optional `note` in the payload).
 
+## Hosted uploads (inline bytes)
+
+`drive_upload` on Cloud Run cannot read `localPath` (there is no laptop filesystem; a path-only call fails closed and does not create a file). Pass one of:
+
+- `contentBase64` — standard base64 or base64url file bytes (same encoding as the `data` field from hosted downloads)
+- `content` — the same bytes; this is the Gmail attachment field name
+
+Plus `filename`. Optional `mimeType`, `parentFolderId`, `convertTo`, `account`.
+
+When inline bytes are set they are the upload, including if `localPath` is also present. Empty, invalid, or missing bytes fail closed. Desk/stdio still accepts `localPath` when inline bytes are omitted. A Drive file that comes back with `size` 0 is not a usable `fileId`.
+
