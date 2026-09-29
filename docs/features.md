@@ -10,6 +10,10 @@ House Streamable HTTP (`src/http.ts`, the Cloud Run / Grok process) builds a new
 
 Hidden is a listing concept, not a security boundary: operational tools stay callable at all times (existing prompts that call tools directly keep working), and write-control + OAuth scopes remain the real enforcement. Use `GOOGLE_TOOLSETS` to switch entire services off — it is a filter only: listing an optional service does not enable it without its `GOOGLE_OPTIONAL_SCOPES` / `GOOGLE_ADMIN_ACCOUNTS` gate.
 
+## Hosted Drive upload (inline bytes)
+
+`drive_upload` on desk/stdio reads `localPath`. On hosted Cloud Run that path is the container, not the laptop, so a path-only call fails closed (it does not surface as `ENOENT`). Pass `content` or `contentBase64` — standard base64 or base64url, the same bytes Gmail attachments accept as `content` and the same encoding hosted downloads return as `data` — plus `filename`. Inline bytes are the file whenever they are present. An empty or invalid payload does not create a Drive file. Write-control and session grants are unchanged.
+
 ## Curated + generated tiers
 
 Everyday operations are **curated** tools: hand-written, response-shaped, token-lean. The long tail is **generated** from Google's API Discovery documents — one tool per method, same write-control, same account fan-out, regenerated when Google revises an API. Together they cover every OAuth-reachable Workspace API method; the split per service is in [COVERAGE.md](../COVERAGE.md).

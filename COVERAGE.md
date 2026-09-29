@@ -715,14 +715,14 @@ Optional scope bundles: `analytics`, `analytics_write`, `appsmarket`, `chat`, `c
 | `drive_copy` | curated | create | Duplicate a file in Google Drive (does not work on folders) |
 | `drive_create_folder` | curated | create | Create a new folder in Google Drive |
 | `drive_delete` | curated | delete | Permanently delete a file or folder from Google Drive. Irreversible. Use drive_trash for recoverable deletion. |
-| `drive_download` | curated | read | Download a binary file from Drive to local disk. For Google Workspace formats (Docs, Sheets, Slides), use drive_export i |
+| `drive_download` | curated | read | Download a binary file from Drive. Desk/stdio: writes to savePath on local disk. Hosted Cloud Run: returns base64 bytes  |
 | `drive_drives_create` | generated | create | Creates a shared drive. For more information, see [Manage shared drives](https://developers.google.com/workspace/drive/a |
 | `drive_drives_delete` | generated | delete | Permanently deletes a shared drive for which the user is an `organizer`. The shared drive cannot contain any untrashed i |
 | `drive_drives_hide` | generated | update | Hides a shared drive from the default view. For more information, see [Manage shared drives](https://developers.google.c |
 | `drive_drives_unhide` | generated | update | Restores a shared drive to the default view. For more information, see [Manage shared drives](https://developers.google. |
 | `drive_drives_update` | generated | update | Updates the metadata for a shared drive. For more information, see [Manage shared drives](https://developers.google.com/ |
 | `drive_empty_trash` | curated | delete | Permanently delete every file currently in the account's trash. Irreversible. |
-| `drive_export` | curated | read | Export a Google Workspace document (Doc, Sheet, Slide) to a standard format and save to disk. Supported: PDF, DOCX, XLSX |
+| `drive_export` | curated | read | Export a Google Workspace document (Doc, Sheet, Slide) to a standard format. Desk/stdio: saves to savePath on local disk |
 | `drive_files_download` | generated | read | Downloads the content of a file. For more information, see [Download and export files](https://developers.google.com/wor |
 | `drive_files_generate_cse_token` | generated | read | Generates a CSE token which can be used to create or update CSE files. |
 | `drive_files_generate_ids` | generated | read | Generates a set of file IDs which can be provided in create or copy requests. For more information, see [Create and mana |
@@ -760,7 +760,7 @@ Optional scope bundles: `analytics`, `analytics_write`, `appsmarket`, `chat`, `c
 | `drive_trash` | curated | delete | Move a file to Google Drive trash. Recoverable from Drive UI or via drive_untrash. |
 | `drive_untrash` | curated | update | Restore a trashed file from Google Drive trash back to its previous location. |
 | `drive_update` | curated | update | Rename, move, or replace content of a Drive file. Any combination in one call. For untrash, use drive_untrash. |
-| `drive_upload` | curated | create | Upload a local file to Google Drive. Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing |
+| `drive_upload` | curated | create | Upload a file to Google Drive from a desk localPath or from inline content/contentBase64 bytes (required on hosted Cloud |
 
 </details>
 
@@ -832,7 +832,7 @@ Optional scope bundles: `analytics`, `analytics_write`, `appsmarket`, `chat`, `c
 | `gmail_create_label` | curated | create | Create a new custom Gmail label |
 | `gmail_delete` | curated | delete | Permanently and irreversibly delete a Gmail message. No recovery possible. |
 | `gmail_delete_label` | curated | delete | Permanently delete a Gmail label and remove it from all messages |
-| `gmail_download_attachment` | curated | read | Download an email attachment to local disk. Use gmail_read first to get the attachmentId. |
+| `gmail_download_attachment` | curated | read | Download an email attachment. Desk/stdio: writes to savePath on local disk. Hosted Cloud Run: returns base64 bytes in th |
 | `gmail_get_draft` | curated | read | Read the full content of a specific Gmail draft |
 | `gmail_get_profile` | curated | read | Get Gmail account profile: email address, total messages, total threads, and current history ID |
 | `gmail_get_vacation` | curated | read | Read current Gmail vacation responder settings |

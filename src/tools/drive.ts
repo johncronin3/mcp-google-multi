@@ -20,6 +20,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import mime from 'mime-types';
 
@@ -167,6 +168,107 @@ export function resolveShareNotification(opts: {
   if (opts.type !== 'user' && opts.type !== 'group') return undefined;
   if (opts.transferOwnership || opts.role === 'owner') return true;
   return opts.sendNotification ?? true;
+}
+
+export type DriveUploadMedia =
+  | { kind: 'path'; localPath: string; mimeType: string }
+  | { kind: 'bytes'; buffer: Buffer; mimeType: string };
+
+/** Standard or url-safe base64, optional data-URL prefix. Empty input throws. */
+export function decodeInlineFileBytes(raw: string): Buffer {
+  const trimmed = raw.trim();
+  const dataUrl = trimmed.match(/^data:[^,]*,([\s\S]*)$/i);
+  const compact = (dataUrl ? dataUrl[1] : trimmed).replace(/\s+/g, '');
+  if (compact === '') {
+    throw new Error(
+      'Inline file bytes are empty. Pass content or contentBase64 (standard base64 or base64url). Nothing was uploaded.',
+    );
+  }
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) {
+    throw new Error(
+      'Inline file bytes are not valid base64. Pass content or contentBase64 (standard base64 or base64url). Nothing was uploaded.',
+    );
+  }
+  const normalized = compact.replace(/-/g, '+').replace(/_/g, '/');
+  const padLen = (4 - (normalized.length % 4)) % 4;
+  const padded = padLen ? normalized + '='.repeat(padLen) : normalized;
+  const buffer = Buffer.from(padded, 'base64');
+  if (buffer.length === 0) {
+    throw new Error('Inline file bytes decoded to zero bytes. Nothing was uploaded.');
+  }
+  return buffer;
+}
+
+function uploadMime(filename: string, localPath: string | undefined, mimeTypeArg: string | undefined): string {
+  if (mimeTypeArg && mimeTypeArg.trim() !== '') return mimeTypeArg;
+  const looked = (localPath ? mime.lookup(localPath) : false) || mime.lookup(path.basename(filename || ''));
+  return typeof looked === 'string' ? looked : 'application/octet-stream';
+}
+
+/**
+ * Desk reads localPath. Hosted Cloud Run cannot — inline bytes are the file.
+ * Pure helper: no Drive calls. docs/internals.md
+ */
+export function resolveDriveUploadSource(opts: {
+  hosted: boolean;
+  localPath?: string;
+  content?: string;
+  contentBase64?: string;
+  filename: string;
+  mimeTypeArg?: string;
+}): { ok: true; media: DriveUploadMedia } | { ok: false; message: string; hint: string } {
+  const hasContent = opts.content !== undefined;
+  const hasB64 = opts.contentBase64 !== undefined;
+  const localPath = opts.localPath !== undefined && opts.localPath.trim() !== '' ? opts.localPath : undefined;
+
+  if (hasContent || hasB64) {
+    if (hasContent && hasB64 && opts.content!.trim() !== opts.contentBase64!.trim()) {
+      return {
+        ok: false,
+        message: 'content and contentBase64 do not match. Pass one inline byte string. Nothing was uploaded.',
+        hint: 'Use content (Gmail-style) or contentBase64, not two different payloads.',
+      };
+    }
+    const raw = hasB64 ? opts.contentBase64! : opts.content!;
+    try {
+      const buffer = decodeInlineFileBytes(raw);
+      return {
+        ok: true,
+        media: { kind: 'bytes', buffer, mimeType: uploadMime(opts.filename, undefined, opts.mimeTypeArg) },
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        message,
+        hint: 'The inline bytes are the file. An empty or invalid payload is not uploaded.',
+      };
+    }
+  }
+
+  if (opts.hosted) {
+    const pathNote = localPath ? 'localPath was provided but is not readable on Cloud Run. ' : '';
+    return {
+      ok: false,
+      message:
+        pathNote +
+        'Hosted Cloud Run cannot read localPath. Pass content or contentBase64 (standard base64 or base64url file bytes) plus filename. Nothing was uploaded.',
+      hint: 'Desk/stdio can still pass localPath when inline bytes are omitted.',
+    };
+  }
+
+  if (localPath) {
+    return {
+      ok: true,
+      media: { kind: 'path', localPath, mimeType: uploadMime(opts.filename, localPath, opts.mimeTypeArg) },
+    };
+  }
+
+  return {
+    ok: false,
+    message: 'Pass localPath (desk/stdio) or content / contentBase64 (inline file bytes). Nothing was uploaded.',
+    hint: 'On hosted Cloud Run pass content or contentBase64. A path on the laptop is not visible to Cloud Run.',
+  };
 }
 
 export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
@@ -429,23 +531,54 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
   registerHostFileTool(
     'drive_upload',
     {
-      description: 'Upload a local file to Google Drive. Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
+      description:
+        'Upload a file to Google Drive from a desk localPath or from inline content/contentBase64 bytes (required on hosted Cloud Run, where localPath is not readable). Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        localPath: z.string().min(1).describe('Absolute path of the SOURCE file on disk to upload (on the machine running the server; this is not savePath)'),
+        localPath: z.string().optional().describe(
+          'Desk/stdio only: absolute path of the source file on the machine running the server (not savePath). Not readable on hosted Cloud Run — pass content or contentBase64. Ignored when inline bytes are set.',
+        ),
+        contentBase64: z.string().optional().describe(
+          'Standard base64 or base64url file bytes. Hosted-safe. Same encoding as the data field from hosted downloads.',
+        ),
+        content: z.string().optional().describe(
+          'Alias of contentBase64: base64 or base64url file bytes (same field Gmail attachments use). When set, these bytes are uploaded and localPath is not read.',
+        ),
         filename: z.string().describe('Name as it appears in Drive'),
-        mimeType: z.string().optional().describe('Source MIME type of the local file (inferred from extension if omitted). With `convertTo`, this is the format Drive imports from.'),
+        mimeType: z.string().optional().describe('Source MIME type (inferred from the filename or localPath extension if omitted). With `convertTo`, this is the format Drive imports from.'),
         convertTo: z.enum(CONVERT_TO_VALUES).optional().describe('Convert the upload into this native Google Workspace type on import: "document" | "spreadsheet" | "presentation" | "drawing" (full application/vnd.google-apps.* ids also accepted). E.g. upload .md/.html/.docx/.txt with convertTo=document to get a real Google Doc. Source must be an importable format. Omit to store the file as-is.'),
         parentFolderId: z.string().optional().describe('Parent folder ID, not parentId. Defaults to My Drive root'),
       },
     },
-    async ({ account, localPath, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
+    async ({ account, localPath, content, contentBase64, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
+      const resolved = resolveDriveUploadSource({
+        hosted: isHostedHttp(),
+        localPath,
+        content,
+        contentBase64,
+        filename,
+        mimeTypeArg,
+      });
+      if (!resolved.ok) return invalidParams(account as Account, resolved.message, resolved.hint);
       try {
+        let body: fs.ReadStream | Readable;
+        if (resolved.media.kind === 'path') {
+          const st = await fs.promises.stat(resolved.media.localPath);
+          if (st.size === 0) {
+            return invalidParams(
+              account as Account,
+              'localPath is empty (0 bytes). Nothing was uploaded.',
+              'Choose a non-empty file, or pass content / contentBase64.',
+            );
+          }
+          body = await openLocalReadStream(resolved.media.localPath);
+        } else {
+          // A Buffer has no .pipe, so googleapis would drop the media. docs/internals.md
+          body = Readable.from(resolved.media.buffer);
+        }
+
         const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
-
-        const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
-        const fileStream = await openLocalReadStream(localPath);
 
         const res = await drive.files.create({
           requestBody: {
@@ -455,12 +588,20 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
             ...(convertTo ? { mimeType: resolveConvertTarget(convertTo) } : {}),
           },
           media: {
-            mimeType: resolvedMime,
-            body: fileStream,
+            mimeType: resolved.media.mimeType,
+            body,
           },
           fields: 'id,name,mimeType,webViewLink,size',
           supportsAllDrives: true,
         });
+        // Metadata-only creates return an id with size 0. That id cannot seed an attachment.
+        if (!convertTo && res.data.size != null && Number(res.data.size) === 0) {
+          return invalidParams(
+            account as Account,
+            `Drive stored an empty file${res.data.id ? ` (id ${res.data.id})` : ''} (size 0). Nothing usable was uploaded.`,
+            'Pass non-empty content or contentBase64. A metadata-only create leaves size 0 and is not a usable fileId.',
+          );
+        }
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(res.data, null, 2) }],
         };
