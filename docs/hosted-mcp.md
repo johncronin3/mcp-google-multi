@@ -56,8 +56,10 @@ the grant on `/oauth/authorize`. Codes never go in the JWT.
   Plugins **Reopen** uses `http://localhost:8787/callback` and the desk process holds
   the PKCE verifier — **302 to that URI**. grok.com Custom still 302s to
   `https://grok.com/connectors-oauth-exchange-code/` because that is what it requested.
-- List hundreds of tools at boot (`GOOGLE_REVEAL_AT_BOOT=all`) unless the client requires it;
-  a huge `tools/list` plus Grok retries contributes to 429s. Prefer deferred discover.
+- Advertise the curated surface on the first `tools/list` (Grok freezes that list and does not
+  rebind after discover). Do not set `GOOGLE_DISCOVERY=eager` or `GOOGLE_REVEAL_AT_BOOT=all`
+  unless the client needs the generated long tail; a huge `tools/list` plus Grok retries
+  contributes to 429s.
 
 Missing layer-1 tokens: **desk-mint error** (mint on a desk, mount `*.enc`).
 
