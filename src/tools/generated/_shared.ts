@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ACCOUNTS } from '../../accounts.js';
+import { accountAliasSchema, accountAliasSchemaFor, accountArgLive } from '../../accounts.js';
 import { executeApiMethod, type ApiMethodRef, type ExecuteDeps, type QueryParams } from '../../executor.js';
 import type { Cud, ToolRegistry } from '../../registry.js';
 
@@ -18,18 +18,29 @@ export interface GeneratedToolDef {
   method: ApiMethodRef;
   params: GeneratedParam[];
   hasBody: boolean;
+  /** Typed-body tier: these top-level args assemble into the request body
+   * (flat schemas only; deep schemas keep the single opaque `body` arg). */
+  bodyParams?: Array<{ field: string; api: string }>;
   shape: z.ZodRawShape;
 }
 
-export function accountField() {
-  return z.enum(ACCOUNTS).describe('Google account alias');
+export function accountField(aliases?: readonly string[] | (() => readonly string[])) {
+  // Generated code passes a getter over registry.accountAliases(), so the field
+  // validates against the registry's CURRENT set, as curated tools do. An
+  // array bakes that set; the no-arg form keeps the global-bound schema.
+  const schema =
+    typeof aliases === 'function' ? accountArgLive(aliases) : aliases ? accountAliasSchemaFor(aliases) : accountAliasSchema;
+  return schema.optional().describe('Google account alias (omit for the default account)');
 }
+
+export type { ExecuteDeps } from '../../executor.js';
 
 interface GeneratedToolConfig {
   description: string;
   inputSchema: z.ZodRawShape;
   cud: Cud;
   annotations: Record<string, unknown>;
+  requiredScopes?: readonly string[];
 }
 
 export function registerGeneratedTool(registry: ToolRegistry, def: GeneratedToolDef, deps: ExecuteDeps = {}): void {
@@ -43,6 +54,7 @@ export function registerGeneratedTool(registry: ToolRegistry, def: GeneratedTool
       inputSchema: def.shape,
       cud: def.cud,
       annotations: { openWorldHint: true },
+      requiredScopes: def.method.scopes,
     },
     async (args: Record<string, unknown>) => {
       const pathParams: Record<string, string | number> = {};
@@ -53,13 +65,22 @@ export function registerGeneratedTool(registry: ToolRegistry, def: GeneratedTool
         if (p.location === 'path') pathParams[p.api] = value as string | number;
         else queryParams[p.api] = value as QueryParams[string];
       }
+      let body: unknown = def.hasBody ? args.body : undefined;
+      if (def.bodyParams) {
+        const assembled: Record<string, unknown> = {};
+        for (const bp of def.bodyParams) {
+          const value = args[bp.field];
+          if (value !== undefined) assembled[bp.api] = value;
+        }
+        body = assembled;
+      }
       return executeApiMethod(
         def.method,
         {
           account: args.account as string,
           pathParams,
           queryParams,
-          body: def.hasBody ? args.body : undefined,
+          body,
         },
         deps,
       );

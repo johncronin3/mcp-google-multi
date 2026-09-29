@@ -1,0 +1,153 @@
+import { describe, it, expect, vi } from 'vitest';
+import { ToolRegistry } from '../src/registry.js';
+import { GENERATED_GATES, SERVICES, servicesAwaitingRestart, unknownToolMessage } from '../src/services.js';
+import type { AccountSet } from '../src/accounts.js';
+import { GENERATED_SERVICES } from '../src/tools/generated/index.js';
+import type { Policy } from '../src/write-control.js';
+
+const POLICY: Policy = { profile: 'read-only', readOnly: true, allow: [], deny: [] };
+
+function stub() {
+  return { registerTool: () => 'ok', sendToolListChanged: vi.fn(), server: { setRequestHandler: () => {} } };
+}
+
+function buildAll(mode: 'lazy' | 'curated' | 'eager' = 'eager') {
+  const registry = new ToolRegistry(stub() as never, POLICY, mode);
+  for (const s of SERVICES) s.register(registry);
+  for (const g of GENERATED_SERVICES) g.register(registry);
+  return registry;
+}
+
+describe('tools that no bundle can authorize', () => {
+  const registry = buildAll();
+  const ungrantable = registry.tools.filter((t) => registry.isUngrantable(t));
+
+  it('is a static property of the bundle catalog, not of an account', () => {
+    // Discovery scope lists are ANY-OF, so one grantable alternative is enough.
+    // A tool with no declared scopes is never judged unreachable.
+    expect(ungrantable.every((t) => (t.requiredScopes?.length ?? 0) > 0)).toBe(true);
+    expect(ungrantable.length).toBeGreaterThan(100);
+  });
+
+  it('hides them from tools/list even in eager mode', () => {
+    expect(ungrantable.some((t) => registry.isVisible(t))).toBe(false);
+  });
+
+  it('keeps them registered, so a call by name still reaches the real scope error', () => {
+    for (const t of ungrantable.slice(0, 20)) expect(registry.hasTool(t.name)).toBe(true);
+  });
+
+  it('still lists them in the service catalog, marked', () => {
+    const rows = registry.catalog('admin');
+    const marked = rows.filter((r) => r.unreachable);
+    expect(marked.length).toBeGreaterThan(0);
+    expect(rows.length).toBeGreaterThan(marked.length);
+    for (const r of marked) expect(registry.hasTool(r.tool)).toBe(true);
+  });
+
+  it('never hides a curated tool: those authorize at service grain', () => {
+    expect(ungrantable.some((t) => !t.generated)).toBe(false);
+  });
+});
+
+describe('unknown tool name', () => {
+  const registry = buildAll();
+
+  it('offers a did-you-mean for a near miss', () => {
+    expect(unknownToolMessage(registry, 'gmail_serach')).toMatch(/Did you mean: .*gmail_search/);
+  });
+
+  it('ranks only the first few unknown keys against the service sibling keys', () => {
+    const reg = buildAll();
+    // near the length of real keys, so the length-gap skip does not spare the DP
+    const keys = Array.from({ length: 60_000 }, (_, i) => `${i}`.padStart(12, '9'));
+    const t0 = performance.now();
+    reg.siblingSpellings('drive_list', keys);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+
+  it('names the scope bundle when the service exists but is gated', () => {
+    const gated = new ToolRegistry(stub() as never, POLICY, 'eager');
+    SERVICES.find((s) => s.name === 'gmail')!.register(gated);
+    const msg = unknownToolMessage(gated, 'keep_notes_zzz');
+    expect(msg).toContain('"keep" service is not enabled');
+    expect(msg).toContain('google_api_call');
+  });
+
+  it('answers an oversized name quickly and echoes only a prefix', () => {
+    const t0 = performance.now();
+    const msg = unknownToolMessage(registry, 'z'.repeat(1_000_000));
+    expect(performance.now() - t0).toBeLessThan(250);
+    expect(msg.length).toBeLessThan(300);
+    expect(msg).toContain(`Tool ${'z'.repeat(64)}... not found`);
+  });
+
+  // Every service registered except the gated ones, as a real boot with no
+  // optional bundles leaves it; `accounts` is the registry's live view.
+  function bootWithoutGated(accounts: () => AccountSet) {
+    const reg = new ToolRegistry(stub() as never, POLICY, 'eager', null, accounts);
+    for (const s of SERVICES) if (!s.enabled) s.register(reg);
+    for (const g of GENERATED_SERVICES) if (!SERVICES.find((s) => s.name === g.name)?.enabled && !GENERATED_GATES[g.name]) g.register(reg);
+    return reg;
+  }
+  const setWith = (bundles: string[]): AccountSet =>
+    ({
+      aliases: ['work'],
+      configs: { work: { email: 'work@x.example', tokenPath: '/t', encPath: '/e', scopeProfile: 'p', source: 'env' as const } },
+      scopeProfiles: { base: { bundles: [] }, p: { bundles } },
+      source: 'env',
+      stamp: 'env:0',
+    }) as AccountSet;
+
+  it('names the gated service before any cross-service did-you-mean', () => {
+    const reg = bootWithoutGated(() => setWith([]));
+    const msg = unknownToolMessage(reg, 'chat_spaces_get');
+    expect(msg).toContain('"chat" service is not enabled');
+    expect(msg).not.toContain('meet_spaces_get');
+  });
+
+  it('says a restart is needed when an account added after boot enables the service', () => {
+    let live = setWith([]);
+    const reg = bootWithoutGated(() => live);
+    expect(servicesAwaitingRestart(reg)).toEqual([]);
+    live = setWith(['forms']);
+    expect(servicesAwaitingRestart(reg)).toEqual(['forms']);
+    const msg = unknownToolMessage(reg, 'forms_get');
+    expect(msg).toContain('"forms" service was enabled after this server started');
+    expect(msg).toContain('Restart the server');
+  });
+
+  it('maps a tool whose service is not its prefix (reports_activities_list is admin)', () => {
+    const reg = bootWithoutGated(() => setWith([]));
+    expect(unknownToolMessage(reg, 'reports_activities_list')).toContain('"admin" service is not enabled');
+  });
+
+  it('tells a GOOGLE_TOOLSETS exclusion apart from a missing bundle', () => {
+    vi.stubEnv('GOOGLE_TOOLSETS', 'gmail');
+    try {
+      const reg = new ToolRegistry(stub() as never, POLICY, 'eager');
+      SERVICES.find((s) => s.name === 'gmail')!.register(reg);
+      expect(unknownToolMessage(reg, 'drive_search')).toContain('"drive" service is turned off in this deployment (GOOGLE_TOOLSETS)');
+      expect(servicesAwaitingRestart(reg)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('points at discovery when the name resembles nothing at all', () => {
+    const msg = unknownToolMessage(registry, 'zzzz_totally_made_up_xyzzy');
+    expect(msg).toContain('_discover');
+    expect(msg).toContain('google_api_search');
+  });
+});
+
+describe('diagnose', () => {
+  it('is advertised at idle: the README sends people here when stuck', () => {
+    const registry = new ToolRegistry(stub() as never, POLICY, 'lazy');
+    SERVICES.find((s) => s.name === 'gmail')!.register(registry);
+    registry.registerMeta('diagnose', { description: 'health report', inputSchema: {} }, () => ({ content: [] }));
+    const entry = registry.tools.find((t) => t.name === 'diagnose')!;
+    expect(entry.meta).toBe(true);
+    expect(registry.isVisible(entry)).toBe(true);
+  });
+});
