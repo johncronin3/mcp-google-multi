@@ -52,7 +52,7 @@ Tool responses are serialized compactly (no pretty-print token tax; set `GOOGLE_
 
 ### Email attachments & safe compose
 
-`gmail_send` and `gmail_create_draft` share one MIME builder (nodemailer MailComposer) and accept `attachments: [{ path, filename?, contentType? }]` — the server reads each absolute path itself (MailComposer never touches the filesystem or network), caps the total at ~35 MB, and derives the MIME filename by basename. Address/subject headers containing CR/LF are rejected up front (`E_HEADER_INJECTION`), closing the old header-injection hole; bodies are CRLF-normalized and base64-encoded so Gmail's raw upload can't be corrupted by a bare LF.
+`gmail_send` and `gmail_create_draft` share one MIME builder (nodemailer MailComposer). Each attachment is `{ content, filename }` (base64 bytes; hosted-safe), a desk `{ path }`, or `{ driveFileId }` / `{ messageId, attachmentId }`. The server puts those bytes into the MIME itself (MailComposer never touches the filesystem or network), caps the total at ~25 MB encoded, and derives the MIME filename by basename. If the caller requested an attachment and those bytes are not in the Gmail `raw` body, the tool returns an error and does not call Gmail — a draft or send id is not success when the file is missing. Address/subject headers containing CR/LF are rejected up front (`E_HEADER_INJECTION`).
 
 
 ### Markdown email (send)

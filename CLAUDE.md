@@ -90,7 +90,7 @@ Reads are never gated. CUD is **deny-by-default**: `GOOGLE_PROFILE` (read-only /
 
 ## Email compose (gmail_send / gmail_create_draft)
 
-Both route through `composeRaw()` in `gmail-mime.ts` (nodemailer MailComposer): header/RFC-2047/address encoding and boundaries are the library's job. A pre-check rejects CR/LF in `from`/`to`/`cc`/`subject` (`E_HEADER_INJECTION`). `attachments` are read by THIS server into buffers (`disableFileAccess`/`disableUrlAccess` on MailComposer), absolute-path-only, basename-guarded, ~35 MB total cap. Do NOT reintroduce hand-rolled header encoders (they were the injection surface, removed in A4).
+Both route through `composeRaw()` in `gmail-mime.ts` (nodemailer MailComposer): header/RFC-2047/address encoding and boundaries are the library's job. A pre-check rejects CR/LF in `from`/`to`/`cc`/`subject` (`E_HEADER_INJECTION`). `attachments` are buffers this server reads (`content` base64, desk `path`, `driveFileId`, or Gmail `messageId`+`attachmentId`); MailComposer gets `disableFileAccess`/`disableUrlAccess`, paths are absolute and basename-guarded, ~25 MB encoded cap. After compose, `assertRequestedBytes` refuses the Gmail call unless every requested attachment's bytes are in `raw` (`E_ATTACHMENT_EMPTY` / `E_ATTACHMENT_MISSING`) — Gmail returns an id for a raw body with no file. Do NOT reintroduce hand-rolled header encoders (they were the injection surface, removed in A4).
 
 ## Drive specifics
 

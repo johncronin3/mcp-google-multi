@@ -207,6 +207,20 @@ export async function composeRaw(input: ComposeInput): Promise<string> {
   return built.toString('base64url');
 }
 
+/**
+ * Filenames whose bytes are absent from a composed Gmail `raw` payload.
+ * MailComposer wraps base64 at 76 columns. Gmail's send/draft methods return
+ * an id even when `raw` has no attachment body, so callers must refuse first.
+ */
+export function mimeOmitsAttachmentBytes(encodedRaw: string, files: ComposeAttachment[]): string[] {
+  const mime = Buffer.from(encodedRaw, 'base64url').toString('latin1').replace(/\r\n/g, '');
+  const missing: string[] = [];
+  for (const file of files) {
+    if (file.content.length === 0 || !mime.includes(file.content.toString('base64'))) missing.push(file.filename);
+  }
+  return missing;
+}
+
 export interface MimeAttachment {
   filename: string;
   mimeType: string;

@@ -7,7 +7,7 @@ import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient, type CuratedToolDeps } from '../client.js';
 import { handleGoogleApiError, invalidParams, mapGoogleError } from './_errors.js';
-import { buildReplyHeaders, composeRaw, renderMarkdown, htmlToMarkdown, HeaderInjectionError, localPathUnavailableMessage, type ComposeAttachment } from './gmail-mime.js';
+import { buildReplyHeaders, composeRaw, mimeOmitsAttachmentBytes, renderMarkdown, htmlToMarkdown, HeaderInjectionError, localPathUnavailableMessage, type ComposeAttachment } from './gmail-mime.js';
 import {
   deskSavePathRequiredMessage,
   hostedBytesPayload,
@@ -238,10 +238,18 @@ const estimateEncoded = (rawBytes: number) => Math.ceil((rawBytes * 4) / 3);
 const attachmentNameFields = {
   filename: z.string().optional().describe('MIME filename; defaults to the source name'),
   contentType: z.string().optional().describe('MIME type; defaults to a lookup on the filename'),
+  content: z.string().optional().describe(
+    'Base64 or base64url file bytes. When set, these bytes are the attachment and path is not read. Hosted-safe.',
+  ),
 };
 const attachmentSchema = z
   .array(
     z.union([
+      z.object({
+        content: z.string().min(1).describe('Base64 or base64url file bytes. These bytes are the attachment.'),
+        filename: z.string().min(1).describe('MIME filename'),
+        contentType: z.string().optional().describe('MIME type; defaults to a lookup on the filename'),
+      }),
       z.object({
         path: z.string().describe('Absolute local path to the file to attach (desk only; hosted Cloud Run cannot see laptop paths)'),
         ...attachmentNameFields,
@@ -258,12 +266,13 @@ const attachmentSchema = z
     ]),
   )
   .optional()
-  .describe('Files to attach: { path } on desk, or hosted-safe { driveFileId } / { messageId, attachmentId }');
+  .describe('Files to attach. Inline { content, filename } (base64 bytes), desk { path }, or hosted { driveFileId } / { messageId, attachmentId }. A request with attachments errors unless those bytes are in the Gmail MIME.');
 
 type SendAttachment = {
   path?: string;
   filename?: string;
   contentType?: string;
+  content?: string;
   driveFileId?: string;
   messageId?: string;
   attachmentId?: string;
@@ -342,6 +351,9 @@ export async function readAttachments(
     }
     const content = await fs.promises.readFile(real);
     const filename = path.basename(a.filename ?? a.path);
+    if (content.length === 0) {
+      throw new GmailComposeError('E_ATTACHMENT_EMPTY', `attachment is empty (0 bytes): ${filename}. Nothing was sent to Gmail.`);
+    }
     out.push({
       filename,
       content,
@@ -399,9 +411,13 @@ async function resolveRemoteAttachment(gmail: any, drive: any, spec: SendAttachm
       { responseType: 'arraybuffer' },
     );
     const filename = spec.filename || name;
+    const content = asDownloadBuffer(res.data);
+    if (content.length === 0) {
+      throw new GmailComposeError('E_ATTACHMENT_EMPTY', `Drive file "${filename}" returned no bytes. Nothing was sent to Gmail.`);
+    }
     return {
       filename,
-      content: asDownloadBuffer(res.data),
+      content,
       contentType: spec.contentType || mimeType,
     };
   }
@@ -421,9 +437,32 @@ async function resolveRemoteAttachment(gmail: any, drive: any, spec: SendAttachm
     });
     const raw = res.data.data;
     if (!raw) throw new GmailComposeError('validation_error', 'No attachment data returned');
-    return { filename: filename || 'attachment', content: Buffer.from(raw, 'base64url'), contentType: contentType || 'application/octet-stream' };
+    const content = Buffer.from(raw, 'base64url');
+    if (content.length === 0) {
+      throw new GmailComposeError('E_ATTACHMENT_EMPTY', `attachment "${filename || 'attachment'}" has no bytes. Nothing was sent to Gmail.`);
+    }
+    return { filename: filename || 'attachment', content, contentType: contentType || 'application/octet-stream' };
   }
-  throw new GmailComposeError('validation_error', 'Each attachment needs exactly one source: path, driveFileId, or messageId+attachmentId');
+  throw new GmailComposeError('validation_error', 'Each attachment needs exactly one source: content (base64), path, driveFileId, or messageId+attachmentId');
+}
+
+function decodeInlineBytes(spec: SendAttachment): ComposeAttachment {
+  const filename = path.basename(spec.filename || spec.path || '') || 'attachment';
+  const trimmed = (spec.content ?? '').trim();
+  const dataUrl = trimmed.match(/^data:[^,]*,([\s\S]*)$/i);
+  const b64 = (dataUrl ? dataUrl[1] : trimmed).replace(/\s+/g, '');
+  if (b64 === '') {
+    throw new GmailComposeError('E_ATTACHMENT_EMPTY', `attachment "${filename}" has no bytes. Nothing was sent to Gmail.`);
+  }
+  const content = Buffer.from(b64, 'base64');
+  if (content.length === 0) {
+    throw new GmailComposeError('E_ATTACHMENT_EMPTY', `attachment "${filename}" decoded to zero bytes. Nothing was sent to Gmail.`);
+  }
+  return {
+    filename,
+    content,
+    contentType: spec.contentType || lookupMime(filename) || 'application/octet-stream',
+  };
 }
 
 /** Path attachments keep the desk guards in readAttachments. Drive and Gmail
@@ -434,21 +473,18 @@ async function collectAttachments(
   raw: SendAttachment[] | undefined,
   bodyBytes: number,
 ): Promise<ComposeAttachment[] | undefined> {
-  if (!raw?.length) return undefined;
-  for (const a of raw) {
-    if (a.path && isHostedHttp()) {
-      throw new GmailComposeError('validation_error', localPathUnavailableMessage(a.path));
-    }
+  if (raw == null) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new GmailComposeError('E_ATTACHMENT_MISSING', 'attachments must be an array of files. Nothing was sent to Gmail.');
   }
-  const pathItems = raw.filter((a): a is SendAttachment & { path: string } => Boolean(a.path));
-  const remoteItems = raw.filter((a) => !a.path);
-  const files = await readAttachments(pathItems, bodyBytes);
-  let total = bodyBytes + (files ?? []).reduce((n, f) => n + f.content.length, 0);
-  const extra: ComposeAttachment[] = [];
-  if (remoteItems.length > 0) {
-    const drive = driveClient({ version: 'v3', auth });
-    for (const spec of remoteItems) {
-      const part = await resolveRemoteAttachment(gmail, drive, spec);
+  if (raw.length === 0) return undefined;
+  const out: ComposeAttachment[] = [];
+  let total = bodyBytes;
+  let drive: ReturnType<typeof driveClient> | undefined;
+  for (const spec of raw) {
+    // Inline bytes win. The schema used to keep only `path` and drop `content`, so a draft could succeed with no file.
+    if (spec.content !== undefined) {
+      const part = decodeInlineBytes(spec);
       total += part.content.length;
       if (estimateEncoded(total) > GMAIL_MAX_MESSAGE_BYTES) {
         throw new GmailComposeError(
@@ -456,11 +492,58 @@ async function collectAttachments(
           `attachments + body exceed Gmail's ~${Math.round(GMAIL_MAX_MESSAGE_BYTES / 1024 / 1024)}MB message limit once encoded`,
         );
       }
-      extra.push(part);
+      out.push(part);
+      continue;
     }
+    if (spec.path) {
+      if (isHostedHttp()) {
+        throw new GmailComposeError('validation_error', localPathUnavailableMessage(spec.path));
+      }
+      const parts = await readAttachments(
+        [{ path: spec.path, filename: spec.filename, contentType: spec.contentType }],
+        total,
+      );
+      const part = parts![0];
+      total += part.content.length;
+      out.push(part);
+      continue;
+    }
+    drive ??= driveClient({ version: 'v3', auth });
+    const part = await resolveRemoteAttachment(gmail, drive, spec);
+    total += part.content.length;
+    if (estimateEncoded(total) > GMAIL_MAX_MESSAGE_BYTES) {
+      throw new GmailComposeError(
+        'E_ATTACHMENT_TOO_LARGE',
+        `attachments + body exceed Gmail's ~${Math.round(GMAIL_MAX_MESSAGE_BYTES / 1024 / 1024)}MB message limit once encoded`,
+      );
+    }
+    out.push(part);
   }
-  const all = [...(files ?? []), ...extra];
-  return all.length > 0 ? all : undefined;
+  return out;
+}
+
+/** Gmail returns a message/draft id for a raw upload that has no attachment
+ * body. Refuse that result when the caller asked for files. */
+function assertRequestedBytes(
+  requested: SendAttachment[] | undefined,
+  files: ComposeAttachment[] | undefined,
+  encoded: string,
+): void {
+  const wanted = Array.isArray(requested) ? requested.length : 0;
+  if (wanted > 0 && (!files || files.length !== wanted)) {
+    throw new GmailComposeError(
+      'E_ATTACHMENT_MISSING',
+      `Requested ${wanted} attachment(s) but the Gmail request would include ${files?.length ?? 0}. Nothing was sent.`,
+    );
+  }
+  if (!files?.length) return;
+  const missing = mimeOmitsAttachmentBytes(encoded, files);
+  if (missing.length > 0) {
+    throw new GmailComposeError(
+      'E_ATTACHMENT_MISSING',
+      `Attachment bytes are not in the Gmail request (${missing.join(', ')}). Nothing was sent.`,
+    );
+  }
 }
 
 /** Maps compose-time (non-Google) failures to an isError envelope;
@@ -882,10 +965,11 @@ export function registerGmailTools(server: ToolRegistry, deps: CuratedToolDeps =
         );
         if (outbound) return outbound;
         const html = renderMarkdown(body, allowRawHtml === true);
+        const requested = attachments as SendAttachment[] | undefined;
         const files = await collectAttachments(
           gmail,
           auth,
-          attachments as SendAttachment[] | undefined,
+          requested,
           Buffer.byteLength(body ?? '') + Buffer.byteLength(html),
         );
         const encoded = await composeRaw({
@@ -899,6 +983,7 @@ export function registerGmailTools(server: ToolRegistry, deps: CuratedToolDeps =
           references: reply?.references,
           attachments: files,
         });
+        assertRequestedBytes(requested, files, encoded);
 
         const sendParams: any = {
           userId: 'me',
@@ -1041,10 +1126,11 @@ export function registerGmailTools(server: ToolRegistry, deps: CuratedToolDeps =
         );
         if (outbound) return outbound;
         const html = renderMarkdown(body, allowRawHtml === true);
+        const requested = attachments as SendAttachment[] | undefined;
         const files = await collectAttachments(
           gmail,
           auth,
-          attachments as SendAttachment[] | undefined,
+          requested,
           Buffer.byteLength(body ?? '') + Buffer.byteLength(html),
         );
         const encoded = await composeRaw({
@@ -1058,6 +1144,7 @@ export function registerGmailTools(server: ToolRegistry, deps: CuratedToolDeps =
           references: reply?.references,
           attachments: files,
         });
+        assertRequestedBytes(requested, files, encoded);
 
         const draftParams: any = {
           userId: 'me',
