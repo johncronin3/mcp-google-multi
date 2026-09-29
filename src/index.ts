@@ -10,7 +10,7 @@ import path from 'node:path';
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { McpServer } from "@modelcontextprotocol/server";
 import type { Transport } from "@modelcontextprotocol/server";
-import { resolveDiscoveryMode } from './registry.js';
+import { connectTimeDiscoveryMode, resolveDiscoveryMode } from './registry.js';
 import { isAllowed, describePolicy } from './write-control.js';
 import { buildIdentityContext } from './identity.js';
 import { buildRegistry, requestHooksFor } from './compose.js';
@@ -371,14 +371,18 @@ async function main() {
 }
 
 
-/** MCP server with the same tools as stdio. Does not bind a transport.
- * House Streamable HTTP (src/http.ts) builds one per request. */
+/** House Streamable HTTP server (src/http.ts), one per request. Does not bind
+ * a transport. Curated tools are on the first tools/list — docs/features.md. */
 export function buildGoogleMcpServer(): McpServer {
   const server = new McpServer({
     name: 'mcp-google-multi',
     version: pkg.version,
   });
-  const registry = buildRegistry(server, buildIdentityContext(process.env, { transport: 'http' }));
+  const registry = buildRegistry(
+    server,
+    buildIdentityContext(process.env, { transport: 'http' }),
+    connectTimeDiscoveryMode(),
+  );
   const bootRevealed = registry.revealAtBootFromEnv();
   if (bootRevealed.length > 0) {
     process.stderr.write(`GOOGLE_REVEAL_AT_BOOT: listing ${bootRevealed.join(', ')}\n`);

@@ -176,4 +176,33 @@ describe('google-multi HTTP MCP', () => {
     expect(listed.text).toContain('set_grant');
     expect(listed.text).toMatch(/account_list|list_accounts/);
   });
+
+  it('tools/list advertises curated tools before any discover', async () => {
+    const init = await postMcp({});
+    expect(init.status).toBe(200);
+    const listed = await postMcp({ body: TOOLS_LIST });
+    expect(listed.status).toBe(200);
+    const names = toolNames(listed.text);
+    expect(names).toEqual(expect.arrayContaining(['gmail_send', 'drive_upload', 'gmail_discover', 'drive_discover']));
+    // Generated long tail stays discover-gated. Listing is not a grant.
+    expect(names).not.toContain('gmail_users_labels_get');
+  });
 });
+
+function toolNames(text: string): string[] {
+  const payloads = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim());
+  const candidates = payloads.length > 0 ? payloads : [text];
+  for (const raw of candidates) {
+    try {
+      const msg = JSON.parse(raw) as { result?: { tools?: { name: string }[] } };
+      if (Array.isArray(msg.result?.tools)) return msg.result.tools.map((t) => t.name);
+    } catch {
+      // try the next SSE data line
+    }
+  }
+  throw new Error(`tools/list response had no tool array: ${text.slice(0, 400)}`);
+}

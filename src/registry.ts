@@ -35,6 +35,18 @@ export function resolveDiscoveryMode(env: NodeJS.ProcessEnv = process.env): Disc
   return DISCOVERY_MODES.includes(raw) ? raw : 'lazy';
 }
 
+/**
+ * Discovery mode for house Streamable HTTP (`buildGoogleMcpServer`).
+ * That transport is stateless, so `tools/list_changed` never reaches the
+ * client, and hosts such as Grok freeze the connect-time list. Advertise the
+ * curated surface on the first `tools/list`. An explicit `eager` still lists
+ * the generated long tail. Stdio keeps `resolveDiscoveryMode` (lazy default).
+ * See docs/features.md and docs/internals.md.
+ */
+export function connectTimeDiscoveryMode(env: NodeJS.ProcessEnv = process.env): DiscoveryMode {
+  return resolveDiscoveryMode(env) === 'eager' ? 'eager' : 'curated';
+}
+
 export interface ToolEntry {
   name: string;
   service: string;
