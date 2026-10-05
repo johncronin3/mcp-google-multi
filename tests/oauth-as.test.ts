@@ -647,6 +647,36 @@ describe('owner_gate Google leg is bound to the browser that started it (H4 F1)'
     expect(second.calls).toEqual({ exchange: 0, resolve: 0 });
   });
 
+  // Two buildAuthServer calls stand in for two processes: each mints its own
+  // flow key, so a state from the first cannot finish on the second, while a
+  // sign-in started on the second still completes. Access tokens stay on MCP_JWT_KEY.
+  it('a rebuilt AuthServer completes a fresh sign-in after dropping the previous process artifacts', async () => {
+    const port1 = await start();
+    const staleJar: Jar = new Map();
+    const stale = stateFrom((await req(port1, 'GET', `/authorize?${authorizeQuery()}`, { jar: staleJar })).headers.location as string);
+    const port2 = await start();
+    const dropped = await req(port2, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(stale)}`, { jar: staleJar });
+    expect(dropped.status).toBe(400);
+    expect(dropped.text).toContain('E_STATE_INVALID');
+    expect(dropped.headers.location).toBeUndefined();
+    const fresh: Jar = new Map();
+    const authz = await req(port2, 'GET', `/authorize?${authorizeQuery()}`, { jar: fresh });
+    expect(authz.status).toBe(302);
+    const cb = await req(port2, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(stateFrom(authz.headers.location as string))}`, { jar: fresh });
+    expect(cb.status).toBe(302);
+    const code = new URL(cb.headers.location as string).searchParams.get('code')!;
+    const tok = JSON.parse((await req(port2, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }))).text);
+    expect(tok.access_token).toBeTruthy();
+    expect(tok.refresh_token).toMatch(/^r1\./);
+    const port3 = await start();
+    const init = await req(port3, 'POST', '/mcp', {
+      headers: { authorization: `Bearer ${tok.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'c', version: '0' } } }),
+    });
+    expect(init.status).toBe(200);
+    expect(JSON.parse(init.text).result.serverInfo.name).toBe('as-test');
+  });
+
   it("sign-in artifacts expire by the AuthServer's clock, the one the replay guard uses", async () => {
     let clock = Date.now() + 700_000;
     const { calls, deps } = spied({ now: () => clock });
