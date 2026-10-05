@@ -8,9 +8,18 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { resolveHttpConfig } from '../src/http-config.js';
 import { HttpTransportHost } from '../src/http-transport.js';
 import { buildAuthServer, redirectAllowed, verifiedEmailFromIdToken, verifiedIdentityFromIdToken, DCR_MAX_CLIENTS, DCR_MAX_REDIRECT_URIS, type AuthServer, type AuthServerDeps } from '../src/oauth-as.js';
-import { jwtSecretFrom, signAccessToken, signPending, signReauthLink, verifyAccessToken } from '../src/mcp-token.js';
+import { jwtSecretFrom, signAccessToken, signPending, signReauthLink, verifyAccessToken, refreshFamilyTagger, RefreshStore, ReplayGuard } from '../src/mcp-token.js';
 import { SsrfBlockedError } from '../src/ssrf-guard.js';
+import { CIMD_MAX_IN_FLIGHT } from '../src/cimd-cache.js';
 import { z } from "zod";
+
+/** Change one character in the middle of a JWT's signature. Changing the last
+ * ones can leave it intact: base64url decoding ignores the final character's
+ * low bits, so about one run in a thousand would not tamper at all. */
+const tamperSig = (jwt: string): string => {
+  const i = jwt.lastIndexOf('.') + 10;
+  return jwt.slice(0, i) + (jwt[i] === 'A' ? 'B' : 'A') + jwt.slice(i + 1);
+};
 
 const BASE = 'https://mcp.test';
 const CLIENT_ID = 'https://claude.ai/oauth/mcp-client';
@@ -45,7 +54,7 @@ const reauthPath = (alias: string) => {
   return `${u.pathname}${u.search}`;
 };
 
-async function start(depOverrides: Partial<AuthServerDeps> = {}, base = BASE): Promise<number> {
+async function start(depOverrides: Partial<AuthServerDeps> = {}, base = BASE, configOver: Record<string, unknown> = {}): Promise<number> {
   const cfg = { ...resolveHttpConfig({ MCP_TRANSPORT: 'http', MCP_PUBLIC_URL: base }), port: 0 };
   const deps: AuthServerDeps = {
     fetchCimd: async (cid) => {
@@ -65,7 +74,7 @@ async function start(depOverrides: Partial<AuthServerDeps> = {}, base = BASE): P
     ...depOverrides,
   };
   const as = buildAuthServer(
-    { base, resourceUri: `${base}/mcp`, secret, ownerEmails: ['owner@x.example'], cimdIssuers: ['claude.ai'], masterKey: 'mk', refreshStorePath: path.join(tmp, 'mcp-tokens.enc') },
+    { base, resourceUri: `${base}/mcp`, secret, ownerEmails: ['owner@x.example'], cimdIssuers: ['claude.ai'], masterKey: 'mk', refreshStorePath: path.join(tmp, 'mcp-tokens.enc'), ...configOver },
     deps,
   );
   currentAs = as;
@@ -274,7 +283,7 @@ describe('negative paths (one per §5.12 MUST)', () => {
     const port = await start();
     const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
     const state = stateFrom(authz.headers.location as string);
-    const r = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state.slice(0, -2) + 'xx')}`);
+    const r = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(tamperSig(state))}`);
     expect(r.status).toBe(400);
     expect(r.text).toContain('E_STATE_INVALID');
   });
@@ -439,7 +448,7 @@ describe('negative paths (one per §5.12 MUST)', () => {
 
   // alpha.57 signed a DCR pending with flow=alias_reauth; one still inside its
   // TTL at upgrade must not start the old unauthenticated re-auth.
-  it('POST /authorize refuses a pending that is not an owner sign-in', async () => {
+  it('POST /authorize refuses a pending signed with MCP_JWT_KEY, as an earlier release signed its alias_reauth ones', async () => {
     const asked: string[] = [];
     const port = await start({
       buildGoogleAuthUrl: ({ flow, state }) => {
@@ -581,6 +590,118 @@ describe('owner_gate Google leg is bound to the browser that started it (H4 F1)'
     expect(calls).toEqual({ exchange: 0, resolve: 0 });
   });
 
+  /** Mint states with fresh browsers until /authorize answers 503 (the guard is full). */
+  async function floodToFull(port: number): Promise<Res> {
+    for (let i = 0; i < 20; i++) {
+      const r = await req(port, 'GET', `/authorize?${authorizeQuery()}`, { jar: new Map() });
+      if (r.status !== 302) return r;
+    }
+    throw new Error('the replay guard never filled');
+  }
+
+  it('a flood after the refusal cannot make the refused callback usable again', async () => {
+    const { calls, logs, deps } = spied({ replayGuard: new ReplayGuard(4) });
+    const port = await start(deps);
+    const attacker: Jar = new Map();
+    const { state } = await dcrGoogleState(port, attacker);
+    expect((await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: new Map() })).status).toBe(400);
+    const busy = await floodToFull(port);
+    expect(busy.status).toBe(503);
+    expect(busy.text).toContain('E_SIGNIN_BUSY');
+    expect(busy.headers['retry-after']).toBe('60');
+    expect(busy.headers['set-cookie']).toBeUndefined();
+    const replay = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: attacker });
+    expect(replay.status).toBe(400);
+    expect(replay.headers.location).toBeUndefined();
+    expect(calls).toEqual({ exchange: 0, resolve: 0 });
+    expect(logs.filter((l) => l.startsWith('replay guard full'))).toEqual(['replay guard full: sign-in refused']);
+  });
+
+  it('a flood before the callback cannot leave it unspent: its slot was reserved when the state was minted', async () => {
+    const { calls, deps } = spied({ replayGuard: new ReplayGuard(4) });
+    const port = await start(deps);
+    const attacker: Jar = new Map();
+    const { state } = await dcrGoogleState(port, attacker);
+    expect((await floodToFull(port)).status).toBe(503);
+    const victim = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: new Map() });
+    expect(victim.status).toBe(400);
+    expect(victim.text).toContain('E_BROWSER_MISMATCH');
+    const replay = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: attacker });
+    expect(replay.status).toBe(400);
+    expect(replay.headers.location).toBeUndefined();
+    expect(calls).toEqual({ exchange: 0, resolve: 0 });
+  });
+
+  it('a restart invalidates every sign-in in flight, so a callback refused before it cannot be finished after it', async () => {
+    const first = spied();
+    const port1 = await start(first.deps);
+    const attacker: Jar = new Map();
+    const { state } = await dcrGoogleState(port1, attacker);
+    expect((await req(port1, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: new Map() })).status).toBe(400);
+    const second = spied();
+    const port2 = await start(second.deps);
+    const replay = await req(port2, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: attacker });
+    expect(replay.status).toBe(400);
+    expect(replay.text).toContain('E_STATE_INVALID');
+    expect(replay.headers.location).toBeUndefined();
+    expect(second.calls).toEqual({ exchange: 0, resolve: 0 });
+  });
+
+  it("sign-in artifacts expire by the AuthServer's clock, the one the replay guard uses", async () => {
+    let clock = Date.now() + 700_000;
+    const { calls, deps } = spied({ now: () => clock });
+    const port = await start(deps);
+    const attacker: Jar = new Map();
+    const { state } = await dcrGoogleState(port, attacker);
+    expect((await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: new Map() })).status).toBe(400);
+    clock += 601_000;
+    const replay = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`, { jar: attacker });
+    expect(replay.status).toBe(400);
+    expect(replay.headers.location).toBeUndefined();
+    expect(calls).toEqual({ exchange: 0, resolve: 0 });
+  });
+
+  it('an approval refused for a full guard works on retry once a slot frees', async () => {
+    let clock = Date.now();
+    const port = await start({ replayGuard: new ReplayGuard(4), now: () => clock });
+    // two 600 s state slots and one 60 s code slot; the approval's spend takes the last
+    await req(port, 'GET', `/authorize?${authorizeQuery()}`, { jar: new Map() });
+    const jar: Jar = new Map();
+    const owner = await req(port, 'GET', `/authorize?${authorizeQuery()}`, { jar });
+    const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(stateFrom(owner.headers.location as string))}`, { jar });
+    const code = new URL(cb.headers.location as string).searchParams.get('code')!;
+    expect((await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }))).status).toBe(200);
+    const dcr: Jar = new Map();
+    const reg = JSON.parse((await req(port, 'POST', '/register', { jar: dcr, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: [ATTACKER_CB] }) })).text);
+    const page = await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: reg.client_id, redirect_uri: ATTACKER_CB })}`, { jar: dcr });
+    const pending = page.text.match(/name="pending" value="([^"]+)"/)![1];
+    expect((await req(port, 'POST', '/authorize', { jar: dcr, ...form({ pending }) })).status).toBe(503);
+    clock += 61_000;
+    expect((await req(port, 'POST', '/authorize', { jar: dcr, ...form({ pending }) })).status).toBe(302);
+    expect((await req(port, 'POST', '/authorize', { jar: dcr, ...form({ pending }) })).status).toBe(400);
+  });
+
+  it('after the clock steps back, the next full-guard line is written at once', async () => {
+    let clock = Date.now();
+    const { logs, deps } = spied({ replayGuard: new ReplayGuard(1), now: () => clock });
+    const port = await start(deps);
+    expect((await floodToFull(port)).status).toBe(503);
+    clock -= 3_600_000;
+    expect((await req(port, 'GET', `/authorize?${authorizeQuery()}`, { jar: new Map() })).status).toBe(503);
+    expect(logs.filter((l) => l.startsWith('replay guard full'))).toEqual(['replay guard full: sign-in refused', 'replay guard full: sign-in refused']);
+  });
+
+  it('a full replay guard answers 503 at /token, not invalid_grant', async () => {
+    const port = await start({ replayGuard: new ReplayGuard(1) });
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(stateFrom(authz.headers.location as string))}`);
+    const code = new URL(cb.headers.location as string).searchParams.get('code')!;
+    const tok = await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }));
+    expect(tok.status).toBe(503);
+    expect(JSON.parse(tok.text).error).toBe('temporarily_unavailable');
+    expect(tok.headers['retry-after']).toBe('5');
+  });
+
   it('the same browser completes the DCR flow and the binding cookie is cleared', async () => {
     const { calls, deps } = spied();
     const port = await start(deps);
@@ -714,12 +835,225 @@ describe('a failed Google code exchange answers a generic page (H4 F12)', () => 
     expect(written.work).toBeUndefined();
   });
 
+  it('a long exchange detail is cut on its log line, with its length', async () => {
+    const logs: string[] = [];
+    const port = await start({
+      exchangeCode: async () => {
+        throw new Error('y'.repeat(1000));
+      },
+      log: (l) => logs.push(l),
+    });
+    const state = stateFrom((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).headers.location as string);
+    expect((await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`)).status).toBe(400);
+    expect(logs.filter((l) => l.startsWith('callback exchange failed'))).toEqual([`callback exchange failed flow=owner_gate: ${'y'.repeat(300)}...(len=1000)`]);
+  });
+
   it('a non-Error rejection still answers the generic page', async () => {
     const port = await start({ exchangeCode: () => Promise.reject(undefined) });
     const state = stateFrom((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).headers.location as string);
     const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
     expect(cb.status).toBe(400);
     expect(cb.text).toBe('invalid_grant: Google could not complete the sign-in; start again from your app');
+  });
+});
+
+describe('a hostile value reaches the log as one escaped, bounded line (H4 F7)', () => {
+  const UNSAFE = /[\r\n\u2028\u2029\p{Cc}]/u;
+  const NEL = String.fromCharCode(0x85);
+  const ALIAS = 'side\ncallback ok flow=alias_add alias=forged';
+  const ALIAS_LOGGED = 'side\\u000acallback ok flow=alias_add alias=forged';
+  const linesFrom = (logs: string[], prefix: string) => {
+    const hits = logs.filter((l) => l.startsWith(prefix));
+    for (const l of hits) expect(l).not.toMatch(UNSAFE);
+    return hits;
+  };
+
+  it('CIMD rejected names the issuer and the client_id length, never the client_id path', async () => {
+    const logs: string[] = [];
+    let fetched = 0;
+    const port = await start({
+      log: (l) => logs.push(l),
+      fetchCimd: async () => {
+        fetched++;
+        throw new SsrfBlockedError('unused');
+      },
+    });
+    const forged = `https://evil.example/${'p'.repeat(300)}\naudit line lost (forged)`;
+    const longHost = `https://${'h'.repeat(200)}.example/x`;
+    for (const clientId of [forged, longHost]) {
+      expect((await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: clientId })}`)).status).toBe(400);
+    }
+    expect(linesFrom(logs, 'CIMD rejected')).toEqual([
+      `CIMD rejected: issuer=https://evil.example not allowlisted client_id_len=${forged.length}`,
+      `CIMD rejected: issuer=https://${'h'.repeat(72)}...(len=216) not allowlisted client_id_len=${longHost.length}`,
+    ]);
+    expect(logs.join('\n')).not.toContain('ppp');
+    expect(fetched).toBe(0);
+  });
+
+  it('CIMD fetch failed and the loopback-only warning escape and cap the client_id and the error', async () => {
+    const logs: string[] = [];
+    const port = await start({
+      log: (l) => logs.push(l),
+      fetchCimd: async (cid) => {
+        if (cid.includes('loop')) return { client_id: cid, redirect_uris: ['http://localhost/cb'] };
+        throw new Error('connect ECONNREFUSED\nCIMD rejected: forged');
+      },
+    });
+    const failing = 'https://claude.ai/x\nCIMD rejected: forged';
+    const loopback = `https://claude.ai/loop/${'q'.repeat(300)}${NEL}x`;
+    expect((await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: failing })}`)).status).toBe(400);
+    await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: loopback })}`);
+    expect(linesFrom(logs, 'CIMD fetch failed')).toEqual(['CIMD fetch failed for https://claude.ai/x\\u000aCIMD rejected: forged: connect ECONNREFUSED\\u000aCIMD rejected: forged']);
+    expect(linesFrom(logs, 'client ')).toEqual([`client ${loopback.slice(0, 128)}...(len=${loopback.length}) advertises only loopback redirect_uris`]);
+    expect(linesFrom(logs, 'CIMD rejected')).toEqual([]);
+  });
+
+  it('every alias_add line escapes the alias, the error and the refusal slug', async () => {
+    const logs: string[] = [];
+    let outcome: 'throw' | 'refuse' | 'ok' = 'throw';
+    const port = await start({
+      log: (l) => logs.push(l),
+      bindTenantAlias: () => {
+        if (outcome === 'throw') throw new Error('disk\nfull');
+        if (outcome === 'refuse') return { refused: { slug: `E_${'X'.repeat(100)}`, message: 'no' } };
+        return undefined;
+      },
+    });
+    for (const next of ['throw', 'refuse', 'ok'] as const) {
+      outcome = next;
+      const url = new URL(await currentAs!.mintFlowState({ flow: 'alias_add', alias: ALIAS, tenantId: 'tenant-a' }));
+      const state = stateFrom((await req(port, 'GET', `${url.pathname}${url.search}`)).headers.location as string);
+      await req(port, 'GET', `/callback?code=work-code&state=${encodeURIComponent(state)}`);
+    }
+    expect(linesFrom(logs, 'alias_add bind failed')).toEqual([`alias_add bind failed for "${ALIAS_LOGGED}": disk\\u000afull`]);
+    expect(linesFrom(logs, 'alias_add refused')).toEqual([`alias_add refused for "${ALIAS_LOGGED}": E_${'X'.repeat(62)}...(len=102)`]);
+    expect(linesFrom(logs, 'callback ok flow=alias_add')).toEqual([`callback ok flow=alias_add alias=${ALIAS_LOGGED}`]);
+  });
+
+  it('every alias_reauth line escapes the alias and the email Google returned', async () => {
+    const logs: string[] = [];
+    const port = await start({
+      log: (l) => logs.push(l),
+      aliasEmail: (a) => (a === ALIAS ? 'work@x.example' : undefined),
+      exchangeCode: async (code) =>
+        code === 'mismatch-code'
+          ? { tokens: { refresh_token: 'g-rt' }, email: 'stranger@x.example\n[as] forged' }
+          : code === 'short-code'
+            ? { tokens: { access_token: 'g-at' }, email: 'work@x.example' }
+            : { tokens: { refresh_token: 'g-rt', scope: code === 'narrow-code' ? 'narrow' : 'full' }, email: 'work@x.example' },
+      missingScopes: (_alias, granted) => (granted === 'narrow' ? ['drive'] : []),
+      hasToken: () => true,
+    });
+    for (const code of ['mismatch-code', 'short-code', 'narrow-code', 'ok-code']) {
+      const state = stateFrom((await req(port, 'GET', reauthPath(ALIAS))).headers.location as string);
+      await req(port, 'GET', `/callback?code=${code}&state=${encodeURIComponent(state)}`);
+    }
+    expect(linesFrom(logs, 'alias_reauth')).toEqual([
+      `alias_reauth identity mismatch for "${ALIAS_LOGGED}" (got stranger@x.example\\u000a[as] forged)`,
+      `alias_reauth for "${ALIAS_LOGGED}" returned no refresh token; stored token kept`,
+      `alias_reauth for "${ALIAS_LOGGED}" granted 1 fewer scope(s); stored token kept`,
+    ]);
+    expect(linesFrom(logs, 'callback ok flow=alias_reauth')).toEqual([`callback ok flow=alias_reauth alias=${ALIAS_LOGGED}`]);
+  });
+
+  it('a subject check that throws a multi-line message logs one line per grant', async () => {
+    const logs: string[] = [];
+    let broken = false;
+    const port = await start({
+      log: (l) => logs.push(l),
+      subjectActive: () => {
+        if (broken) throw new Error('registry\nlocked');
+        return true;
+      },
+    });
+    const codeFor = async () => {
+      const state = stateFrom((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).headers.location as string);
+      const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(state)}`);
+      return new URL(cb.headers.location as string).searchParams.get('code')!;
+    };
+    const redeem = async (code: string) =>
+      req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }));
+    const tok = JSON.parse((await redeem(await codeFor())).text);
+    const pendingCode = await codeFor();
+    broken = true;
+    expect((await redeem(pendingCode)).status).toBe(503);
+    expect((await req(port, 'POST', '/token', form({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }))).status).toBe(503);
+    expect(linesFrom(logs, 'token deferred')).toEqual([
+      'token deferred grant=authorization_code: subject check failed: registry\\u000alocked',
+      'token deferred grant=refresh_token: subject check failed: registry\\u000alocked',
+    ]);
+  });
+});
+
+describe('CIMD fetches at /authorize are capped, and cached only once valid (H4 F6)', () => {
+  /** A fetchCimd whose `/held-` documents wait for release(); every call is recorded. */
+  function heldCimd() {
+    const gates: (() => void)[] = [];
+    const calls: string[] = [];
+    const fetchCimd = async (cid: string): Promise<Record<string, unknown>> => {
+      calls.push(cid);
+      if (cid.includes('/held-')) await new Promise<void>((r) => gates.push(r));
+      if (cid.includes('/mismatch')) return { client_id: 'https://claude.ai/someone-else', redirect_uris: [REDIRECT] };
+      return { client_id: cid, redirect_uris: [REDIRECT] };
+    };
+    return { gates, calls, fetchCimd, release: () => gates.splice(0).forEach((g) => g()) };
+  }
+  async function fillCap(port: number, h: ReturnType<typeof heldCimd>): Promise<Promise<Res>[]> {
+    const parked = Array.from({ length: CIMD_MAX_IN_FLIGHT }, (_, i) => req(port, 'GET', `/authorize?${authorizeQuery({ client_id: `https://claude.ai/held-${i}` })}`));
+    for (let waited = 0; h.gates.length < CIMD_MAX_IN_FLIGHT; waited += 5) {
+      if (waited > 2000) throw new Error('the parked fetches never started');
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return parked;
+  }
+
+  it('over the cap /authorize answers 503 with Retry-After, a body that names nothing, and no fetch', async () => {
+    const h = heldCimd();
+    const logs: string[] = [];
+    const port = await start({ fetchCimd: h.fetchCimd, log: (l) => logs.push(l) });
+    const parked = await fillCap(port, h);
+    const r = await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: 'https://claude.ai/random-path-1' })}`);
+    expect(r.status).toBe(503);
+    expect(r.headers['retry-after']).toBe('5');
+    expect(JSON.parse(r.text)).toEqual({ error: 'temporarily_unavailable', message: 'the client could not be checked right now; retry shortly' });
+    expect(h.calls).toHaveLength(CIMD_MAX_IN_FLIGHT);
+    expect(logs.filter((l) => l.startsWith('CIMD busy'))).toEqual(['CIMD busy: in-flight cap reached']);
+    h.release();
+    for (const p of await Promise.all(parked)) expect(p.status).toBe(302);
+  });
+
+  it('a client validated before still signs in while the cap is full, within the TTL and past it', async () => {
+    const h = heldCimd();
+    let off = 0;
+    const port = await start({ fetchCimd: h.fetchCimd, now: () => Date.now() + off });
+    expect((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).status).toBe(302);
+    const parked = await fillCap(port, h);
+    expect((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).status).toBe(302);
+    off = 6 * 60_000;
+    expect((await req(port, 'GET', `/authorize?${authorizeQuery()}`)).status).toBe(302);
+    expect(h.calls.filter((c) => c === CLIENT_ID)).toHaveLength(1);
+    h.release();
+    await Promise.all(parked);
+  });
+
+  it('a document whose client_id does not match is refused and fetched again next time', async () => {
+    const h = heldCimd();
+    const port = await start({ fetchCimd: h.fetchCimd });
+    const id = 'https://claude.ai/mismatch';
+    for (let i = 0; i < 2; i++) {
+      const r = await req(port, 'GET', `/authorize?${authorizeQuery({ client_id: id })}`);
+      expect(r.status).toBe(400);
+      expect(JSON.parse(r.text).error).toBe('invalid_client');
+    }
+    expect(h.calls).toEqual([id, id]);
+  });
+
+  it('the loopback-only warning is logged once per fetch, not on every cached sign-in', async () => {
+    const logs: string[] = [];
+    const port = await start({ log: (l) => logs.push(l), fetchCimd: async (cid) => ({ client_id: cid, redirect_uris: ['http://localhost/cb'] }) });
+    for (let i = 0; i < 3; i++) await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    expect(logs.filter((l) => l.includes('advertises only loopback'))).toEqual([`client ${CLIENT_ID} advertises only loopback redirect_uris`]);
   });
 });
 
@@ -738,6 +1072,30 @@ describe('DCR /register bounds (unbounded-store DoS guard)', () => {
     expect(r.status).toBe(400);
   });
 
+  it('a body that is not an object, or a redirect_uri that is not a string, answers 400 and logs no 500', async () => {
+    const logs: string[] = [];
+    const registeredClients = new Map<string, { redirect_uris: string[] }>();
+    const port = await start({ log: (l) => logs.push(l), registeredClients });
+    const bodies = [
+      'null',
+      '[]',
+      '[{"redirect_uris":["https://c.example/cb"]}]',
+      '5',
+      '"https://c.example/cb"',
+      '{"redirect_uris":[{"toString":1}]}',
+      '{"redirect_uris":[5]}',
+      '{"redirect_uris":["https://c.example/cb",null]}',
+      '{"redirect_uris":"https://c.example/cb"}',
+    ];
+    for (const body of bodies) {
+      const r = await req(port, 'POST', '/register', { headers: { 'content-type': 'application/json' }, body });
+      expect(r.status, body).toBe(400);
+      expect(JSON.parse(r.text).error).toBe('invalid_client_metadata');
+    }
+    expect(logs.filter((l) => l.startsWith('500'))).toEqual([]);
+    expect(registeredClients.size).toBe(0);
+  });
+
   it('FIFO-evicts the oldest registration once at capacity (store stays bounded)', async () => {
     const registeredClients = new Map<string, { redirect_uris: string[] }>();
     for (let i = 0; i < DCR_MAX_CLIENTS; i++) registeredClients.set(`seed-${i}`, { redirect_uris: ['https://s.example/cb'] });
@@ -752,6 +1110,89 @@ describe('DCR /register bounds (unbounded-store DoS guard)', () => {
 });
 
 type AuthServerDepsMint = ReturnType<typeof buildAuthServer>['mintFlowState'];
+
+describe('refresh lifetimes on AuthServerConfig (ruling 10)', () => {
+  // deps.now also dates the state and the code, which jose checks against the
+  // real clock, so the code is redeemed at off = 0 and only refreshes move on.
+  let off = 0;
+  beforeEach(() => {
+    off = 0;
+  });
+  const startWith = (configOver: Record<string, unknown>, depOverrides: Partial<AuthServerDeps> = {}) =>
+    start({ now: () => Date.now() + off, ...depOverrides }, BASE, configOver);
+  async function signIn(port: number): Promise<string> {
+    const authz = await req(port, 'GET', `/authorize?${authorizeQuery()}`);
+    const cb = await req(port, 'GET', `/callback?code=owner-code&state=${encodeURIComponent(stateFrom(authz.headers.location as string))}`);
+    const code = new URL(cb.headers.location as string).searchParams.get('code')!;
+    const tok = await req(port, 'POST', '/token', form({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, code_verifier: verifier, resource: `${BASE}/mcp` }));
+    expect(tok.status).toBe(200);
+    return JSON.parse(tok.text).refresh_token;
+  }
+  const refreshAt = async (port: number, atMs: number, refresh_token: string) => {
+    off = atMs;
+    const r = await req(port, 'POST', '/token', form({ grant_type: 'refresh_token', refresh_token }));
+    return { status: r.status, body: JSON.parse(r.text) as Record<string, string> };
+  };
+  const expectInvalidGrant = (r: { status: number; body: Record<string, string> }) => {
+    expect(r.status).toBe(400);
+    expect(r.body.error).toBe('invalid_grant');
+    expect(r.body.access_token).toBeUndefined();
+  };
+
+  it('O1 refreshIdleSec ends a session that long after its last refresh', async () => {
+    const port = await startWith({ refreshIdleSec: 60 });
+    const first = await signIn(port);
+    const r1 = await refreshAt(port, 59_000, first);
+    expect(r1.status).toBe(200);
+    expectInvalidGrant(await refreshAt(port, 119_000, r1.body.refresh_token));
+  });
+
+  it('O2 refreshMaxAgeSec ends a session that long after its sign-in, however often it refreshes', async () => {
+    const port = await startWith({ refreshMaxAgeSec: 120 });
+    let t = await signIn(port);
+    for (const at of [60_000, 119_000]) {
+      const r = await refreshAt(port, at, t);
+      expect(r.status).toBe(200);
+      t = r.body.refresh_token;
+    }
+    expectInvalidGrant(await refreshAt(port, 121_000, t));
+  });
+
+  it('O3 a lifetime together with an injected refreshStore throws; an injected store alone works', () => {
+    const cfg = { base: BASE, resourceUri: `${BASE}/mcp`, secret, ownerEmails: ['owner@x.example'], cimdIssuers: ['claude.ai'], masterKey: 'mk', refreshStorePath: path.join(tmp, 'mcp-tokens.enc') };
+    const refreshStore = new RefreshStore(path.join(tmp, 'injected.enc'), 'mk');
+    for (const over of [{ refreshMaxAgeSec: 60 }, { refreshIdleSec: 60 }]) {
+      expect(() => buildAuthServer({ ...cfg, ...over }, { refreshStore })).toThrow(/^E_REFRESH_OPTION_CONFLICT: /);
+    }
+    expect(() => buildAuthServer(cfg, { refreshStore })).not.toThrow();
+    expect(() => buildAuthServer({ ...cfg, refreshIdleSec: 60 })).not.toThrow();
+  });
+
+  it('O5 revoked and expired families reach the log with a tag, never the token, subject or email', async () => {
+    const logs: string[] = [];
+    const port = await startWith({ refreshIdleSec: 60 }, { log: (l) => logs.push(l) });
+    const stolen = await signIn(port);
+    const rotated = await refreshAt(port, 1_000, stolen);
+    expect(rotated.status).toBe(200);
+    expectInvalidGrant(await refreshAt(port, 2_000, stolen));
+    off = 0;
+    const idle = await signIn(port);
+    expectInvalidGrant(await refreshAt(port, 61_000, idle));
+
+    const tag = refreshFamilyTagger('mk');
+    const lines = logs.filter((l) => l.startsWith('refresh '));
+    expect(lines).toEqual([
+      `refresh family revoked: reuse tag=${tag(stolen)}`,
+      'refresh families expired n=1',
+      'refresh store: every session expired at once (check the host clock)',
+    ]);
+    expect(tag(stolen)).toMatch(/^[0-9a-f]{8}$/);
+    for (const t of [stolen, rotated.body.refresh_token, idle]) {
+      expect(logs.join('\n')).not.toContain(t.slice(3));
+    }
+    expect(lines.join('\n')).not.toMatch(/owner|@x\.example/);
+  });
+});
 
 describe('alias_add flow + resolveSubject seam (S1.14)', () => {
   const binds: Record<string, unknown>[] = [];
@@ -927,7 +1368,8 @@ describe('alias_add flow + resolveSubject seam (S1.14)', () => {
       const ref = await refreshWith(port, tok.refresh_token);
       expect(ref.status).toBe(200);
       expect((await verifyAccessToken(JSON.parse(ref.text).access_token, BASE, secret)).sub).toBe('tenant-9');
-      // the code's jti was spent before the check; the client signs in again
+      // the code was given back, so the retry the 503 asked for redeems it, once
+      expect((await redeem(port, pendingCode)).status).toBe(200);
       expect(JSON.parse((await redeem(port, pendingCode)).text).message).toBe('authorization code already redeemed');
     });
   });
