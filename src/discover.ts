@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ToolRegistry } from './registry.js';
 import { describePolicy, type Policy } from './write-control.js';
+import { hints } from './hint-provider.js';
 
 // The description budget is the whole point of lazy mode: a full op list per
 // service put lazy tools/list at ~11.5k tokens (RQ2), so descriptions carry a
@@ -120,6 +121,7 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
       async ({ query }) => {
         const operations = registry.catalog(service, query as string | undefined);
         registry.reveal(service);
+        const rendered = hints()?.render({ kind: 'policy_summary', policy });
         return {
           content: [
             {
@@ -127,7 +129,7 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
               text: JSON.stringify({
                 service,
                 operations,
-                writeControl: describePolicy(policy),
+                writeControl: rendered?.hint ?? describePolicy(policy),
                 next:
                   operations.length > 0
                     ? 'Call the chosen tool by name; it is now listed and callable.'

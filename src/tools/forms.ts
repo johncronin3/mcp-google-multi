@@ -221,6 +221,9 @@ export function registerFormsTools(server: ToolRegistry, deps: CuratedToolDeps =
   );
 }
 
-function handleFormsError(error: any, account: Account) {
-  return handleGoogleApiError(error, account, "Forms tools require the optional \"forms\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=forms (or include \"forms\" in the list) and re-auth.");
+export function handleFormsError(error: any, account: Account) {
+  return handleGoogleApiError(error, account, {
+    scope: "Forms tools require the optional \"forms\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=forms (or include \"forms\" in the list) and re-auth.",
+    bundle: 'forms',
+  });
 }

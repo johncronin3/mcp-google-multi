@@ -309,4 +309,22 @@ describe('token-store crypto', () => {
     expect(snapshotEncFile('test')?.equals(prior!)).toBe(true);
     expect(readToken('test')).toEqual(sample);
   });
+
+  it('updateToken never recreates a token file that was never written, or one removed out from under it (R3)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-store-'));
+    cleanupDirs.push(dir);
+    ACCOUNT_CONFIG.test.encPath = path.join(dir, 'test.enc');
+    process.env.MASTER_KEY = KEY;
+
+    // First write: no token stored yet, a refresh-style update must not create one.
+    expect(() => updateToken('test', { access_token: 'new' })).not.toThrow();
+    expect(fs.existsSync(ACCOUNT_CONFIG.test.encPath)).toBe(false);
+
+    // A stored token removed (e.g. a revoked linked account) while a refresh
+    // is in flight must stay removed, not get resurrected by the merge.
+    writeToken('test', sample);
+    fs.rmSync(ACCOUNT_CONFIG.test.encPath);
+    expect(() => updateToken('test', { access_token: 'new2' })).not.toThrow();
+    expect(fs.existsSync(ACCOUNT_CONFIG.test.encPath)).toBe(false);
+  });
 });

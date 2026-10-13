@@ -4,6 +4,8 @@
 // into the AS's clientless alias_reauth flow (AuthServer.reauthLink). The HTTP
 // bootstrap installs the linker when the AS starts; stdio never does.
 
+import { hints } from './hint-provider.js';
+
 let httpReauthLink: ((alias: string) => string) | null = null;
 
 export function setHttpReauthLink(linker: ((alias: string) => string) | null): void {
@@ -11,6 +13,8 @@ export function setHttpReauthLink(linker: ((alias: string) => string) | null): v
 }
 
 export function reauthHint(account: string): string {
+  const rendered = hints()?.render({ kind: 'reauth', account });
+  if (rendered) return rendered.hint;
   if (httpReauthLink) {
     return `Re-authenticate "${account}" in your browser, then retry: ${httpReauthLink(account)}`;
   }

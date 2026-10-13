@@ -1,7 +1,23 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { mapGoogleError, stringifyEnvelope } from '../src/tools/_errors.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 
 const acc = 'work';
+
+afterEach(() => setHintProvider(null));
+
+/** Echoes `kind:<kind>` plus every fact so a test can assert both the text
+ * routed and the facts the call site actually passed. */
+function echoProvider() {
+  const seen: HintCase[] = [];
+  setHintProvider({
+    render: (c) => {
+      seen.push(c);
+      return { hint: `kind:${c.kind}`, message: `msg:${c.kind}`, retriable: false };
+    },
+  });
+  return seen;
+}
 
 describe('mapGoogleError', () => {
   it('401 → auth_required with a re-auth hint', () => {
@@ -379,5 +395,145 @@ describe('local preconditions are not Google failures', () => {
     const e = mapGoogleError(Object.assign(new Error('nope'), { code }), acc);
     expect(e.error).toBe(slug);
     expect(e.retriable).toBe(false);
+  });
+});
+
+// H3 PR1: with no provider every case above is unchanged (case A, proven by
+// the untouched assertions above). Case B: a stub provider routes and sees
+// the right facts, for every call site this file can reach.
+describe('hint provider routing (H3)', () => {
+  it('401 auth_required renders kind reauth with the account', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ code: 401, message: 'Invalid Credentials' }, acc);
+    expect(e.hint).toBe('kind:reauth');
+    expect(seen).toEqual([{ kind: 'reauth', account: acc }]);
+  });
+
+  it('E_NO_TOKEN (status-less auth_required) renders kind reauth', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError(Object.assign(new Error('nope'), { code: 'E_NO_TOKEN' }), acc);
+    expect(e.hint).toBe('kind:reauth');
+    expect(seen).toEqual([{ kind: 'reauth', account: acc }]);
+  });
+
+  it('reauth has no message override: the 401 message stays "Authentication failed"', () => {
+    echoProvider();
+    const e = mapGoogleError({ code: 401, message: 'Invalid Credentials' }, acc);
+    expect(e.message).toBe(`Authentication failed for account "${acc}".`);
+  });
+
+  it('invalid_grant renders kind dead_refresh_token', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ code: 401, message: 'invalid_grant' }, acc);
+    expect(e.hint).toBe('kind:dead_refresh_token');
+    expect(seen).toEqual([{ kind: 'dead_refresh_token', account: acc }]);
+  });
+
+  it('curated insufficient_scope fallback (with a bundle) renders scope_unknown carrying serviceText and bundle', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError(
+      { code: 403, errors: [{ reason: 'insufficientPermissions' }], message: 'Insufficient Permission' },
+      acc,
+      { scope: 'add the forms bundle', bundle: 'forms' },
+    );
+    expect(e.hint).toBe('kind:scope_unknown');
+    expect(seen).toEqual([{ kind: 'scope_unknown', account: acc, serviceText: 'add the forms bundle', bundle: 'forms' }]);
+  });
+
+  it('curated insufficient_scope fallback (no bundle) renders scope_unknown with bundle undefined', () => {
+    const seen = echoProvider();
+    mapGoogleError(
+      { code: 403, errors: [{ reason: 'insufficientPermissions' }], message: 'Insufficient Permission' },
+      acc,
+      { scope: 'enable meet' },
+    );
+    expect(seen).toEqual([{ kind: 'scope_unknown', account: acc, serviceText: 'enable meet', bundle: undefined }]);
+  });
+
+  it('a bare-string ServiceHints still renders scope_unknown with serviceText from the string', () => {
+    const seen = echoProvider();
+    mapGoogleError(
+      { code: 403, errors: [{ reason: 'insufficientPermissions' }], message: 'Insufficient Permission' },
+      acc,
+      'enable admin writes',
+    );
+    expect(seen).toEqual([{ kind: 'scope_unknown', account: acc, serviceText: 'enable admin writes', bundle: undefined }]);
+  });
+
+  it('a generated/escape-hatch scopeContext hint wins over the provider fallback (scope_unknown never renders)', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError(
+      { code: 403, errors: [{ reason: 'insufficientPermissions' }], message: 'Insufficient Permission' },
+      acc,
+      undefined,
+      () => ({ hint: 'from scopeHintForMethod', retriable: true }),
+    );
+    expect(e.hint).toBe('from scopeHintForMethod');
+    expect(seen).toEqual([]);
+  });
+
+  it('invalid_scope renders kind invalid_scope', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ code: 400, message: 'invalid_scope: bad' }, acc);
+    expect(e.hint).toBe('kind:invalid_scope');
+    expect(seen).toEqual([{ kind: 'invalid_scope', account: acc }]);
+  });
+
+  it('E_NO_OAUTH_CLIENT renders kind no_oauth_client for the hint only (message comes from client.ts)', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError(Object.assign(new Error('nope'), { code: 'E_NO_OAUTH_CLIENT' }), acc);
+    expect(e.hint).toBe('kind:no_oauth_client');
+    expect(e.message).toBe('nope');
+    expect(seen).toEqual([{ kind: 'no_oauth_client' }]);
+  });
+
+  it('api_not_enabled renders its facts, never pre-rendered text', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({
+      code: 403,
+      errors: [{ reason: 'accessNotConfigured' }],
+      message: 'Access Not Configured. Gmail API has not been used in project 12 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=12 then retry.',
+    }, acc);
+    expect(e.hint).toBe('kind:api_not_enabled');
+    expect(seen).toEqual([{ kind: 'api_not_enabled', api: 'gmail', service: undefined, project: undefined, googleMessage: expect.any(String) }]);
+  });
+
+  it('dailyLimitExceeded renders kind daily_quota with no facts', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ code: 403, errors: [{ reason: 'dailyLimitExceeded' }], message: 'quota' }, acc);
+    expect(e.hint).toBe('kind:daily_quota');
+    expect(seen).toEqual([{ kind: 'daily_quota' }]);
+  });
+
+  it('CONSUMER_SUSPENDED renders kind project_suspended with the account', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ code: 403, errors: [{ reason: 'CONSUMER_SUSPENDED' }], message: 'suspended' }, acc);
+    expect(e.hint).toBe('kind:project_suspended');
+    expect(seen).toEqual([{ kind: 'project_suspended', account: acc }]);
+  });
+
+  it('network_error renders hint only; retriable stays the core code, never the provider override', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ message: 'fetch failed', code: 'ENOTFOUND' }, acc);
+    expect(e.hint).toBe('kind:network_error');
+    expect(e.retriable).toBe(false); // ENOTFOUND is not in RETRIABLE_NET_CODES
+    expect(seen).toEqual([{ kind: 'network_error', code: 'ENOTFOUND' }]);
+  });
+
+  it('a local-fs error renders both message and hint from local_path', () => {
+    const seen = echoProvider();
+    const err = Object.assign(new Error("ENOENT: no such file"), { code: 'ENOENT', path: '/data/x.pdf' });
+    const e = mapGoogleError(err, acc);
+    expect(e.message).toBe('msg:local_path');
+    expect(e.hint).toBe('kind:local_path');
+    expect(seen).toEqual([{ kind: 'local_path', code: 'ENOENT', path: '/data/x.pdf' }]);
+  });
+
+  it('a statusless internal failure renders both message and hint from internal', () => {
+    const seen = echoProvider();
+    const e = mapGoogleError({ message: 'something odd' }, acc);
+    expect(e.message).toBe('msg:internal');
+    expect(e.hint).toBe('kind:internal');
+    expect(seen).toEqual([{ kind: 'internal', account: acc }]);
   });
 });

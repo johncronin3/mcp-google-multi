@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { z } from 'zod';
 import { inferCud, ToolRegistry } from '../src/registry.js';
+import { setHintProvider } from '../src/hint-provider.js';
 import type { Policy } from '../src/write-control.js';
 
 describe('inferCud', () => {
@@ -75,6 +76,8 @@ function fakeServer() {
 }
 
 describe('ToolRegistry', () => {
+  afterEach(() => setHintProvider(null));
+
   it('records the tool entry and forwards to the server', () => {
     const { server, registered } = fakeServer();
     const reg = new ToolRegistry(server as never, FULL_WRITES);
@@ -92,13 +95,15 @@ describe('ToolRegistry', () => {
     const reg = new ToolRegistry(server as never, FULL_WRITES);
     reg.registerTool('gmail_search', { description: 'x' }, () => {});
     reg.registerTool('gmail_create_draft', { description: 'x' }, () => {});
+    reg.registerTool('gmail_send', { description: 'x' }, () => {});
     reg.registerTool('gmail_modify_labels', { description: 'x' }, () => {});
     reg.registerTool('gmail_delete', { description: 'x' }, () => {});
-    const expected: Record<string, { readOnlyHint: boolean; destructiveHint: boolean }> = {
+    const expected: Record<string, { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean }> = {
       gmail_search: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-      gmail_create_draft: { readOnlyHint: false, destructiveHint: false },
-      gmail_modify_labels: { readOnlyHint: false, destructiveHint: true },
-      gmail_delete: { readOnlyHint: false, destructiveHint: true },
+      gmail_create_draft: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+      gmail_send: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+      gmail_modify_labels: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+      gmail_delete: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     };
     for (const r of registered) {
       expect(r.config.annotations, r.name).toMatchObject(expected[r.name]);
@@ -109,6 +114,36 @@ describe('ToolRegistry', () => {
     for (const t of listed) {
       expect(t.annotations, t.name).toMatchObject(expected[t.name]);
     }
+  });
+
+  it('advertises every generated non-read tool as destructive, whatever its HTTP-derived cud', () => {
+    const { server } = fakeServer();
+    const reg = new ToolRegistry(server as never, FULL_WRITES);
+    for (const cud of ['read', 'create', 'update', 'delete'] as const) {
+      reg.registerTool(`drive_gen_${cud}`, { description: 'x', cud }, () => {});
+    }
+    const hints = Object.fromEntries(reg.tools.map((t) => [t.cud, [t.annotations.readOnlyHint, t.annotations.destructiveHint]]));
+    expect(hints).toEqual({ read: [true, false], create: [false, true], update: [false, true], delete: [false, true] });
+  });
+
+  it('advertises read-classified tools that write as writes, keeping their gating and fan-out class', () => {
+    const { server } = fakeServer();
+    const reg = new ToolRegistry(server as never, FULL_WRITES);
+    const writers = ['account_add', 'account_reauth', 'account_write_config', 'gmail_download_attachment', 'drive_download', 'drive_export'];
+    for (const name of writers) reg.registerTool(name, { description: 'x' }, () => {});
+    for (const t of reg.tools) {
+      expect(t.cud, t.name).toBe('read');
+      expect(t.annotations, t.name).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    }
+  });
+
+  it('keeps the requiresUserInteraction client meta on the irreversible set only', () => {
+    const { server } = fakeServer();
+    const reg = new ToolRegistry(server as never, FULL_WRITES);
+    reg.registerTool('gmail_send', { description: 'x' }, () => {});
+    reg.registerTool('gmail_create_draft', { description: 'x' }, () => {});
+    const meta = Object.fromEntries(reg.tools.map((t) => [t.name, t.clientMeta?.['anthropic/requiresUserInteraction']]));
+    expect(meta).toEqual({ gmail_send: true, gmail_create_draft: undefined });
   });
 
   it('explicit annotation overrides survive through to the list handler', async () => {
@@ -333,6 +368,26 @@ describe('ToolRegistry', () => {
       }));
       expect(JSON.parse(out.content[0].text).error, label).toBe(expected);
     }
+  });
+
+  it('a throwing hint provider never breaks a registry-wrapped write-denied call (red by mutation: drop the catch in hints())', async () => {
+    const policy: Policy = { profile: 'read-only', readOnly: true, allow: [], deny: [] };
+    const { server, registered } = fakeServer();
+    const reg = new ToolRegistry(server as never, policy);
+    reg.registerTool('gmail_send', { description: 'x', inputSchema: { to: z.string() } }, () => ({
+      content: [{ type: 'text' as const, text: '{}' }],
+    }));
+    setHintProvider({
+      render: () => {
+        throw new Error('provider blew up');
+      },
+    });
+    const handler = registered[0].handler as (...a: unknown[]) => Promise<{ content: { text: string }[] }>;
+    const out = await handler({ to: 'x' });
+    const body = JSON.parse(out.content[0].text);
+    expect(body.error).toBe('write_disabled');
+    expect(body.message).not.toContain('provider blew up');
+    expect(body.message).toContain('"gmail_send"');
   });
 
   it('installListHandler throws when nothing is registered', () => {

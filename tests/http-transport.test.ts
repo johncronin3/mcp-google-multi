@@ -9,9 +9,11 @@ import {
   originAllowed,
   hostAllowed,
   jsonRpcMethod,
+  logSafe,
   type Authenticator,
   type HttpHostOptions,
 } from '../src/http-transport.js';
+import { logSafe as trimLogSafe } from '../src/trim.js';
 import { z } from "zod";
 
 // ---- pure helpers -----------------------------------------------------------
@@ -46,6 +48,23 @@ describe('http-transport pure helpers', () => {
     expect(jsonRpcMethod('nonsense')).toBe('unknown');
   });
 
+  it('jsonRpcMethod: a method not shaped like a name is <invalid>, a batch lists four then a count', () => {
+    for (const method of [5, null, 'a\nb', '', 'x'.repeat(65), 'tools call', { toString: 1 }, ['tools/list']]) {
+      expect(jsonRpcMethod({ jsonrpc: '2.0', id: 1, method }), JSON.stringify(method) ?? 'object').toBe('<invalid>');
+    }
+    expect(jsonRpcMethod({ method: 'x'.repeat(64) })).toBe('x'.repeat(64));
+    expect(jsonRpcMethod({ method: 'notifications/initialized' })).toBe('notifications/initialized');
+    expect(jsonRpcMethod({ method: 'rpc.discover' })).toBe('rpc.discover');
+    expect(jsonRpcMethod({ jsonrpc: '2.0', id: 1, result: {} })).toBe('unknown');
+    expect(jsonRpcMethod(['a', 'b', 'c', 'd', 'e'].map((method) => ({ method })))).toBe('a,b,c,d,+1');
+    expect(jsonRpcMethod(['a', 'b', 'c', 'd'].map((method) => ({ method })))).toBe('a,b,c,d');
+    expect(jsonRpcMethod([{ method: 'a' }, { method: 'a\nb' }, { id: 1, result: {} }])).toBe('a,<invalid>');
+    expect(jsonRpcMethod([{ id: 1, result: {} }, { id: 2, error: {} }])).toBe('batch');
+  });
+
+  it('re-exports logSafe for a host that imports only this module', () => {
+    expect(logSafe).toBe(trimLogSafe);
+  });
 });
 
 // ---- integration: real McpServer over the host (BV-3) ------------------------
@@ -536,6 +555,76 @@ describe('HttpTransportHost (BV-3: stateless dispatch)', () => {
     ]);
   });
 
+  // Node decodes header bytes as latin1, so an 8-bit byte reaches the log as a
+  // C1 control (NEL ends a line for some readers, CSI drives a terminal).
+  const NEL = String.fromCharCode(0x85);
+  const CSI = String.fromCharCode(0x9b);
+  const UNSAFE = /[\r\n\u2028\u2029\p{Cc}]/u;
+
+  it('a hostile or oversized Host logs one escaped, bounded line', async () => {
+    const logs: string[] = [];
+    const port = await startHost(() => ({ ok: true }), { log: (l) => logs.push(l) });
+    for (const host of [`evil${NEL}500 internal_error path=/forged`, `evil${CSI}2J`, 'h'.repeat(10_000)]) {
+      const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, host }, body: initBody });
+      expect(res.status).toBe(403);
+    }
+    expect(logs.filter((l) => l.startsWith('403 '))).toEqual([
+      '403 host_rejected host=evil\\u0085500 internal_error path=/forged',
+      '403 host_rejected host=evil\\u009b2J',
+      `403 host_rejected host=${'h'.repeat(64)}...(len=10000)`,
+    ]);
+    for (const l of logs) expect(l).not.toMatch(UNSAFE);
+  });
+
+  it('a hostile, oversized or repeated Origin logs one escaped, bounded line', async () => {
+    const logs: string[] = [];
+    const port = await startHost(() => ({ ok: true }), { log: (l) => logs.push(l) });
+    const repeated = Array.from({ length: 400 }, (_, i) => `https://o${i}.example`);
+    for (const origin of [`https://evil.example${NEL}403 forged`, 'o'.repeat(12_000), repeated as unknown as string]) {
+      const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, origin }, body: initBody });
+      expect(res.status).toBe(403);
+    }
+    const lines = logs.filter((l) => l.startsWith('403 '));
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toBe('403 origin_rejected origin=https://evil.example\\u0085403 forged');
+    expect(lines[1]).toBe(`403 origin_rejected origin=${'o'.repeat(64)}...(len=12000)`);
+    expect(lines[2]).toMatch(/^403 origin_rejected origin=https:\/\/o0\.example, https:\/\/o1\.example, .{24}\.\.\.\(len=\d{4,}\)$/);
+    for (const l of logs) expect(l).not.toMatch(UNSAFE);
+  });
+
+  // A method whose String() throws made the success line throw after the
+  // answer was sent: a tenant-triggered 500 line and a cut connection.
+  it('a method that is not a name logs <invalid> on the success line, never a 500', async () => {
+    const logs: string[] = [];
+    const port = await startHost(() => ({ ok: true }), { log: (l) => logs.push(l) });
+    for (const method of ['{"toString":1}', JSON.stringify(`tools/list\n200 /mcp method=forged`), JSON.stringify('m'.repeat(100_000))]) {
+      const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT }, raw: `{"jsonrpc":"2.0","id":1,"method":${method}}` });
+      expect(res.status).not.toBe(500);
+    }
+    expect(logs.filter((l) => !l.startsWith('listening on '))).toEqual(Array(3).fill('200 /mcp method=<invalid>'));
+  });
+
+  it('a thrown message with line breaks, or a long one, stays one bounded 500 line', async () => {
+    const logs: string[] = [];
+    const port = await startHost(() => ({ ok: true }), {
+      log: (l) => logs.push(l),
+      routes: {
+        '/forge': async () => {
+          throw new Error('lock busy\n403 host_rejected host=forged\r\naudit line lost');
+        },
+        '/long': async () => {
+          throw new Error('x'.repeat(5000));
+        },
+      },
+    });
+    expect((await request(port, 'GET', '/forge')).status).toBe(500);
+    expect((await request(port, 'GET', '/long')).status).toBe(500);
+    expect(logs.filter((l) => l.startsWith('500 '))).toEqual([
+      '500 internal_error path=/forge: lock busy\\u000a403 host_rejected host=forged\\u000d\\u000aaudit line lost',
+      `500 internal_error path=/long: ${'x'.repeat(200)}...(len=5000)`,
+    ]);
+  });
+
   it('a host log that throws on the 500 line leaves the answered connection open', async () => {
     const port = await startHost(() => ({ ok: true }), {
       log: (l) => {
@@ -632,6 +721,112 @@ async function laneHost(extra: Partial<HttpHostOptions> = {}) {
   };
   return { host, port, open, held, logs, call, admitted };
 }
+
+describe('HttpTransportHost resolveServer refusal (H3 PR1)', () => {
+  async function refusalHost(resolveServer: HttpHostOptions['resolveServer'], log: (l: string) => void = () => {}) {
+    const config = { ...resolveHttpConfig({ MCP_TRANSPORT: 'http' }), port: 0 };
+    const host = new HttpTransportHost({
+      server: makeServer(),
+      config,
+      version: '9.9.9',
+      ownerConfigured: true,
+      authenticate: (req) => ({ ok: true, sub: String(req.headers['x-test-sub'] ?? '') }),
+      resolveServer,
+      log,
+    });
+    await host.start();
+    hosts.push(host);
+    return host.address()!.port;
+  }
+
+  it('a valid refusal answers 403 with its own slug and message, logging only the slug', async () => {
+    const logs: string[] = [];
+    const port = await refusalHost(
+      () => ({ refused: { error: 'tenant_suspended', message: 'This workspace is suspended by its operator.' } }),
+      (l) => logs.push(l),
+    );
+    const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.text)).toEqual({ error: 'tenant_suspended', message: 'This workspace is suspended by its operator.' });
+    expect(logs.some((l) => l.includes('403 tenant_suspended path=/mcp'))).toBe(true);
+  });
+
+  it('a refusal never reaches dispatch: the resolved target server is never the one that answers', async () => {
+    const marker = new McpServer({ name: 'never-dispatched', version: '0.0.0' });
+    let called = false;
+    marker.registerTool('tag', { description: 'x', inputSchema: z.object({}) }, async () => {
+      called = true;
+      return { content: [{ type: 'text' as const, text: 'x' }] };
+    });
+    // red by mutation: a resolveServer whose RETURN carries both 'refused' and
+    // a usable 'server' would prove the refusal path never falls through to
+    // treat any truthy return as a dispatchable target.
+    const port = await refusalHost(() => ({
+      server: marker,
+      refused: { error: 'tenant_suspended', message: 'suspended' },
+    }) as never);
+    const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(res.status).toBe(403);
+    expect(called).toBe(false);
+
+    // initialize alone never calls a tool on a real dispatched server either,
+    // so the assertion above holds even if dispatch happened; send an actual
+    // tools/call for the marker tool, which WOULD set called=true if the
+    // refusal ever fell through to the resolved server.
+    const callBody = { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'tag', arguments: {} } };
+    const callRes = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: callBody });
+    expect(callRes.status).toBe(403);
+    expect(called).toBe(false);
+  });
+
+  it('an invalid slug falls back to today\'s exact tenant_not_found body', async () => {
+    const port = await refusalHost(() => ({ refused: { error: 'Not-Valid!', message: 'ok message' } }));
+    const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.text)).toEqual({ error: 'tenant_not_found', message: 'no tenant is provisioned for this subject' });
+  });
+
+  it('an overlong message falls back to tenant_not_found', async () => {
+    const port = await refusalHost(() => ({ refused: { error: 'tenant_unavailable', message: 'x'.repeat(301) } }));
+    const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.text).error).toBe('tenant_not_found');
+  });
+
+  it('a non-printable message falls back to tenant_not_found', async () => {
+    const port = await refusalHost(() => ({ refused: { error: 'tenant_unavailable', message: 'bad\nmessage' } }));
+    const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.text).error).toBe('tenant_not_found');
+  });
+
+  it('a non-string slug, a C1 control, U+2028 and U+202E each fall back to tenant_not_found (red by mutation: the old \\x00-\\x1f\\x7f-only regex)', async () => {
+    const refusals: unknown[] = [
+      { refused: { error: 42, message: 'ok message' } },
+      { refused: { error: 'tenant_unavailable', message: `bad${String.fromCharCode(0x85)}message` } },
+      { refused: { error: 'tenant_unavailable', message: 'bad message' } },
+      { refused: { error: 'tenant_unavailable', message: 'bad‮message' } },
+    ];
+    for (const refusal of refusals) {
+      const port = await refusalHost(() => refusal as never);
+      const res = await request(port, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+      expect(res.status).toBe(403);
+      expect(JSON.parse(res.text)).toEqual({ error: 'tenant_not_found', message: 'no tenant is provisioned for this subject' });
+    }
+  });
+
+  it('null and a throw both keep today\'s exact tenant_not_found body', async () => {
+    const nullPort = await refusalHost(() => null);
+    const nullRes = await request(nullPort, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(nullRes.status).toBe(403);
+    expect(JSON.parse(nullRes.text)).toEqual({ error: 'tenant_not_found', message: 'no tenant is provisioned for this subject' });
+
+    const throwPort = await refusalHost(() => { throw new Error('boom'); });
+    const throwRes = await request(throwPort, 'POST', '/mcp', { headers: { accept: MCP_ACCEPT, 'x-test-sub': 'x' }, body: initBody });
+    expect(throwRes.status).toBe(403);
+    expect(JSON.parse(throwRes.text)).toEqual({ error: 'tenant_not_found', message: 'no tenant is provisioned for this subject' });
+  });
+});
 
 describe('HttpTransportHost lane bounds', () => {
   it('maxQueuedPerLane: a full lane answers 429 lane_busy while another server still completes', async () => {
@@ -1208,6 +1403,54 @@ describe('HttpTransportHost graceful close', () => {
     await until(() => conn.received().length > 0, 'the start of the big response');
     const stop = readSlowly(conn.socket);
     try {
+      const closing = h.host.close({ graceMs: 15_000 });
+      await new Promise((r) => setTimeout(r, 50));
+      conn.socket.write(lateBody());
+      await conn.ended;
+      await closing;
+    } finally {
+      stop();
+    }
+    const answers = responsesOf(conn.received());
+    expect(answers).toHaveLength(1);
+    expect(JSON.parse(answers[0].body).result.content[0].text.length).toBe(BIG_CHARS);
+    expect(h.writes.calls).toBe(0);
+  }, 40_000);
+
+  it("close({ graceMs }) delivers a finished big response whole to a client that stops reading longer than Node's keep-alive timeout", async () => {
+    const h = await closeHost();
+    const pending = (h.host as unknown as { pending: Map<unknown, unknown> }).pending;
+    const conn = wire(h.port);
+    const stop = readSlowly(conn.socket);
+    conn.socket.write(rawPost(callTool(1, 'big')));
+    await until(() => conn.received().length > 0, 'the start of the big response');
+    await until(() => pending.size === 0, 'the big response to finish writing', 15_000);
+    stop();
+    conn.socket.pause();
+    const closing = h.host.close({ graceMs: 15_000 });
+    // Past the 5 s keep-alive timeout plus Node's 1 s buffer, with the tail still unread.
+    await new Promise((r) => setTimeout(r, 7_000));
+    conn.socket.write(lateBody());
+    conn.socket.resume();
+    await conn.ended;
+    await closing;
+    const answers = responsesOf(conn.received());
+    expect(answers).toHaveLength(1);
+    expect(JSON.parse(answers[0].body).result.content[0].text.length).toBe(BIG_CHARS);
+    expect(h.writes.calls).toBe(0);
+  }, 40_000);
+
+  it('close({ graceMs }) delivers a big response that finished writing before the close began whole to a slow reader that pipelines a large body after it', async () => {
+    const h = await closeHost();
+    const pending = (h.host as unknown as { pending: Map<unknown, unknown> }).pending;
+    const conn = wire(h.port);
+    // Read slowly from the start: nothing is then left to write while the
+    // kernel's buffers still hold megabytes of the response.
+    const stop = readSlowly(conn.socket);
+    try {
+      conn.socket.write(rawPost(callTool(1, 'big')));
+      await until(() => conn.received().length > 0, 'the start of the big response');
+      await until(() => pending.size === 0, 'the big response to finish writing', 15_000);
       const closing = h.host.close({ graceMs: 15_000 });
       await new Promise((r) => setTimeout(r, 50));
       conn.socket.write(lateBody());

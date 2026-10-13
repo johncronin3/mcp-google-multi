@@ -1,4 +1,5 @@
 import type { Cud } from './registry.js';
+import { hints } from './hint-provider.js';
 
 export type Profile = 'read-only' | 'safe-writes' | 'full-writes';
 export type Transport = 'stdio' | 'http';
@@ -203,10 +204,18 @@ export function writeDisabledResult(tool: ToolRef, policy: Policy, account?: str
   // Recomputed rather than passed in: every call site has already run
   // isAllowed, and a hint that disagrees with the verdict is worse than none.
   const reason = denyReason(tool, policy) ?? { rule: 'profile' as const, profile: policy.profile };
+  const rendered = hints()?.render({
+    kind: 'write_denied',
+    tool: { name: tool.name, service: tool.service, cud: tool.cud },
+    reason,
+    policy,
+  });
   const envelope = {
     error: 'write_disabled',
-    message: `"${tool.name}" (${tool.cud}) is disabled by the current write-control policy (profile: ${policy.profile}${policy.readOnly ? ', GOOGLE_READ_ONLY=true' : ''}).`,
-    hint: denyHint(tool, reason),
+    message:
+      rendered?.message ??
+      `"${tool.name}" (${tool.cud}) is disabled by the current write-control policy (profile: ${policy.profile}${policy.readOnly ? ', GOOGLE_READ_ONLY=true' : ''}).`,
+    hint: rendered?.hint ?? denyHint(tool, reason),
     retriable: false,
     ...(account ? { account } : {}),
   };

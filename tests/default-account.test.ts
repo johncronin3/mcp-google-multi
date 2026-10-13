@@ -5,6 +5,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { resolveAccounts, invalidateAccountSet } from '../src/accounts.js';
 import { ToolRegistry } from '../src/registry.js';
+import { setHintProvider } from '../src/hint-provider.js';
 import type { Policy } from '../src/write-control.js';
 
 const POLICY: Policy = { profile: 'full-writes', readOnly: false, allow: [], deny: [] };
@@ -101,6 +102,24 @@ describe('withDefaultAccount injection matrix (single dispatch site)', () => {
     expect(payload.error).toBe('E_NO_DEFAULT_ACCOUNT');
     expect(payload.hint).toContain('GOOGLE_DEFAULT_ACCOUNT');
     expect((res as { isError: boolean }).isError).toBe(true);
+  });
+
+  it('a hint provider renders no_default_account with the registry aliases (H3)', async () => {
+    const seen: unknown[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    try {
+      const { res } = await callWith(undefined, {});
+      const payload = JSON.parse((res as { content: { text: string }[] }).content[0].text);
+      expect(payload.hint).toBe('kind:no_default_account');
+      expect(seen).toEqual([{ kind: 'no_default_account', aliases: ['test'] }]);
+    } finally {
+      setHintProvider(null);
+    }
   });
 
   // The wizard tools take the account as the SUBJECT of the operation, so an

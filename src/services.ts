@@ -20,6 +20,7 @@ import { getToolsets, toolsetEnabled } from './toolsets.js';
 import { GENERATED_SERVICES } from './tools/generated/index.js';
 import { suggestKeys } from './arg-strict.js';
 import { sliceClean } from './trim.js';
+import { hints } from './hint-provider.js';
 
 export interface ServiceEntry {
   name: string;
@@ -89,17 +90,31 @@ export function unknownToolMessage(registry: ToolRegistry, rawName: string): str
   const service = serviceOf(name);
   const known = SERVICES.some((s) => s.name === service) || GENERATED_SERVICES.some((s) => s.name === service);
   if (known && !registry.services().includes(service)) {
+    const aliases = registry.accountSet().aliases;
     if (!toolsetEnabled(getToolsets(), service)) {
-      return `Tool ${name} not found: the "${service}" service is turned off in this deployment (GOOGLE_TOOLSETS).`;
+      const rendered = hints()?.render({ kind: 'service_not_enabled', tool: name, service, aliases, admin: false, toolsetOff: true, awaitingRestart: false });
+      return rendered?.hint ?? `Tool ${name} not found: the "${service}" service is turned off in this deployment (GOOGLE_TOOLSETS).`;
     }
     if (servicesAwaitingRestart(registry).includes(service)) {
-      return `Tool ${name} not found: the "${service}" service was enabled after this server started, and tools register at startup. Restart the server to use them. Until then, google_api_call can reach the same API.`;
+      const rendered = hints()?.render({ kind: 'service_not_enabled', tool: name, service, aliases, admin: false, toolsetOff: false, awaitingRestart: true });
+      return rendered?.hint ?? `Tool ${name} not found: the "${service}" service was enabled after this server started, and tools register at startup. Restart the server to use them. Until then, google_api_call can reach the same API.`;
     }
+    const isAdmin = service === 'admin';
     const hint =
-      service === 'admin'
+      isAdmin
         ? 'set admin on an account/profile (or GOOGLE_ADMIN_ACCOUNTS), then re-auth'
         : (GENERATED_GATES[service]?.hint ?? `add "${service}" to an account's scope profile (or legacy GOOGLE_OPTIONAL_SCOPES), then re-auth`);
-    return `Tool ${name} not found: the "${service}" service is not enabled in this deployment. To enable it, ${hint}. Until then, google_api_call can reach the same API.`;
+    const rendered = hints()?.render({
+      kind: 'service_not_enabled',
+      tool: name,
+      service,
+      bundle: isAdmin ? undefined : service,
+      aliases,
+      admin: isAdmin,
+      toolsetOff: false,
+      awaitingRestart: false,
+    });
+    return rendered?.hint ?? `Tool ${name} not found: the "${service}" service is not enabled in this deployment. To enable it, ${hint}. Until then, google_api_call can reach the same API.`;
   }
 
   const near = suggestKeys(rawName, registry.toolNames(), 3);

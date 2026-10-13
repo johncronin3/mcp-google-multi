@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
-import { resolvePolicy, isAllowed, describePolicy, type Policy } from '../src/write-control.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { resolvePolicy, isAllowed, describePolicy, writeDisabledResult, type Policy } from '../src/write-control.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
+import type { Cud } from '../src/registry.js';
 
 const tool = (name: string, cud: 'read' | 'create' | 'update' | 'delete') => ({
   name,
@@ -100,5 +102,60 @@ describe('describePolicy', () => {
     expect(
       describePolicy({ profile: 'safe-writes', readOnly: false, allow: ['a:*'], deny: ['*:delete*'] }),
     ).toBe('profile=safe-writes readOnly=false allow=[a:*] deny=[*:delete*]');
+  });
+});
+
+describe('writeDisabledResult hint provider routing (H3)', () => {
+  afterEach(() => setHintProvider(null));
+
+  function echo() {
+    const seen: HintCase[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}`, message: `msg:${c.kind}` };
+      },
+    });
+    return seen;
+  }
+
+  const expectRouted = (tool: { name: string; service: string; cud: Cud }, p: Policy, account?: string) => {
+    const seen = echo();
+    const envelope = JSON.parse(writeDisabledResult(tool, p, account).content[0].text) as { hint: string; message: string };
+    expect(envelope.hint).toBe('kind:write_denied');
+    expect(envelope.message).toBe('msg:write_denied');
+    expect(seen).toHaveLength(1);
+    return seen[0] as { kind: 'write_denied'; tool: typeof tool; reason: unknown; policy: Policy };
+  };
+
+  it('rule read_only renders write_denied with reason.rule = read_only', () => {
+    const c = expectRouted(tool('gmail_send', 'create'), { profile: 'full-writes', readOnly: true, allow: [], deny: [] });
+    expect(c.reason).toEqual({ rule: 'read_only' });
+  });
+
+  it('rule deny_glob renders write_denied naming the pattern', () => {
+    const c = expectRouted(tool('gmail_send', 'create'), { profile: 'full-writes', readOnly: false, allow: [], deny: ['gmail:send'] });
+    expect(c.reason).toEqual({ rule: 'deny_glob', pattern: 'gmail:send' });
+  });
+
+  it('rule profile renders write_denied naming the profile', () => {
+    const c = expectRouted(tool('drive_delete', 'delete'), { profile: 'safe-writes', readOnly: false, allow: [], deny: [] });
+    expect(c.reason).toEqual({ rule: 'profile', profile: 'safe-writes' });
+  });
+
+  it('rule privileged renders write_denied with the privilege kind', () => {
+    const c = expectRouted(
+      { name: 'gmail_users_watch', service: 'gmail', cud: 'create' },
+      { profile: 'safe-writes', readOnly: false, allow: [], deny: [] },
+    );
+    expect(c.reason).toEqual({ rule: 'privileged', profile: 'safe-writes', kind: 'push_registration' });
+  });
+
+  it('carries the account through to the envelope even with a provider installed', () => {
+    echo();
+    const envelope = JSON.parse(
+      writeDisabledResult(tool('gmail_send', 'create'), { profile: 'read-only', readOnly: false, allow: [], deny: [] }, 'work').content[0].text,
+    ) as { account?: string };
+    expect(envelope.account).toBe('work');
   });
 });
