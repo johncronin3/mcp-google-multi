@@ -1,9 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { z } from 'zod';
 import { ToolRegistry } from '../src/registry.js';
+import { runFanout } from '../src/fanout.js';
+import { setHintProvider } from '../src/hint-provider.js';
 import type { Policy } from '../src/write-control.js';
 import type { AccountSet } from '../src/accounts.js';
 import type { Metrics } from '../src/usage-metrics.js';
+
+afterEach(() => setHintProvider(null));
 
 // S1.8 containment (the #162 shape): a '*' selector against a registry built
 // with one alias set must never enumerate another registry's (or the global)
@@ -100,5 +104,55 @@ describe('fan-out containment (S1.8, #162 shape)', () => {
     expect(x.registry.accountSet().aliases).toEqual(['x1', 'x2']);
     await x.handlers['thing_search']({ account: 'x1,x2' });
     expect(widths).toEqual([2]);
+  });
+});
+
+describe('runFanout per-account throw (H3)', () => {
+  it('with no provider the per-account throw renders internal with no hint field (unchanged)', async () => {
+    const res = await runFanout(async () => { throw new Error('boom'); }, [{}], ['a1']);
+    const payload = JSON.parse(res.content[0].text) as { results: { error: { error: string; message: string; hint?: string } }[] };
+    expect(payload.results[0].error).toEqual({ error: 'internal', message: 'boom', retriable: false, account: 'a1' });
+    expect('hint' in payload.results[0].error).toBe(false);
+  });
+
+  it('a provider renders internal for the per-account throw, message and hint included', async () => {
+    const seen: unknown[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: 'tell the operator', message: 'server error' };
+      },
+    });
+    const res = await runFanout(async () => { throw new Error('boom'); }, [{}], ['a1']);
+    const payload = JSON.parse(res.content[0].text) as { results: { error: { error: string; message: string; hint?: string } }[] };
+    expect(payload.results[0].error).toEqual({ error: 'internal', message: 'server error', hint: 'tell the operator', retriable: false, account: 'a1' });
+    expect(seen).toEqual([{ kind: 'internal', account: 'a1' }]);
+  });
+
+  it('a throwing provider never rejects runFanout, and the other accounts\' results stay intact (red by mutation: drop the catch in hints())', async () => {
+    setHintProvider({
+      render: () => {
+        throw new Error('provider blew up');
+      },
+    });
+    const res = await runFanout(
+      async (args: unknown) => {
+        const { account } = args as { account: string };
+        if (account === 'a1') throw new Error('boom');
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ account, ok: true }) }] };
+      },
+      [{}],
+      ['a1', 'a2'],
+    );
+    const payload = JSON.parse(res.content[0].text) as {
+      results: ({ account: string; ok: true; data: unknown } | { account: string; ok: false; error: { message: string } })[];
+      partial: boolean;
+    };
+    const a1 = payload.results.find((r) => r.account === 'a1')!;
+    const a2 = payload.results.find((r) => r.account === 'a2')!;
+    expect(a1.ok).toBe(false);
+    expect((a1 as { error: { message: string } }).error.message).toBe('boom');
+    expect(a2).toEqual({ account: 'a2', ok: true, data: { account: 'a2', ok: true } });
+    expect(payload.partial).toBe(true);
   });
 });

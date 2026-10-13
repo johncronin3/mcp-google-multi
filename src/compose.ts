@@ -4,7 +4,7 @@
 // parsing, no process.exit, no prints (accounts.js module-load resolution is
 // the one inherited, pre-existing exception on the import chain).
 
-import type { McpServer } from "@modelcontextprotocol/server";
+import { McpServer } from "@modelcontextprotocol/server";
 import { GENERATED_SERVICES } from './tools/generated/index.js';
 import { GENERATED_GATES, SERVICES, servicesAwaitingRestart, unknownToolMessage } from './services.js';
 import { argNormalizationEnabled } from './arg-normalize.js';
@@ -23,6 +23,18 @@ import { resolveScopesForAccount } from './auth.js';
 import type { CuratedToolDeps } from './client.js';
 import type { ExecuteDeps } from './executor.js';
 import type { Metrics } from './usage-metrics.js';
+
+export interface McpServerOptions {
+  /** Sent in the initialize result; omitted entirely when absent or blank. */
+  instructions?: string;
+}
+
+/** The one place the MCP server is constructed, so an embedding host can pass
+ * per-session `instructions` without re-deriving the server identity. */
+export function createMcpServer(version: string, opts: McpServerOptions = {}): McpServer {
+  const instructions = opts.instructions?.trim() ? opts.instructions : undefined;
+  return new McpServer({ name: 'mcp-google-multi', version }, instructions ? { instructions } : undefined);
+}
 
 export function buildRegistry(server: McpServer, ctx: IdentityContext, mode?: DiscoveryMode, metrics: Metrics | null = null): ToolRegistry {
   const policy = ctx.policy;

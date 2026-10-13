@@ -6,6 +6,7 @@ import {
   outboundViolations,
   resolveOutboundAllowlist,
 } from '../src/outbound-allowlist.js';
+import { setHintProvider } from '../src/hint-provider.js';
 
 const ENV = { GOOGLE_OUTBOUND_ALLOWLIST: 'a@corp.com, @corp.com , Boss@Partner.io' };
 
@@ -49,6 +50,29 @@ describe('outboundViolations / checkOutbound', () => {
     expect(j.hint).toContain('@corp.com');
     expect(j.retriable).toBe(false);
     expect(j.account).toBe('work');
+  });
+
+  it('a hint provider renders outbound_denied with the kind, the target and the entries (H3)', () => {
+    const seen: unknown[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    try {
+      const r = checkOutbound('gmail recipient', ['bad@evil.io'], 'work', ENV)!;
+      const j = JSON.parse(r.content[0].text);
+      expect(j.hint).toBe('kind:outbound_denied');
+      expect(seen).toEqual([{
+        kind: 'outbound_denied',
+        what: 'gmail recipient',
+        blocked: ['bad@evil.io'],
+        entries: ['a@corp.com', '@corp.com', 'boss@partner.io'],
+      }]);
+    } finally {
+      setHintProvider(null);
+    }
   });
 });
 

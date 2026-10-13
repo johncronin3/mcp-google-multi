@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { deriveAccountHealth, type AccountHealthDeps } from '../src/tools/accounts-tool.js';
 import { setHttpReauthLink } from '../src/reauth-hint.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 import { resolveScopesForAccount } from '../src/auth.js';
 
 const ALIAS = 'test';
@@ -98,5 +99,58 @@ describe('deriveAccountHealth', () => {
     expect(h.token.status).toBe('needs_reauth');
     expect(h.scopes.granted).toBe(0);
     expect(h.token.expiryDate).toBeUndefined();
+  });
+});
+
+describe('deriveAccountHealth hint provider routing (H3)', () => {
+  afterEach(() => setHintProvider(null));
+
+  function echo() {
+    const seen: HintCase[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    return seen;
+  }
+
+  it('missing (no legacy file) renders reauth', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false }));
+    expect(h.token.hint).toBe('kind:reauth');
+    expect(seen).toEqual([{ kind: 'reauth', account: ALIAS }]);
+  });
+
+  it('missing (legacy plaintext file present) renders legacy_plaintext_token, not reauth', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false, fileExists: () => true }));
+    expect(h.token.hint).toBe('kind:legacy_plaintext_token');
+    expect(seen).toEqual([{ kind: 'legacy_plaintext_token', account: ALIAS }]);
+  });
+
+  it('decrypt_error renders token_unreadable', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ readToken: () => { throw new Error('nope'); } }));
+    expect(h.token.hint).toBe('kind:token_unreadable');
+    expect(seen).toEqual([{ kind: 'token_unreadable', account: ALIAS }]);
+  });
+
+  it('needs_reauth renders reauth', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ readToken: () => ({ expiry_date: NOW - 1 }) }));
+    expect(h.token.hint).toBe('kind:reauth');
+    expect(seen).toEqual([{ kind: 'reauth', account: ALIAS }]);
+  });
+
+  it('a live token with scopes still missing renders scopes_missing', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(
+      ALIAS,
+      deps({ readToken: () => ({ expiry_date: NOW + 60_000, refresh_token: 'r', scope: CONFIGURED[0] }) }),
+    );
+    expect(h.token.hint).toBe('kind:scopes_missing');
+    expect(seen).toEqual([{ kind: 'scopes_missing', account: ALIAS }]);
   });
 });

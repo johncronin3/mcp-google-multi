@@ -129,6 +129,22 @@ describe('createTokenStore (S1.7 custody closures)', () => {
     expect(store.hasToken('work')).toBe(true);
   });
 
+  it('updateToken never recreates a token file that was never written, or one removed out from under it (R3)', () => {
+    const dir = tmp();
+    const store = createTokenStore(dir, { tenantId: 'tenant-a', resolveKey: () => 'k' });
+
+    // First write: no token stored yet, a refresh-style update must not create one.
+    expect(() => store.updateToken('work', { access_token: 'at' })).not.toThrow();
+    expect(store.hasToken('work')).toBe(false);
+
+    // A stored token removed (e.g. a revoked linked account) while a refresh
+    // is in flight must stay removed, not get resurrected by the merge.
+    store.writeToken('work', { refresh_token: 'rt', scope: 's' });
+    fs.rmSync(path.join(dir, 'work.enc'));
+    expect(() => store.updateToken('work', { access_token: 'at2' })).not.toThrow();
+    expect(store.hasToken('work')).toBe(false);
+  });
+
   it('rejects a traversal-shaped alias before touching the filesystem', () => {
     const store = createTokenStore(tmp(), { resolveKey: () => 'k' });
     for (const bad of ['../evil', 'a/b', '__proto__']) {

@@ -1,6 +1,7 @@
 import type { Account } from '../accounts.js';
 import { reauthHint } from '../reauth-hint.js';
 import { sliceClean, sliceEncoded } from '../trim.js';
+import { hints as hintProvider } from '../hint-provider.js';
 
 const MAX_ERROR_MESSAGE_CHARS = 1000;
 const MAX_ERROR_ENVELOPE_CHARS = 4000;
@@ -13,6 +14,9 @@ const MAX_BODY_PARSE_CHARS = 64_000;
 export interface ServiceHints {
   scope?: string;
   resource?: string;
+  /** The scope bundle the scope hint is about, when known; carried through to
+   * a host-supplied provider so it can name the bundle in-band. */
+  bundle?: string;
 }
 
 function normalizeHints(h: string | ServiceHints | undefined): ServiceHints {
@@ -215,10 +219,11 @@ function rateLimited(error: any, message: string, account: Account, reason?: str
     };
   }
   if (reason === 'dailyLimitExceeded') {
+    const rendered = hintProvider()?.render({ kind: 'daily_quota' });
     return {
       error: 'rate_limited',
       message,
-      hint: 'A per-day project quota, not a burst limit: it resets at midnight Pacific. Reduce call volume or raise the quota in the Cloud Console; a tight retry loop will not clear it.',
+      hint: rendered?.hint ?? 'A per-day project quota, not a burst limit: it resets at midnight Pacific. Reduce call volume or raise the quota in the Cloud Console; a tight retry loop will not clear it.',
       retriable: true,
       account,
     };
@@ -270,22 +275,25 @@ export function mapGoogleError(
     .filter(Boolean)
     .join(' ');
   if ((status === 400 || status === 401) && /invalid_grant/i.test(grantHaystack)) {
+    const rendered = hintProvider()?.render({ kind: 'dead_refresh_token', account });
     return {
       error: 'reauth_required',
       message,
       hint:
-        `Refresh token for "${account}" is dead (often the 7-day Testing-mode trap). ` +
-        'Set Publishing status to In production at https://console.cloud.google.com/auth/audience, ' +
-        `then ${reauthHint(account)}`,
+        rendered?.hint ??
+        (`Refresh token for "${account}" is dead (often the 7-day Testing-mode trap). ` +
+          'Set Publishing status to In production at https://console.cloud.google.com/auth/audience, ' +
+          `then ${reauthHint(account)}`),
       retriable: false,
       account,
     };
   }
   if (status === 401) {
+    const rendered = hintProvider()?.render({ kind: 'reauth', account });
     return {
       error: 'auth_required',
       message: `Authentication failed for account "${account}".`,
-      hint: reauthHint(account),
+      hint: rendered?.hint ?? reauthHint(account),
       retriable: false,
       account,
     };
@@ -302,7 +310,14 @@ export function mapGoogleError(
       reason === 'SERVICE_DISABLED' ||
       /has not been used in project|accessNotConfigured|SERVICE_DISABLED|it is disabled/i.test(message);
     if (notEnabled) {
-      return { error: 'api_not_enabled', message, hint: enableHint(info, message), retriable: false, account };
+      const rendered = hintProvider()?.render({
+        kind: 'api_not_enabled',
+        api: disabledApiId(message) ?? undefined,
+        service: info?.metadata?.service,
+        project: info?.metadata?.consumer?.replace(/^projects\//, ''),
+        googleMessage: message,
+      });
+      return { error: 'api_not_enabled', message, hint: rendered?.hint ?? enableHint(info, message), retriable: false, account };
     }
 
     // The scope hint fires ONLY on the machine-readable token. A coarse AIP
@@ -314,10 +329,13 @@ export function mapGoogleError(
       /\bACCESS_TOKEN_SCOPE_INSUFFICIENT\b/.test(message);
     if (scopeIssue) {
       const enriched = scopeContext?.() ?? null;
+      const fallback = enriched
+        ? null
+        : hintProvider()?.render({ kind: 'scope_unknown', account, serviceText: hints.scope, bundle: hints.bundle });
       return {
         error: 'insufficient_scope',
         message,
-        hint: enriched?.hint ?? hints.scope ?? `Re-auth "${account}" with the scope this operation needs. ${reauthHint(account)}`,
+        hint: enriched?.hint ?? fallback?.hint ?? hints.scope ?? `Re-auth "${account}" with the scope this operation needs. ${reauthHint(account)}`,
         retriable: enriched?.retriable ?? false,
         account,
       };
@@ -327,7 +345,8 @@ export function mapGoogleError(
       return { error: 'forbidden', message, hint: `Drive storage for "${account}" is full. Free space or use another account; retrying will not help.`, retriable: false, account };
     }
     if (reason === 'CONSUMER_SUSPENDED' || reason === 'accountSuspended') {
-      return { error: 'forbidden', message, hint: `Google has suspended the project or the account behind "${account}". Check the Cloud Console notifications; no change to the request will fix this.`, retriable: false, account };
+      const rendered = hintProvider()?.render({ kind: 'project_suspended', account });
+      return { error: 'forbidden', message, hint: rendered?.hint ?? `Google has suspended the project or the account behind "${account}". Check the Cloud Console notifications; no change to the request will fix this.`, retriable: false, account };
     }
     if (reason === 'domainPolicy' || reason === 'ORG_RESTRICTION_VIOLATION') {
       return { error: 'forbidden', message, hint: `A Workspace admin policy blocks this operation for the domain of "${account}". A super-admin has to allow the app or the feature; re-auth will not change it.`, retriable: false, account };
@@ -344,10 +363,11 @@ export function mapGoogleError(
     };
   }
   if (status === 400 && /invalid[_ ]scope/i.test(message)) {
+    const rendered = hintProvider()?.render({ kind: 'invalid_scope', account });
     return {
       error: 'invalid_scope',
       message,
-      hint: 'One of the requested OAuth scopes is malformed or unavailable to this client. Run `config check` to review the account scope profile, fix it, then re-auth.',
+      hint: rendered?.hint ?? 'One of the requested OAuth scopes is malformed or unavailable to this client. Run `config check` to review the account scope profile, fix it, then re-auth.',
       retriable: false,
       account,
     };
@@ -390,13 +410,15 @@ export function mapGoogleError(
     // The server's own preconditions, tagged at the throw site in client.ts.
     // Untagged they reached the floor and were reported as Google failures.
     if (error?.code === 'E_NO_TOKEN') {
-      return { error: 'auth_required', message, hint: reauthHint(account), retriable: false, account };
+      const rendered = hintProvider()?.render({ kind: 'reauth', account });
+      return { error: 'auth_required', message, hint: rendered?.hint ?? reauthHint(account), retriable: false, account };
     }
     if (error?.code === 'E_NO_OAUTH_CLIENT') {
+      const rendered = hintProvider()?.render({ kind: 'no_oauth_client' });
       return {
         error: 'invalid_client',
         message,
-        hint: 'Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (see docs/google-cloud-setup.md), then restart the server.',
+        hint: rendered?.hint ?? 'Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (see docs/google-cloud-setup.md), then restart the server.',
         retriable: false,
         account,
       };
@@ -412,25 +434,32 @@ export function mapGoogleError(
     }
     const fsCode = typeof error?.code === 'string' && LOCAL_FS_CODES.has(error.code) ? error.code : undefined;
     if (fsCode) {
-      const p = typeof error?.path === 'string' ? ` "${error.path}"` : '';
+      const p = typeof error?.path === 'string' ? error.path : undefined;
+      const rendered = hintProvider()?.render({ kind: 'local_path', code: fsCode, path: p });
       return {
         error: 'invalid_params',
-        message: `Cannot access local path${p}: ${fsCode}`,
+        message: rendered?.message ?? `Cannot access local path${p ? ` "${p}"` : ''}: ${fsCode}`,
         hint:
-          'The path must exist on the machine running this server and be accessible to it. ' +
-          'When the server runs remotely (HTTP transport), paths on your own machine are not visible to it.',
+          rendered?.hint ??
+          ('The path must exist on the machine running this server and be accessible to it. ' +
+            'When the server runs remotely (HTTP transport), paths on your own machine are not visible to it.'),
         retriable: false,
         account,
       };
     }
     const netCode = netCodeOf(error);
     if (netCode) {
+      const rendered = hintProvider()?.render({ kind: 'network_error', code: netCode });
       return {
         error: 'network_error',
         message: message.includes(netCode) ? message : message.endsWith('reason: ') ? `${message}${netCode}` : `${message} (${netCode})`,
         hint:
-          `Network failure (${netCode}) before reaching Google - not an auth or API problem. Usually transient: retry. ` +
-          'If it persists on a high-latency or broken-IPv6 link, raise the happy-eyeballs budget: NODE_OPTIONS=--network-family-autoselection-attempt-timeout=4000 (server default 2000ms), and check connectivity with curl.',
+          rendered?.hint ??
+          (`Network failure (${netCode}) before reaching Google - not an auth or API problem. Usually transient: retry. ` +
+            'If it persists on a high-latency or broken-IPv6 link, raise the happy-eyeballs budget: NODE_OPTIONS=--network-family-autoselection-attempt-timeout=4000 (server default 2000ms), and check connectivity with curl.'),
+        // Not an override site (C5 is the only kind whose retriable the host
+        // may flip): a multi-tenant host keeps core's retriable codes for
+        // network_error.
         retriable: RETRIABLE_NET_CODES.has(netCode),
         account,
       };
@@ -449,13 +478,16 @@ export function mapGoogleError(
       account,
     };
   }
-  return {
-    error: 'internal',
-    message,
-    hint: 'This failed inside the MCP server, before any request was sent. The message above is the signal: it is most often a configuration problem such as a missing key or credential. Retrying the same call will fail the same way.',
-    retriable: false,
-    account,
-  };
+  {
+    const rendered = hintProvider()?.render({ kind: 'internal', account });
+    return {
+      error: 'internal',
+      message: rendered?.message ?? message,
+      hint: rendered?.hint ?? 'This failed inside the MCP server, before any request was sent. The message above is the signal: it is most often a configuration problem such as a missing key or credential. Retrying the same call will fail the same way.',
+      retriable: false,
+      account,
+    };
+  }
 }
 
 /** Bound the SERIALIZED envelope, not just the message: an authored hint can

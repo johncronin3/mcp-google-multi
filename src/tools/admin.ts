@@ -258,7 +258,7 @@ export function registerAdminTools(server: ToolRegistry, deps: CuratedToolDeps =
   );
 }
 
-function handleAdminError(error: any, account: Account) {
+export function handleAdminError(error: any, account: Account) {
   const admin = 'Admin tools require Workspace super-admin privileges AND the account must be listed as an admin account (then re-authenticated). Personal Gmail accounts cannot use these endpoints.';
-  return handleGoogleApiError(error, account, { scope: admin, resource: admin });
+  return handleGoogleApiError(error, account, { scope: admin, resource: admin, bundle: 'admin' });
 }

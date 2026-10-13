@@ -1,9 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   runDiagnostics, overallVerdict, exitCodeFor, apiEnableLink,
   renderReport, renderDoctorText,
   type DiagnosticsDeps, type AccountHealth, type ApiProbeResult, type HttpProbeResult,
 } from '../src/doctor.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 
 function emptyScopes() {
   return { configured: 0, granted: 0, callable: [] as string[], requestable: [] as string[], notRequestable: { addBundle: [], accountType: [], unknown: [] }, missing: [] as string[] };
@@ -70,6 +71,103 @@ describe('tenant-scoped diagnose (S1.21)', () => {
   });
 });
 
+describe('tenant-scope §1/§2/§6 residue (H3 PR1 commit 2)', () => {
+  afterEach(() => setHintProvider(null));
+
+  function echo() {
+    const seen: HintCase[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    return seen;
+  }
+
+  it('§1: tenant scope on an old Node carries no version string; operator scope is unchanged (red by mutation: trim in operator scope too)', async () => {
+    const tenant = await runDiagnostics(deps({ nodeVersion: '20.11.0' }), { scope: 'tenant' });
+    const tenantSection = tenant.sections.find((x) => x.id === 1)!;
+    expect(tenantSection.lines).toEqual(['Runtime below the supported version']);
+    expect(tenantSection.lines.join(' ')).not.toContain('20.11.0');
+
+    const operator = await runDiagnostics(deps({ nodeVersion: '20.11.0' }));
+    const operatorSection = operator.sections.find((x) => x.id === 1)!;
+    expect(operatorSection.lines.join(' ')).toContain('20.11.0');
+  });
+
+  it('§1: tenant-scope fail hint with no provider names the slug, never the CLI', async () => {
+    const r = await runDiagnostics(deps({ nodeVersion: '20.11.0' }), { scope: 'tenant' });
+    const s = r.sections.find((x) => x.id === 1)!;
+    expect(s.hint).toBe('Tell the server operator the code E_NODE_TOO_OLD.');
+  });
+
+  it('§1: a provider renders operator_only with the slug', async () => {
+    const seen = echo();
+    const r = await runDiagnostics(deps({ nodeVersion: '20.11.0' }), { scope: 'tenant' });
+    const s = r.sections.find((x) => x.id === 1)!;
+    expect(s.hint).toBe('kind:operator_only');
+    expect(seen).toEqual([{ kind: 'operator_only', slug: 'E_NODE_TOO_OLD' }]);
+  });
+
+  it('§1: a throwing provider falls back to the no-provider hint (red by mutation: drop the catch in hints())', async () => {
+    setHintProvider({
+      render: () => {
+        throw new Error('provider blew up');
+      },
+    });
+    const r = await runDiagnostics(deps({ nodeVersion: '20.11.0' }), { scope: 'tenant' });
+    const s = r.sections.find((x) => x.id === 1)!;
+    expect(s.hint).toBe('Tell the server operator the code E_NODE_TOO_OLD.');
+  });
+
+  it('§1: a provider is never consulted in operator scope (no HintCase rendered)', async () => {
+    const seen = echo();
+    await runDiagnostics(deps({ nodeVersion: '20.11.0' }));
+    expect(seen).toEqual([]);
+  });
+
+  it('§2: tenant scope with no accounts carries no hint by default (unchanged: no original exists)', async () => {
+    const r = await runDiagnostics(deps({ accountSet: () => null }), { scope: 'tenant' });
+    const s = r.sections.find((x) => x.id === 2)!;
+    expect(s.hint).toBeUndefined();
+  });
+
+  it('§2: a provider renders no_accounts in tenant scope', async () => {
+    const seen = echo();
+    const r = await runDiagnostics(deps({ accountSet: () => null }), { scope: 'tenant' });
+    const s = r.sections.find((x) => x.id === 2)!;
+    expect(s.hint).toBe('kind:no_accounts');
+    expect(seen).toEqual([{ kind: 'no_accounts' }]);
+  });
+
+  it('§6: tenant scope drops the raw probe error text; operator scope keeps it', async () => {
+    const probeApi = async (): Promise<ApiProbeResult[]> => { throw new Error('connect ETIMEDOUT 10.0.0.1:443 via corp-proxy.internal'); };
+    const tenant = await runDiagnostics(deps({ probeApi }), { scope: 'tenant' });
+    const tenantSection = tenant.sections.find((x) => x.id === 6)!;
+    expect(tenantSection.lines).toEqual(['Probe could not complete.']);
+    expect(JSON.stringify(tenantSection)).not.toContain('corp-proxy.internal');
+
+    const operator = await runDiagnostics(deps({ probeApi }));
+    const operatorSection = operator.sections.find((x) => x.id === 6)!;
+    expect(operatorSection.lines.join(' ')).toContain('corp-proxy.internal');
+  });
+
+  it('§6: a provider renders apis_disabled with the full disabled-service list, in both scopes', async () => {
+    const probeApi = async (): Promise<ApiProbeResult[]> => [
+      { service: 'gmail', api: 'gmail', ok: true },
+      { service: 'drive', api: 'drive', ok: false, notEnabled: true },
+    ];
+    for (const opts of [{ scope: 'tenant' as const }, undefined]) {
+      const seen = echo();
+      const r = await runDiagnostics(deps({ probeApi }), opts);
+      const s = r.sections.find((x) => x.id === 6)!;
+      expect(s.hint).toBe('kind:apis_disabled');
+      expect(seen).toEqual([{ kind: 'apis_disabled', services: [{ service: 'drive', api: 'drive' }] }]);
+    }
+  });
+});
+
 describe('runDiagnostics sections', () => {
   it('§1 Runtime fails on old Node', async () => {
     const r = await runDiagnostics(deps({ nodeVersion: '20.11.0' }));
@@ -122,6 +220,20 @@ describe('runDiagnostics sections', () => {
     const s = r.sections.find((x) => x.id === 5)!;
     expect(s.verdict).toBe('warn');
     expect(s.slug).toBe('E_SCOPE_NOT_GRANTED');
+  });
+
+  it('§5: a provider renders scopes_missing with the account (H3)', async () => {
+    const seen: HintCase[] = [];
+    setHintProvider({ render: (c) => { seen.push(c); return { hint: `kind:${c.kind}` }; } });
+    try {
+      const scopes = { ...emptyScopes(), callable: ['a'], requestable: ['https://scope/x'] };
+      const r = await runDiagnostics(deps({ accountHealth: (a) => health(a, { scopes }) }));
+      const s = r.sections.find((x) => x.id === 5)!;
+      expect(s.hint).toBe('kind:scopes_missing');
+      expect(seen).toEqual([{ kind: 'scopes_missing', account: 'ic' }]);
+    } finally {
+      setHintProvider(null);
+    }
   });
 
   it('§6 API enablement is unknown without a probe', async () => {

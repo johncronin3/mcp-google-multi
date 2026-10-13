@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import { ToolRegistry } from '../src/registry.js';
 import { registerDiscoverTools } from '../src/discover.js';
+import { setHintProvider } from '../src/hint-provider.js';
 import type { Policy } from '../src/write-control.js';
 
 const POLICY: Policy = { profile: 'safe-writes', readOnly: false, allow: [], deny: [] };
@@ -96,5 +97,44 @@ describe('registerDiscoverTools', () => {
     const empty = JSON.parse((await gmail.handler({ query: 'zzz' })).content[0].text);
     expect(empty.operations).toEqual([]);
     expect(empty.next).toContain('without query');
+  });
+
+  it('a hint provider renders writeControl via kind policy_summary (H3)', async () => {
+    const seen: unknown[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    try {
+      const { registered } = setup();
+      const gmail = registered.find((r) => r.name === 'gmail_discover')!;
+      const payload = JSON.parse((await gmail.handler({ query: undefined })).content[0].text);
+      expect(payload.writeControl).toBe('kind:policy_summary');
+      expect(seen).toEqual([{ kind: 'policy_summary', policy: POLICY }]);
+    } finally {
+      setHintProvider(null);
+    }
+  });
+
+  it('a throwing hint provider falls back to describePolicy, the discover call never rejects (red by mutation: drop the catch in hints())', async () => {
+    const { registered: baseline } = setup();
+    const gmailBaseline = baseline.find((r) => r.name === 'gmail_discover')!;
+    const defaultPayload = JSON.parse((await gmailBaseline.handler({ query: undefined })).content[0].text);
+
+    setHintProvider({
+      render: () => {
+        throw new Error('provider blew up');
+      },
+    });
+    try {
+      const { registered } = setup();
+      const gmail = registered.find((r) => r.name === 'gmail_discover')!;
+      const payload = JSON.parse((await gmail.handler({ query: undefined })).content[0].text);
+      expect(payload.writeControl).toBe(defaultPayload.writeControl);
+    } finally {
+      setHintProvider(null);
+    }
   });
 });

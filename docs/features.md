@@ -14,6 +14,8 @@ Hidden is a listing concept, not a security boundary: operational tools stay cal
 
 Everyday operations are **curated** tools: hand-written, response-shaped, token-lean. The long tail is **generated** from Google's API Discovery documents — one tool per method, same write-control, same account fan-out, regenerated when Google revises an API. Together they cover every OAuth-reachable Workspace API method; the split per service is in [COVERAGE.md](../COVERAGE.md).
 
+Every tool advertises MCP annotations computed from its read/create/update/delete class: reads are `readOnlyHint: true`, and every write (creates and sends included) is `destructiveHint: true`, so clients that key per-call approval on annotations ask before running it. Tools that are read-classified for write-control but still write something (`google_api_call`, the account tools, the download/export tools that save to disk) advertise as writes too.
+
 ## Multi-account: fan out one call across accounts
 
 Every read tool's `account` argument also accepts `"*"` (all configured accounts) or a CSV subset (`"work,personal"`). The server runs the call once per account (bounded concurrency) and returns per-account results — one account failing never hides the others:

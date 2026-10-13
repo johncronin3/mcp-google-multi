@@ -17,6 +17,7 @@ import {
   searchMethods,
   MAX_SEARCH_QUERY,
 } from '../discovery-client.js';
+import { hints } from '../hint-provider.js';
 
 
 // Policy/toolset namespace for each API alias must match the NAMED tools' service
@@ -92,16 +93,18 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
   };
   const enabledApis = Object.keys(SUPPORTED_APIS).filter(apiEnabled);
   const apiList = enabledApis.join(', ');
-  const toolsetDisabled = (alias: string) =>
-    jsonResult(
+  const toolsetDisabled = (alias: string) => {
+    const rendered = hints()?.render({ kind: 'toolset_disabled', api: alias, service: serviceForAlias(alias) });
+    return jsonResult(
       {
         error: 'toolset_disabled',
-        message: `API "${alias}" maps to service "${serviceForAlias(alias)}", which is excluded by GOOGLE_TOOLSETS.`,
-        hint: 'Add the service to GOOGLE_TOOLSETS (or unset it) to use this API.',
+        message: rendered?.message ?? `API "${alias}" maps to service "${serviceForAlias(alias)}", which is excluded by GOOGLE_TOOLSETS.`,
+        hint: rendered?.hint ?? 'Add the service to GOOGLE_TOOLSETS (or unset it) to use this API.',
         retriable: false,
       },
       true,
     );
+  };
 
   registry.registerMeta(
     'google_api_search',

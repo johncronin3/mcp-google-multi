@@ -210,6 +210,9 @@ export function summarizePresentation(p: Record<string, any>): Record<string, un
   };
 }
 
-function handleSlidesError(error: any, account: Account) {
-  return handleGoogleApiError(error, account, "Slides tools require the optional \"slides\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=slides (or include \"slides\" in the list) and re-auth.");
+export function handleSlidesError(error: any, account: Account) {
+  return handleGoogleApiError(error, account, {
+    scope: "Slides tools require the optional \"slides\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=slides (or include \"slides\" in the list) and re-auth.",
+    bundle: 'slides',
+  });
 }

@@ -1,9 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ToolRegistry } from '../src/registry.js';
 import { GENERATED_GATES, SERVICES, servicesAwaitingRestart, unknownToolMessage } from '../src/services.js';
 import type { AccountSet } from '../src/accounts.js';
 import { GENERATED_SERVICES } from '../src/tools/generated/index.js';
 import type { Policy } from '../src/write-control.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 
 const POLICY: Policy = { profile: 'read-only', readOnly: true, allow: [], deny: [] };
 
@@ -138,6 +139,75 @@ describe('unknown tool name', () => {
     const msg = unknownToolMessage(registry, 'zzzz_totally_made_up_xyzzy');
     expect(msg).toContain('_discover');
     expect(msg).toContain('google_api_search');
+  });
+});
+
+describe('unknown tool name: hint provider routing (H3)', () => {
+  afterEach(() => setHintProvider(null));
+
+  function echo() {
+    const seen: HintCase[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    return seen;
+  }
+
+  const setWith = (bundles: string[]): AccountSet =>
+    ({
+      aliases: ['work'],
+      configs: { work: { email: 'work@x.example', tokenPath: '/t', encPath: '/e', scopeProfile: 'p', source: 'env' as const } },
+      scopeProfiles: { base: { bundles: [] }, p: { bundles } },
+      source: 'env',
+      stamp: 'env:0',
+    }) as AccountSet;
+
+  function bootWithoutGated(accounts: () => AccountSet) {
+    const reg = new ToolRegistry(stub() as never, POLICY, 'eager', null, accounts);
+    for (const s of SERVICES) if (!s.enabled) s.register(reg);
+    for (const g of GENERATED_SERVICES) if (!SERVICES.find((s) => s.name === g.name)?.enabled && !GENERATED_GATES[g.name]) g.register(reg);
+    return reg;
+  }
+
+  it('toolset-off renders service_not_enabled with toolsetOff:true', () => {
+    vi.stubEnv('GOOGLE_TOOLSETS', 'gmail');
+    try {
+      const seen = echo();
+      const reg = new ToolRegistry(stub() as never, POLICY, 'eager');
+      SERVICES.find((s) => s.name === 'gmail')!.register(reg);
+      const msg = unknownToolMessage(reg, 'drive_search');
+      expect(msg).toBe('kind:service_not_enabled');
+      expect(seen).toEqual([{ kind: 'service_not_enabled', tool: 'drive_search', service: 'drive', aliases: ['test'], admin: false, toolsetOff: true, awaitingRestart: false }]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('awaiting-restart renders service_not_enabled with awaitingRestart:true', () => {
+    const seen = echo();
+    const reg = bootWithoutGated(() => setWith(['forms']));
+    const msg = unknownToolMessage(reg, 'forms_get');
+    expect(msg).toBe('kind:service_not_enabled');
+    expect(seen).toEqual([{ kind: 'service_not_enabled', tool: 'forms_get', service: 'forms', aliases: ['work'], admin: false, toolsetOff: false, awaitingRestart: true }]);
+  });
+
+  it('a gated (bundle) service renders service_not_enabled with the bundle and current aliases', () => {
+    const seen = echo();
+    const reg = bootWithoutGated(() => setWith([]));
+    const msg = unknownToolMessage(reg, 'chat_spaces_get');
+    expect(msg).toBe('kind:service_not_enabled');
+    expect(seen).toEqual([{ kind: 'service_not_enabled', tool: 'chat_spaces_get', service: 'chat', bundle: 'chat', aliases: ['work'], admin: false, toolsetOff: false, awaitingRestart: false }]);
+  });
+
+  it('the admin service renders service_not_enabled with admin:true and no bundle', () => {
+    const seen = echo();
+    const reg = bootWithoutGated(() => setWith([]));
+    const msg = unknownToolMessage(reg, 'reports_activities_list');
+    expect(msg).toBe('kind:service_not_enabled');
+    expect(seen).toEqual([{ kind: 'service_not_enabled', tool: 'reports_activities_list', service: 'admin', bundle: undefined, aliases: ['work'], admin: true, toolsetOff: false, awaitingRestart: false }]);
   });
 });
 

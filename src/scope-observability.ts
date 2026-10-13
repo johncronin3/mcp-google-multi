@@ -2,6 +2,7 @@ import { ADMIN_SCOPES, BUNDLE_CATALOG } from './scope-catalog.js';
 import { BASE_SCOPES, resolveScopesForAccount } from './auth.js';
 import { readToken } from './token-store.js';
 import { reauthHint } from './reauth-hint.js';
+import { hints } from './hint-provider.js';
 
 // The #114 three-state model: what action, if any, reaches a granted state.
 export type ScopeState = 'callable' | 'requestable_not_granted' | 'not_requestable';
@@ -94,43 +95,57 @@ export function classifyMethodScopes(
  */
 export function scopeHint(scope: string, c: ScopeClassification, alias: string): { hint: string; retriable: boolean } {
   switch (c.state) {
-    case 'requestable_not_granted':
+    case 'requestable_not_granted': {
+      const rendered = hints()?.render({ kind: 'scope_not_granted', account: alias, scope });
       return {
         hint:
-          `Scope ${scope} is in ${alias}'s profile but not granted (you unchecked it at consent). ` +
-          reauthHint(alias),
-        retriable: true,
+          rendered?.hint ??
+          (`Scope ${scope} is in ${alias}'s profile but not granted (you unchecked it at consent). ` +
+            reauthHint(alias)),
+        // The ONE kind whose retriable the host may flip (Decision 3): the
+        // owner keeps true, a multi-tenant host may report false because the
+        // fix needs the user in a browser.
+        retriable: rendered?.retriable ?? true,
       };
+    }
     case 'not_requestable':
       if (c.reason === 'add_bundle') {
         // "base" is a pseudo-bundle (BASE_SCOPES excluded by includesBase:
         // false), NOT a catalog key — telling users to add it to bundles[]
         // would fail boot with E_UNKNOWN_BUNDLE.
         if (c.bundle === 'base') {
+          const rendered = hints()?.render({ kind: 'scope_base_excluded', account: alias, scope });
           return {
             hint:
-              `Scope ${scope} is a base scope excluded by "includesBase": false in ${alias}'s profile. ` +
-              `Set includesBase back to true (or remove it) in config.json, then npx mcp-google-multi auth --account ${alias}`,
+              rendered?.hint ??
+              (`Scope ${scope} is a base scope excluded by "includesBase": false in ${alias}'s profile. ` +
+                `Set includesBase back to true (or remove it) in config.json, then npx mcp-google-multi auth --account ${alias}`),
             retriable: false,
           };
         }
+        const rendered = hints()?.render({ kind: 'scope_needs_bundle', account: alias, scope, bundle: c.bundle! });
         return {
           hint:
-            `Scope ${scope} needs the "${c.bundle}" bundle, which is not in ${alias}'s profile. ` +
-            `Add it: set ${alias}'s profile bundles to include "${c.bundle}" in config.json, then npx mcp-google-multi auth --account ${alias}`,
+            rendered?.hint ??
+            (`Scope ${scope} needs the "${c.bundle}" bundle, which is not in ${alias}'s profile. ` +
+              `Add it: set ${alias}'s profile bundles to include "${c.bundle}" in config.json, then npx mcp-google-multi auth --account ${alias}`),
           retriable: false,
         };
       }
       if (c.reason === 'account_type') {
+        const rendered = hints()?.render({ kind: 'scope_account_type', account: alias, scope });
         return {
-          hint: `Scope ${scope} requires a Google Workspace account; ${alias} is a personal account and will 403. Use a Workspace alias. Do not retry.`,
+          hint: rendered?.hint ?? `Scope ${scope} requires a Google Workspace account; ${alias} is a personal account and will 403. Use a Workspace alias. Do not retry.`,
           retriable: false,
         };
       }
-      return {
-        hint: `Scope ${scope} is not offered by this server (no bundle grants it). Not requestable. Do not retry.`,
-        retriable: false,
-      };
+      {
+        const rendered = hints()?.render({ kind: 'scope_unknown_scope', scope });
+        return {
+          hint: rendered?.hint ?? `Scope ${scope} is not offered by this server (no bundle grants it). Not requestable. Do not retry.`,
+          retriable: false,
+        };
+      }
     default:
       return { hint: '', retriable: true };
   }

@@ -15,6 +15,7 @@ import { apiProbeDepsFor, probeApiEnablement } from './api-probe.js';
 import { safeMessage, stringifyEnvelope } from './tools/_errors.js';
 import { resolveHttpConfig, HttpConfigError, type HttpConfig } from './http-config.js';
 import { parseOwnerEmails } from './http-transport.js';
+import { hints } from './hint-provider.js';
 
 // B9: one engine (runDiagnostics), two skins — `doctor` (CLI glyph) and
 // `diagnose` (agent tool, structured). Sections 1-6 here; section 7 (HTTP:
@@ -134,9 +135,22 @@ export function apiEnableLink(api: string): string {
 
 const LEGACY_ENV_KEYS = ['GOOGLE_ACCOUNTS', 'GOOGLE_OPTIONAL_SCOPES', 'GOOGLE_ADMIN_ACCOUNTS'] as const;
 
-function sectionRuntime(deps: DiagnosticsDeps): DiagnosticSection {
+function sectionRuntime(deps: DiagnosticsDeps, tenantScope = false): DiagnosticSection {
   const major = Number.parseInt(deps.nodeVersion.split('.')[0] ?? '0', 10);
   if (!Number.isFinite(major) || major < MIN_NODE_MAJOR) {
+    if (tenantScope) {
+      // The host version is operator infrastructure, not the tenant's (E7
+      // residue): no version string, and the fix is the operator's to apply.
+      const rendered = hints()?.render({ kind: 'operator_only', slug: 'E_NODE_TOO_OLD' });
+      return {
+        id: 1,
+        title: 'Runtime',
+        verdict: 'fail',
+        slug: 'E_NODE_TOO_OLD',
+        lines: ['Runtime below the supported version'],
+        hint: rendered?.hint ?? 'Tell the server operator the code E_NODE_TOO_OLD.',
+      };
+    }
     return {
       id: 1,
       title: 'Runtime',
@@ -146,7 +160,12 @@ function sectionRuntime(deps: DiagnosticsDeps): DiagnosticSection {
       hint: `Upgrade to Node ${MIN_NODE_MAJOR} LTS or newer.`,
     };
   }
-  return { id: 1, title: 'Runtime', verdict: 'ok', lines: [`Node.js ${deps.nodeVersion} (>= ${MIN_NODE_MAJOR})`] };
+  return {
+    id: 1,
+    title: 'Runtime',
+    verdict: 'ok',
+    lines: [tenantScope ? 'Runtime ok' : `Node.js ${deps.nodeVersion} (>= ${MIN_NODE_MAJOR})`],
+  };
 }
 
 function sectionConfig(deps: DiagnosticsDeps, set: ReturnType<typeof getAccountSet> | null, tenantScope = false): DiagnosticSection {
@@ -156,13 +175,16 @@ function sectionConfig(deps: DiagnosticsDeps, set: ReturnType<typeof getAccountS
   let slug: string | undefined;
 
   if (!set || set.aliases.length === 0) {
+    const tenantHint = tenantScope ? (hints()?.render({ kind: 'no_accounts' })?.hint ?? '') : undefined;
     return {
       id: 2,
       title: 'Config',
       verdict: 'fail',
       slug: 'E_NO_ACCOUNTS_CONFIGURED',
       lines: ['No accounts configured.'],
-      ...(tenantScope ? {} : { hint: 'Add an account: run `npx mcp-google-multi migrate-config` or set GOOGLE_ACCOUNTS.' }),
+      ...(tenantScope
+        ? (tenantHint ? { hint: tenantHint } : {})
+        : { hint: 'Add an account: run `npx mcp-google-multi migrate-config` or set GOOGLE_ACCOUNTS.' }),
     };
   }
   // The config file, process env, working directory and metrics store below
@@ -258,7 +280,8 @@ function sectionsTokensAndScopes(deps: DiagnosticsDeps, aliases: string[]): [Dia
     if (r.requestable.length > 0) {
       if (scopeVerdict === 'ok') scopeVerdict = 'warn';
       scopeLines.push(`${alias}: ${r.callable.length} callable, ${r.requestable.length} requested-not-granted`);
-      scopeHint = `Re-auth to grant missing scopes. ${reauthHint(alias)}`;
+      const rendered = hints()?.render({ kind: 'scopes_missing', account: alias });
+      scopeHint = rendered?.hint ?? `Re-auth to grant missing scopes. ${reauthHint(alias)}`;
     } else {
       scopeLines.push(`${alias}: ${r.callable.length} callable, all profile scopes granted`);
     }
@@ -270,7 +293,7 @@ function sectionsTokensAndScopes(deps: DiagnosticsDeps, aliases: string[]): [Dia
   ];
 }
 
-async function sectionApiEnablement(deps: DiagnosticsDeps, aliases: string[]): Promise<DiagnosticSection> {
+async function sectionApiEnablement(deps: DiagnosticsDeps, aliases: string[], tenantScope = false): Promise<DiagnosticSection> {
   if (!deps.probeApi) {
     return { id: 6, title: 'API enablement', verdict: 'unknown', lines: ['Probe not run (no live account probe configured).'] };
   }
@@ -286,8 +309,15 @@ async function sectionApiEnablement(deps: DiagnosticsDeps, aliases: string[]): P
   try {
     results = await deps.probeApi(healthy);
   } catch (e: any) {
-    // Network / transient: WARN with the target, never crash the report.
-    return { id: 6, title: 'API enablement', verdict: 'warn', lines: [`Probe could not complete: ${e?.message ?? e}`] };
+    // Network / transient: WARN with the target, never crash the report. The
+    // raw text can name an egress or proxy host (E7 residue): tenant scope
+    // drops it.
+    return {
+      id: 6,
+      title: 'API enablement',
+      verdict: 'warn',
+      lines: [tenantScope ? 'Probe could not complete.' : `Probe could not complete: ${e?.message ?? e}`],
+    };
   }
   if (results.length === 0) {
     return { id: 6, title: 'API enablement', verdict: 'unknown', lines: [`No probeable service scopes granted on "${healthy}".`] };
@@ -295,13 +325,14 @@ async function sectionApiEnablement(deps: DiagnosticsDeps, aliases: string[]): P
   const disabled = results.filter((r) => r.notEnabled);
   const lines = results.map((r) => `${r.service}: ${r.ok ? 'enabled' : r.notEnabled ? 'NOT ENABLED' : `unknown (${r.message ?? 'error'})`}`);
   if (disabled.length > 0) {
+    const rendered = hints()?.render({ kind: 'apis_disabled', services: disabled.map((r) => ({ service: r.service, api: r.api })) });
     return {
       id: 6,
       title: 'API enablement',
       verdict: 'fail',
       slug: 'E_API_NOT_ENABLED',
       lines,
-      hint: disabled.map((r) => `Enable ${r.service}: ${apiEnableLink(r.api)}`).join('\n'),
+      hint: rendered?.hint ?? disabled.map((r) => `Enable ${r.service}: ${apiEnableLink(r.api)}`).join('\n'),
     };
   }
   return { id: 6, title: 'API enablement', verdict: 'ok', lines: lines.length ? lines : ['(probed account, all enabled)'] };
@@ -390,7 +421,7 @@ export async function runDiagnostics(
   // the context's own account count.
   const tenantScope = opts.scope === 'tenant';
   const sections: DiagnosticSection[] = [];
-  sections.push(sectionRuntime(deps));
+  sections.push(sectionRuntime(deps, tenantScope));
 
   const set = deps.accountSet();
   sections.push(sectionConfig(deps, set, tenantScope));
@@ -401,7 +432,7 @@ export async function runDiagnostics(
   if (aliases.length > 0) {
     const [tokens, scopes] = sectionsTokensAndScopes(deps, aliases);
     sections.push(tokens, scopes);
-    sections.push(await sectionApiEnablement(deps, aliases));
+    sections.push(await sectionApiEnablement(deps, aliases, tenantScope));
   }
 
   if (!tenantScope) {

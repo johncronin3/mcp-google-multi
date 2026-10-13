@@ -8,12 +8,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
-import { McpServer } from "@modelcontextprotocol/server";
 import type { Transport } from "@modelcontextprotocol/server";
 import { connectTimeDiscoveryMode, resolveDiscoveryMode } from './registry.js';
 import { isAllowed, describePolicy } from './write-control.js';
 import { buildIdentityContext } from './identity.js';
-import { buildRegistry, requestHooksFor } from './compose.js';
+import { buildRegistry, createMcpServer, requestHooksFor } from './compose.js';
 import { registerSetupPrompt } from './setup-prompt.js';
 import { applyNetTuning } from './net-tuning.js';
 import { withArgNormalization, withValidationEnvelope } from './arg-normalize.js';
@@ -102,7 +101,7 @@ async function main() {
     const ctx = buildIdentityContext();
     const policy = ctx.policy;
     const registry = buildRegistry(
-      new McpServer({ name: 'mcp-google-multi', version: pkg.version }),
+      createMcpServer(pkg.version),
       ctx,
     );
     const cud = registry.tools.filter((t) => t.cud !== 'read');
@@ -222,7 +221,7 @@ async function main() {
   // Build one McpServer + registry per transport at boot (P1 / BV gap #4:
   // never rebuilt per request); `both` runs the two concurrently.
   if (wantStdio) {
-    const server = new McpServer({ name: 'mcp-google-multi', version: pkg.version });
+    const server = createMcpServer(pkg.version);
     const stdioMetrics = initMetricsFor('stdio', resolveDiscoveryMode());
     const stdioCtx = buildIdentityContext(process.env, { transport: 'stdio' });
     const registry = buildRegistry(server, stdioCtx, undefined, stdioMetrics);
@@ -280,7 +279,7 @@ async function main() {
     if (configuredMode && configuredMode !== 'curated') {
       process.stderr.write(`GOOGLE_DISCOVERY="${configuredMode}" is ignored over HTTP; the stateless transport forces "curated".\n`);
     }
-    const httpServer = new McpServer({ name: 'mcp-google-multi', version: pkg.version });
+    const httpServer = createMcpServer(pkg.version);
     const httpMetrics = initMetricsFor('http', 'curated');
     const httpCtx = buildIdentityContext(process.env, { transport: 'http' });
     const registry = buildRegistry(httpServer, httpCtx, 'curated', httpMetrics);

@@ -143,9 +143,10 @@ export function registerChatTools(server: ToolRegistry, deps: CuratedToolDeps = 
   );
 }
 
-function handleChatError(error: any, account: Account) {
+export function handleChatError(error: any, account: Account) {
   return handleGoogleApiError(error, account, {
     scope: 'Chat tools require the optional "chat" scope bundle: add it to this account\'s scope profile, then re-auth.',
     resource: `Google Chat denied this space or message to "${account}". The scope is not the problem: check that the account is a member of the space, and that Chat is turned on for the Workspace.`,
+    bundle: 'chat',
   });
 }

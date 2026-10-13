@@ -27,7 +27,7 @@ afterEach(() => {
   for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 
-function make(dir: string, opts: { now?: () => number; mono?: () => number; log?: (l: string) => void; sequencingEnabled?: boolean } = {}) {
+function make(dir: string, opts: { now?: () => number; mono?: () => number; log?: (l: string) => void; sequencingEnabled?: boolean; extraErrorSlugs?: readonly string[] } = {}) {
   return new Metrics({
     dir,
     version: '6.0.0-test',
@@ -37,6 +37,7 @@ function make(dir: string, opts: { now?: () => number; mono?: () => number; log?
     monotonic: opts.mono,
     log: opts.log ?? (() => {}),
     sequencingEnabled: opts.sequencingEnabled,
+    extraErrorSlugs: opts.extraErrorSlugs,
   });
 }
 
@@ -145,6 +146,27 @@ describe('recording and derivations', () => {
     expect(readDay(dir).tools.drive_search.err.other).toBe(1);
   });
 
+  it('extraErrorSlugs: an envelope slug in the extras is counted under its name, one outside both sets is other, a malformed extra is dropped, and without the option the day file is byte-identical to today', async () => {
+    const dir = tmp();
+    const m = make(dir, { extraErrorSlugs: ['tenant_quota_exceeded', '123bad', 'has space'] });
+    await m.wrap(entry('drive_search'), async () => errResult({ error: 'tenant_quota_exceeded', message: 'x', retriable: false, account: 'a' }))({});
+    await m.wrap(entry('drive_search'), async () => errResult({ error: 'truly_unknown_slug', message: 'x', retriable: false, account: 'a' }))({});
+    await m.wrap(entry('drive_search'), async () => errResult({ error: '123bad', message: 'x', retriable: false, account: 'a' }))({});
+    m.flush();
+    const day = readDay(dir);
+    expect(day.tools.drive_search.err.tenant_quota_exceeded).toBe(1);
+    expect(day.tools.drive_search.err.other).toBe(2);
+    expect(day.tools.drive_search.err['123bad']).toBeUndefined();
+
+    const dirDefault = tmp();
+    const mDefault = make(dirDefault);
+    await mDefault.wrap(entry('drive_search'), async () => errResult({ error: 'tenant_quota_exceeded', message: 'x', retriable: false, account: 'a' }))({});
+    await mDefault.wrap(entry('drive_search'), async () => errResult({ error: 'truly_unknown_slug', message: 'x', retriable: false, account: 'a' }))({});
+    await mDefault.wrap(entry('drive_search'), async () => errResult({ error: '123bad', message: 'x', retriable: false, account: 'a' }))({});
+    mDefault.flush();
+    expect(readDay(dirDefault).tools.drive_search.err).toEqual({ other: 3 });
+  });
+
   it('retry self-correction: hinted error then success inside the window', async () => {
     const dir = tmp();
     let t = 0;
@@ -197,6 +219,18 @@ describe('recording and derivations', () => {
     expect(day.bigrams).toEqual({});
     expect(day.tools.tasks_update.n).toBe(2);
     expect(day.tools.gmail_read.n).toBe(1);
+  });
+
+  it('sequencingEnabled=false: an escape method recorded during one google_api_call is not attached to the next google_api_call event, and escape.methods still counts it', async () => {
+    const dir = tmp();
+    const m = make(dir, { sequencingEnabled: false });
+    m.recordEscapeMethod('sheets.spreadsheets.values.update');
+    await m.wrap(entry('google_api_call'), async () => okResult())({});
+    m.flush();
+    const day = readDay(dir);
+    expect(day.escape.methods).toEqual({ 'sheets.spreadsheets.values.update': 1 });
+    const line = JSON.parse(fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf-8').trim().split('\n')[0]);
+    expect(line.mid).toBeUndefined();
   });
 
   it('bigrams chain in order and break on a 5-minute gap', async () => {
@@ -391,6 +425,43 @@ describe('storage discipline', () => {
     expect(line.ts).toBe('2026-09-20T10:11:00Z');
     expect(line.tool).toBe('gmail_search');
     expect(line.chars).toBe('le64');
+  });
+
+  it('eventLog=false: record, recordRpc, flush, a day rollover and shutdown never create events.jsonl or events.1.jsonl, and the day file is byte-identical to the same run with eventLog=true', async () => {
+    const run = async (eventLog: boolean) => {
+      const dir = tmp();
+      let nowMs = Date.parse('2026-09-20T10:11:42.000Z');
+      let mono = 0;
+      const m = new Metrics({
+        dir, version: '6.0.0-test', mode: 'lazy', transport: 'stdio',
+        now: () => nowMs,
+        monotonic: () => mono,
+        log: () => {},
+        eventLog,
+      });
+      const w = m.wrap(entry('gmail_search'), async () => okResult());
+      await w({});
+      m.recordRpc('tool_not_found');
+      m.flush();
+      nowMs += 2 * 86_400_000; // cross a day boundary
+      mono += 50;
+      await w({});
+      m.flush();
+      m.shutdown();
+      return dir;
+    };
+    const dirOff = await run(false);
+    expect(fs.existsSync(path.join(dirOff, 'events.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(dirOff, 'events.1.jsonl'))).toBe(false);
+    expect(fs.readdirSync(dirOff).sort()).toEqual(['agg']);
+
+    const dirOn = await run(true);
+    const aggOff = fs.readdirSync(path.join(dirOff, 'agg')).sort();
+    const aggOn = fs.readdirSync(path.join(dirOn, 'agg')).sort();
+    expect(aggOff).toEqual(aggOn);
+    for (const f of aggOff) {
+      expect(fs.readFileSync(path.join(dirOff, 'agg', f), 'utf-8')).toBe(fs.readFileSync(path.join(dirOn, 'agg', f), 'utf-8'));
+    }
   });
 });
 
