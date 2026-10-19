@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
-import type { Transport } from "@modelcontextprotocol/server";
+import type { McpServer, Transport } from "@modelcontextprotocol/server";
 import { connectTimeDiscoveryMode, resolveDiscoveryMode } from './registry.js';
 import { isAllowed, describePolicy } from './write-control.js';
 import { buildIdentityContext } from './identity.js';
@@ -362,10 +362,7 @@ async function main() {
 /** House Streamable HTTP server (src/http.ts), one per request. Does not bind
  * a transport. Curated tools are on the first tools/list — docs/features.md. */
 export function buildGoogleMcpServer(): McpServer {
-  const server = new McpServer({
-    name: 'mcp-google-multi',
-    version: pkg.version,
-  });
+  const server = createMcpServer(pkg.version);
   const registry = buildRegistry(
     server,
     buildIdentityContext(process.env, { transport: 'http' }),
