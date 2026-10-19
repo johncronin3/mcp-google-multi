@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { ToolRegistry } from '../src/registry.js';
 import { nearestMethodIds, registerEscapeTools } from '../src/tools/google-api.js';
 import { clearDiscoveryMemoryCache, searchMethods } from '../src/discovery-client.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 import type { Policy } from '../src/write-control.js';
 
 const FIXTURE = {
@@ -142,6 +143,15 @@ afterEach(() => {
 });
 
 describe('google_api_search', () => {
+  it('advertises google_api_call as a destructive write despite its read cud, and google_api_search as read-only', () => {
+    const { registry } = setup(FULL);
+    const call = registry.tools.find((t) => t.name === 'google_api_call')!;
+    const search = registry.tools.find((t) => t.name === 'google_api_search')!;
+    expect(call.cud).toBe('read');
+    expect(call.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+    expect(search.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+  });
+
   it('returns matching methods with cud and invocation hint', async () => {
     const { search, dir } = setup(FULL);
     cleanupDirs.push(dir);
@@ -407,5 +417,43 @@ describe('google_api_call', () => {
     const payload = JSON.parse(res.content[0].text);
     expect(payload.error).toBe('invalid_params');
     expect(payload.hint).toContain('userId');
+  });
+
+  describe('hint provider routing', () => {
+    afterEach(() => setHintProvider(null));
+
+    function echo() {
+      const seen: HintCase[] = [];
+      setHintProvider({
+        render: (c) => {
+          seen.push(c);
+          return { hint: `kind:${c.kind}`, message: `msg:${c.kind}` };
+        },
+      });
+      return seen;
+    }
+
+    it('toolset_disabled renders both message and hint from the provider', async () => {
+      const seen = echo();
+      const { call, dir } = setup(FULL, { toolsets: new Set(['drive']) });
+      cleanupDirs.push(dir);
+      const res = await call({ account: 'test', api: 'gmail', methodId: 'gmail.users.messages.list', pathParams: { userId: 'me' } });
+      const payload = JSON.parse(res.content[0].text);
+      expect(payload.error).toBe('toolset_disabled');
+      expect(payload.message).toBe('msg:toolset_disabled');
+      expect(payload.hint).toBe('kind:toolset_disabled');
+      expect(seen).toEqual([{ kind: 'toolset_disabled', api: 'gmail', service: 'gmail' }]);
+    });
+
+    it('untrusted_host renders the hint from the provider', async () => {
+      const seen = echo();
+      const { call, dir } = setup(FULL);
+      cleanupDirs.push(dir);
+      const res = await call({ account: 'test', api: 'slides', methodId: 'slides.presentations.get', pathParams: { presentationId: 'p1' } });
+      const payload = JSON.parse(res.content[0].text);
+      expect(payload.error).toBe('untrusted_host');
+      expect(payload.hint).toBe('kind:untrusted_host');
+      expect(seen).toEqual([{ kind: 'untrusted_host' }]);
+    });
   });
 });

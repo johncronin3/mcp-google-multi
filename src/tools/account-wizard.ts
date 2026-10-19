@@ -5,7 +5,7 @@ import { getAccountSet, invalidateAccountSet, refreshAccountSetIfStale } from '.
 import { ALIAS_RE, mutateConfigFile } from '../config-file.js';
 import { writeToken } from '../token-store.js';
 import { resolveScopesForAccount } from '../auth.js';
-import { BUNDLE_CATALOG, closestBundle, isKnownBundle, resolveBundleAliases } from '../scope-catalog.js';
+import { BUNDLE_CATALOG, closestBundle, isKnownBundle, refusedBundlesFor, resolveBundleAliases } from '../scope-catalog.js';
 import { openUrl } from '../open-url.js';
 import { coerceBoolean } from './_coerce.js';
 import { safeMessage, stringifyEnvelope } from './_errors.js';
@@ -17,12 +17,8 @@ import {
   DEFAULT_SERVER_NAME, type ClientId, type Mode,
 } from '../client-config.js';
 
-// B7: the elicitation-driven account_add / account_reauth wizard. It rebuilds
-// interactive account management on the mutable config.json registry so a
-// running server can add an account without the deployer editing env + running
-// a CLI. Google consent reuses the loopback flow (leg C); the HTTP-transport
-// consent path (${BASE}/authorize) is owned by the OAuth AS and lands with that
-// cluster. account_add over http is gated behind it.
+// Elicitation-driven account_add / account_reauth, built on the mutable
+// config.json registry; HTTP-transport consent is owned by the OAuth AS, not this file.
 
 export interface AddForm {
   alias: string;
@@ -34,14 +30,17 @@ export interface AddForm {
   admin: boolean;
 }
 
-// The common optional bundles get their own checkbox (MCP elicitation has no
-// multi-select, so a boolean per bundle IS the checklist); the long tail stays
-// a comma-separated field for power users, and `allBundles` grants every one.
+// Each common bundle gets its own checkbox since MCP elicitation has no
+// multi-select; the long tail stays a comma-separated field, `allBundles` grants all.
 const CHECKBOX_BUNDLES = ['forms', 'chat'] as const;
 
-/** Every optional bundle (admin is granted via its own checkbox, not here). */
-export function allOptionalBundles(): string[] {
-  return Object.keys(BUNDLE_CATALOG).filter((n) => n !== 'admin');
+/** Every optional bundle (admin is granted via its own checkbox, not here),
+ * less those Google refuses for the account at `email` when one is given. */
+export function allOptionalBundles(email?: string): string[] {
+  const all = Object.keys(BUNDLE_CATALOG).filter((n) => n !== 'admin');
+  if (email === undefined) return all;
+  const refused = new Set(refusedBundlesFor(email, all));
+  return all.filter((n) => !refused.has(n));
 }
 
 /** elicitation/create form schema (flat primitives only, per the MCP spec). */
@@ -80,8 +79,7 @@ export function validateAddForm(input: Partial<AddForm>, existingAliases: string
     return { ok: false, slug: 'E_VALIDATION', message: 'Email is required.', hint: "It is used as the Google login hint, so it must be the account's real Google address.", alias };
   }
   if (input.allBundles === true) {
-    // "All optional scopes" supersedes the individual picks.
-    return { ok: true, alias, email, bundles: allOptionalBundles(), admin: input.admin === true };
+    return { ok: true, alias, email, bundles: allOptionalBundles(email), admin: input.admin === true };
   }
   const picked = CHECKBOX_BUNDLES.filter((b) => input[b] === true);
   const rawOther = (input.otherBundles ?? '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -101,6 +99,16 @@ export function validateAddForm(input: Partial<AddForm>, existingAliases: string
         alias,
       };
     }
+  }
+  const refused = refusedBundlesFor(email, bundles);
+  if (refused.length > 0) {
+    return {
+      ok: false,
+      slug: 'E_VALIDATION',
+      message: `Google does not let a personal account grant ${refused.map((b) => `"${b}"`).join(', ')}.`,
+      hint: 'Leave it out, or link a Google Workspace account for it.',
+      alias,
+    };
   }
   return { ok: true, alias, email, bundles, admin: input.admin === true };
 }
@@ -140,8 +148,6 @@ export function scopeGrantDiff(requested: string[], grantedScope: string | undef
   return requested.filter((s) => !granted.has(s));
 }
 
-/** Persist a new account row (+ a per-account scope profile when bundles/admin
- * were chosen) through the atomic registry mutation path (BR2). */
 function writeAccountRow(alias: string, email: string, bundles: string[], admin: boolean): void {
   mutateConfigFile((current) => {
     const next = { ...current, accounts: { ...(current.accounts ?? {}) } };
@@ -160,9 +166,8 @@ function textResult(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-/** Wizard failures carry the same envelope as every other tool's, so a client
- * can branch on the slug and metrics can classify them. Success stays prose:
- * it is a human-readable onboarding report, not data. */
+// Errors use the shared envelope so clients can branch on slug; success stays
+// plain prose (a human-readable report, not data).
 function errorResult(slug: string, message: string, hint?: string, account?: string) {
   return {
     content: [{ type: 'text' as const, text: stringifyEnvelope({
@@ -178,7 +183,7 @@ function errorResult(slug: string, message: string, hint?: string, account?: str
 
 interface ConsentFailure { ok: false; slug: string; message: string; hint?: string }
 
-/** HTTP-transport consent context (S1.20): set by the HTTP bootstrap. When
+/** HTTP-transport consent context: set by the HTTP bootstrap. When
  * present, runConsent NEVER binds a server-side loopback listener — the
  * user's browser cannot reach the daemon's loopback — and instead hands out
  * a clientless AS consent URL. The injector decides the flow (single-owner =
@@ -193,9 +198,8 @@ export function setWizardHttpConsent(ctx: WizardHttpConsent | null): void {
   httpConsent = ctx;
 }
 
-/** Services register their tools at startup, so one first enabled by this
- * account stays unregistered until a restart; say so rather than claim the
- * whole account works without one. */
+// Services register tools at startup: an account's first-enabled service
+// stays unregistered until a restart, so say so rather than claim it just works.
 function restartNote(pending: readonly string[]): string {
   if (pending.length === 0) return '';
   const names = pending.map((s) => `"${s}"`).join(', ');
@@ -211,9 +215,6 @@ function pendingText(alias: string, url: string, pending: readonly string[]): st
   );
 }
 
-/** Run Google consent for `alias` and persist the token. Opens the browser via
- * URL-mode elicitation when the client supports it, else server-side + prints
- * the URL. Returns the granted-scope diff for the S4 report. */
 async function runConsent(server: McpServer, alias: string): Promise<{ ok: true; missing: string[] } | { ok: 'pending'; url: string } | ConsentFailure> {
   const { randomBytes } = await import('node:crypto');
   const cfg = getAccountSet().configs[alias];
@@ -226,9 +227,8 @@ async function runConsent(server: McpServer, alias: string): Promise<{ ok: true;
     };
   }
 
-  // HTTP transport: consent completes OUT OF BAND at the AS /callback. Never
-  // bind a loopback listener here; try URL-mode elicitation as a convenience
-  // but surface the URL UP FRONT either way (not only on failure).
+  // HTTP: consent completes out-of-band at the AS /callback; never bind a
+  // loopback listener; surface the URL up front, elicitation is just a convenience.
   const http = httpConsent;
   if (http) {
     let url: string;
@@ -242,15 +242,14 @@ async function runConsent(server: McpServer, alias: string): Promise<{ ok: true;
       try {
         await server.server.elicitInput(urlElicitationParams(alias, url, randomBytes(16).toString('hex')));
       } catch {
-        // the URL in the pending text is the recovery
+        // pending text has the recovery URL
       }
     }
     return { ok: 'pending', url };
   }
 
-  // Bind the ephemeral loopback listener BEFORE building the auth URL: the
-  // redirect URI needs the assigned port, and listening first means the
-  // callback can't race the browser.
+  // Bind the loopback listener before building the auth URL: the redirect URI
+  // needs the assigned port, and listening first avoids a race with the callback.
   const loop = await openLoopbackConsent();
   const client = buildConsentClient(loop.redirect);
   const expectedState = randomBytes(32).toString('hex');
@@ -264,9 +263,8 @@ async function runConsent(server: McpServer, alias: string): Promise<{ ok: true;
   let opened = false;
   if (caps?.elicitation?.url !== undefined) {
     try {
-      // elicitationId is REQUIRED by the spec schema; omitting it made every
-      // url-mode request fail client-side validation, so this branch always
-      // fell through to the server-side browser open.
+      // elicitationId is REQUIRED by the spec; omitting it silently fails
+      // client-side validation, falling through to the server-side browser open.
       const r = await server.server.elicitInput(
         urlElicitationParams(alias, url, randomBytes(16).toString('hex')),
       );
@@ -319,9 +317,8 @@ export function registerAccountWizardTools(
   server: McpServer,
   awaitingRestart: () => string[] = () => [],
 ): void {
-  // Registered as META (always-visible, like account_list) so onboarding tools
-  // are reachable in lazy mode without discover_all first; registerMeta still
-  // preserves the requiresUserInteraction clientMeta and skips the fan-out path.
+  // Registered as meta (like account_list) so onboarding tools are reachable in
+  // lazy mode without discover_all; this still preserves requiresUserInteraction and skips fan-out.
   const registerMeta = registry.registerMeta as unknown as (
     name: string,
     config: { description: string; inputSchema: Record<string, unknown>; annotations?: Record<string, unknown>; _meta?: Record<string, unknown> },
@@ -345,9 +342,8 @@ export function registerAccountWizardTools(
     },
     async (args: unknown) => {
       try {
-        // Env-sourced registry: GOOGLE_ACCOUNTS is the exclusive source and
-        // config.json accounts are ignored, so a wizard add would be a phantom
-        // write. Refuse up front (BR-10) rather than write a row nothing reads.
+        // GOOGLE_ACCOUNTS is the exclusive registry source when set; config.json
+        // is ignored, so refuse here rather than write a row nothing reads.
         if (process.env.GOOGLE_ACCOUNTS?.trim()) {
           return errorResult(
             'E_ENV_ACCOUNTS_MODE',
@@ -362,9 +358,8 @@ export function registerAccountWizardTools(
             'Run the `setup` prompt (/mcp__google-multi__setup) to create an OAuth client, then set them. See docs/google-cloud-setup.md.',
           );
         }
-        // S1: collect the registry row. Arguments win over the form so the
-        // wizard still works in clients without form elicitation (where the
-        // interactive path used to dead-end).
+        // Arguments win over the form so the wizard still works for clients
+        // without form elicitation support.
         const a = (args ?? {}) as { alias?: string; account?: string; email?: string; bundles?: string; allBundles?: boolean; admin?: boolean };
         let input: Partial<AddForm>;
         if (a.alias?.trim() || a.account?.trim() || a.email?.trim()) {
@@ -388,23 +383,20 @@ export function registerAccountWizardTools(
         const validated = validateAddForm(input, getAccountSet().aliases);
         if (!validated.ok) return errorResult(validated.slug, validated.message, validated.hint, validated.alias);
 
-        // S2: atomic write + make the alias callable without a restart (BR3).
+        // Atomic write + make the alias callable without a restart.
         writeAccountRow(validated.alias, validated.email, validated.bundles, validated.admin);
         invalidateAccountSet();
-        // Live account args validate against the refreshed registry already;
-        // the list_changed nudge makes clients re-fetch tools/list, where the
-        // advertised account enums are rebuilt from the live set.
+        // Account args already validate against the refreshed registry; the
+        // nudge just gets clients to re-fetch tools/list for the new account enum.
         try {
           server.sendToolListChanged();
         } catch {
-          // a client that cannot receive notifications loses nothing but the nudge
+          // harmless if unsupported
         }
 
-        // S3 + S4: consent + validate.
         const consent = await runConsent(server, validated.alias);
         if (consent.ok === 'pending') return textResult(pendingText(validated.alias, consent.url, awaitingRestart()));
         if (!consent.ok) return errorResult(consent.slug, consent.message, consent.hint, validated.alias);
-        // B15: offer to register the server with another MCP client.
         return textResult(
           `${s4Text(validated.alias, consent.missing, awaitingRestart())}\nTip: run account_write_config to register this server with another MCP client (Claude Desktop / Cursor / Claude Code).`,
         );
@@ -426,10 +418,8 @@ export function registerAccountWizardTools(
         // Plain string (NOT the account enum) so this never joins the
         // multi-account fan-out path; validated against the registry below.
         alias: z.string().min(1).optional().describe('Existing account alias to re-authenticate'),
-        // Every other tool in the server spells this `account`, so that is
-        // what a caller reaches for. Accepting both removes a dead end that
-        // no did-you-mean can rescue: `account` is 5 edits from `alias`, so
-        // the matcher cannot bridge them.
+        // Every other tool spells this `account`; accepting both avoids a dead
+        // end no did-you-mean can bridge (too many edits from `alias`).
         account: z.string().min(1).optional().describe('Alias of the account to re-authenticate (same as `alias`)'),
       },
     },
@@ -490,7 +480,7 @@ export function registerAccountWizardTools(
           mode = m.mode;
           resourceUri = m.resourceUri;
         } catch {
-          // stdio fallback on any config error
+          // fallback to stdio on error
         }
         let entry;
         try {
@@ -509,9 +499,8 @@ export function registerAccountWizardTools(
           if (client.managed === 'cli') {
             blocks.push(`${client.label}: run\n  ${instr.text}`);
           } else if (a.write && mode === 'http') {
-            // Over HTTP this tool runs on the DAEMON, whose homedir is not the
-            // caller's machine: write:true would edit the operator's own client
-            // configs (a cross-tenant hazard under tenancy). Snippet only.
+            // Over HTTP this runs on the daemon, not the caller's machine: write:true
+            // would edit the operator's own client configs (a tenancy hazard), so snippet only.
             blocks.push(`${client.label}: write:true is ignored over HTTP — this tool runs on the server, not your machine. Add to ${instr.path}\n${instr.text}`);
           } else if (a.write) {
             const res = applyFileEntry(client, name, entry);

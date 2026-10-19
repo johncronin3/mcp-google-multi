@@ -412,4 +412,33 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     expect(JSON.parse(text).error).toBe('Unauthorized');
     expect(String(headers['www-authenticate'] || '')).toContain('oauth-protected-resource');
   });
+
+  it('upstream duplicate-refresh grace does not open the house gate', async () => {
+    clearSessionGrant();
+    const anon = await request({
+      method: 'POST',
+      path: '/mcp',
+      token: null,
+      skipAuth: true,
+      host: publicMcpHost(),
+      body: { jsonrpc: '2.0', id: 9, method: 'initialize', params: {} },
+    });
+    expect(anon.status).toBe(401);
+    expect(JSON.parse(anon.text).error).toBe('Unauthorized');
+
+    const jwt = signJwt(
+      { typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: 'Not A Real Grant' },
+      60,
+    );
+    const wrong = await request({
+      method: 'POST',
+      path: '/mcp',
+      token: jwt,
+      host: publicMcpHost(),
+      body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
+    });
+    expect(wrong.status).toBe(403);
+    expect(JSON.parse(wrong.text).error).toBe('grant_unknown');
+    expect(wrong.text).not.toContain(GRANT_CODE);
+  });
 });

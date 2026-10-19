@@ -23,20 +23,16 @@ export function hostFilesRefused(account: string | undefined, what: string) {
 // path.basename() is a traversal guard — a caller-supplied filename must never escape savePath.
 export function prepareLocalDest(savePath: string, filename: string): string {
   const name = path.basename(filename);
-  // Agents routinely pass the intended FILE path as savePath and repeat the
-  // name in `filename`; a blind join would mkdir a directory named like the
-  // file and bury the download inside it, so strip the duplicated leaf.
+  // Agents routinely repeat the leaf in both savePath and filename; a blind
+  // join would bury the download in a directory named like the file itself.
   const dir = path.basename(savePath) === name ? path.dirname(savePath) : savePath;
   const dest = path.join(dir, name);
   fs.mkdirSync(dir, { recursive: true });
   return dest;
 }
 
-// fs.createReadStream() reports an unopenable path as an async 'error' EVENT;
-// with no listener attached, that single event kills the whole process — fatal
-// for the shared HTTP transport. Opening the fd first turns the open-failure
-// class (ENOENT/EACCES/...) into a normal rejection the caller's try/catch can
-// map to an error envelope.
+// createReadStream's open failure surfaces as an unhandled 'error' event that
+// kills the process; opening the fd first turns it into a normal rejection.
 export async function openLocalReadStream(localPath: string): Promise<fs.ReadStream> {
   const handle = await fs.promises.open(localPath, 'r');
   // open() succeeds on a directory; fail it here rather than as an async read error.

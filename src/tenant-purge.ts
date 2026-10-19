@@ -1,7 +1,5 @@
-// S1.21: tenant offboarding primitives. Core owns the reusable token-purge
-// legs (generically useful, tenant-id-agnostic); the tenant_delete
-// ORCHESTRATION (what to purge, in what order, from which admin surface)
-// lives with the tenancy module that calls these.
+// Tenant offboarding primitives: core owns the reusable token-purge legs;
+// orchestration (what to purge, in what order) lives with the tenancy module calling these.
 
 import fs from 'node:fs';
 import path from 'node:path';

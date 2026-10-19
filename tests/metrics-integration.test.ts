@@ -31,10 +31,8 @@ function rpc(id: number, method: string, params: unknown): string {
   return JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
 }
 
-/** Boot the stdio server, run the messages, then END STDIN after the last
- * response: the event loop drains (the flush timer is unref'd) and the
- * process exits through the `exit` flush hook. Signal-free on purpose:
- * Windows' SIGTERM emulation kills without running handlers. */
+// Ends stdin after the last response so the event loop drains and the
+// process exits through the `exit` flush hook; signal-free since Windows' SIGTERM emulation skips handlers.
 function runSession(env: NodeJS.ProcessEnv, messages: string[]): Promise<void> {
   const expected = messages.filter((m) => m.includes('"id"')).length;
   return new Promise((resolve, reject) => {

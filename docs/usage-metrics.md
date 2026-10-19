@@ -21,17 +21,19 @@ metrics port. Data leaves the machine only when the operator copies files.
 
 ## What is recorded
 
-Two layers under `$XDG_STATE_HOME/mcp-google-multi/metrics` (dir `0700`,
-files `0600`):
+Two layers under `${XDG_STATE_HOME:-~/.local/state}/mcp-google-multi/metrics`
+(or `USAGE_METRICS_PATH`; dir `0700`, files `0600`):
 
 - `agg/YYYY-MM-DD.json`: per-UTC-day aggregates. Per tool: call count, error
-  slugs, hint count, latency buckets, bucketed fan-out widths, argfix count.
+  slugs, hint count, latency buckets, bucketed fan-out widths, argfix count,
+  unknown-argument drops (counted by the declared key they resolve to).
   Per error class: hint coverage and retry self-correction. Escape hatch:
   resolved Discovery method ids and searched API keys. Protocol-level failures
   (schema validation, tool-not-found, enumerated JSON-RPC codes). Tool bigrams.
 - `events.jsonl`: a bounded raw tail (4 MB rotation, one rotated file), one
-  line per dispatch with **minute-precision** timestamps, tool name, ok flag,
-  error slug, latency, and a bucketed result size.
+  line per dispatch with **minute-precision** timestamps, a random per-boot id
+  and sequence number, tool name, ok flag, error slug, latency, and a bucketed
+  result size.
 
 Both layers are pruned to the newest 180 days. Every string written is a member
 of a closed vocabulary the server ships (registered tool names, the error-slug
@@ -49,7 +51,7 @@ text, hint text, exact result sizes.
 Honestly: on a single-user instance, this is that one person's tool-activity
 record: which tools ran, how often, on which days, at which minutes (in the
 tail), with latency and error-class distributions. The file contents carry no
-name, but the deployment might (a harvest filename, an adjacent token dir).
+name, but the deployment might (a directory name, an adjacent token dir).
 That is why timestamps are minute-coarse, sizes and fan-out widths are
 bucketed, and both layers age out at 180 days.
 

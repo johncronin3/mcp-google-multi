@@ -36,7 +36,7 @@ Existing encrypted tokens keep decrypting: upgrading alone never forces a re-aut
 | 10 | Email send | `body` is Markdown; `htmlBody` removed | rewrite callers ([§3](#3-email-format-breaking-both-directions)) | `E_HTMLBODY_REMOVED` |
 | 11 | Removed | `alertcenter` bundle removed | drop it from any scope config | `E_UNKNOWN_BUNDLE` |
 | 12 | Auth (opt-in) | HTTP `/mcp` + OAuth authorization server | opt-in only | n/a |
-| 13 | Auth | OAuth redirect URI now configurable | none (default preserved) | n/a |
+| 13 | Auth | local OAuth redirect: fixed `localhost:4242` → ephemeral loopback port | none with a Desktop app OAuth client | n/a |
 | 14 | Security | CRLF header-injection closed in email compose | none (input hardening) | n/a |
 | 15 | Behavior | an undeclared tool argument is now refused, not dropped | none for a correct caller; see [§4.3](#43-undeclared-arguments-are-refused-not-dropped) | `unknown_argument` |
 | 16 | Errors | caller-side 4xx split out of `upstream_error` | rebranch if you keyed on the slug; see [§4.4](#44-error-slugs-are-narrower) | `bad_request`, `internal` |
@@ -58,7 +58,7 @@ node -v            # must be >= 22
 nvm install 22 && nvm use 22
 ```
 
-`doctor` adds a line: `Node version: OK 22.x (>=22 required)`.
+`doctor`'s Runtime section prints `Node.js 22.x (>= 22)`.
 
 **Free win (already yours on current v5.x):** the switch from the `googleapis` monolith to right-sized `@googleapis/*` packages shrank install/download ~85% (≈218 MB → ≈32 MB; npx ≈18.6 MB → ≈4.2 MB) with byte-identical types. This shipped as a v5 minor *ahead* of v6, so a current v5 user already has it.
 
@@ -132,7 +132,7 @@ This is the one behavior change likely to touch your callers.
 
 | Direction | v5 | v6 | Your action |
 |---|---|---|---|
-| **Read** | HTML-only body flattened to text | HTML-only body → **Markdown** (via turndown); `text/plain` mail is unchanged; a new `bodyFormat` field is `markdown` or `text/plain` | branch on `bodyFormat`; pass `rawHtml:true` when you need the raw HTML source |
+| **Read** | HTML-only body flattened to text | HTML-only body → **Markdown** (via turndown); `text/plain` mail is unchanged; a new `bodyFormat` field is `markdown`, `plain`, or `html` (with `rawHtml:true`) | branch on `bodyFormat`; pass `rawHtml:true` when you need the raw HTML source |
 | **Send** | `body` = plain text; `htmlBody` = optional HTML | `body` = **Markdown** (rendered to a `multipart/alternative` with an auto-generated HTML part); **`htmlBody` is removed** | author `body` as Markdown; drop `htmlBody`; use `allowRawHtml:true` for the rare raw-HTML case |
 
 **Silent trap: read this even if you never used `htmlBody`.** A v5 caller that passed only `body` with *plain prose containing Markdown metacharacters* now has it rendered as Markdown. Text like `# 1 priority`, `Cost: $5 * 3`, `> quoted`, or `[x] done` will render as a heading, emphasis, a blockquote, or a task item. If your prose isn't meant to be Markdown, escape the metacharacters or send it with `allowRawHtml:true` wrapping pre-escaped HTML.
@@ -155,7 +155,7 @@ Passing `htmlBody` now returns `E_HTMLBODY_REMOVED` with the exact rewrite. Colo
 +   allowRawHtml: true })
 ```
 
-Additive email conveniences you now also get (nothing to migrate): attachments on both `gmail_send` and `gmail_create_draft`, reply auto-fill of to/cc/subject from `replyToMessageId`, `gmail_read_batch`, and an agent-callable contact/alias resolver. The old hand-rolled header encoders (a CRLF-injection surface) are gone: MailComposer validates and encodes headers and rejects embedded newlines.
+Additive email conveniences you now also get (nothing to migrate): attachments on both `gmail_send` and `gmail_create_draft`, reply auto-fill of to/cc/subject from `replyToMessageId`, `gmail_read_batch`, and an agent-callable contact/alias resolver (`contacts_resolve`). The old hand-rolled header encoders (a CRLF-injection surface) are gone: MailComposer encodes headers, and a pre-check refuses CR/LF in `from`/`to`/`cc`/`subject` with `E_HEADER_INJECTION`.
 
 ---
 
@@ -275,7 +275,7 @@ Only the first can be branched on. The second gives a different `error` value fo
 
 All three are now the first shape. Concretely:
 
-- **16 argument guards** across `admin`, `chat`, `contacts`, `docs`, `sheets` and `tasks` (the "no fields to update" and "supply one of X" checks) now return `invalid_params` with the fault in `message` and the list of accepted fields in `hint`.
+- **The argument guards** in the curated tools (the "no fields to update" and "supply one of X" checks) now return `invalid_params` with the fault in `message` and the list of accepted fields in `hint`.
 - **The account wizard** (`account_add`, `account_reauth`, `account_write_config`) returns envelopes. The slugs are `E_ENV_ACCOUNTS_MODE`, `E_VALIDATION`, `E_ALIAS_EXISTS`, `E_UNKNOWN_BUNDLE`, `elicitation_unsupported`, `confirmation_declined`, `invalid_client`, `auth_required` and `internal`. Wizard **success** output stays prose: it is an onboarding report meant to be read, not parsed.
 - **`account` is now carried** by `write_disabled`, by the `drive_transfer` and `drive_read` outcomes, and by the `docs_read` tab and heading errors, so a fan-out result can be attributed to the account that produced it. It is formally optional, because a few failures genuinely happen before any account is resolved.
 - **`ambiguous_heading` is gone**; `docs_read` reports an ambiguous heading as `ambiguous`, the slug already used elsewhere for the same condition.
@@ -333,11 +333,48 @@ declared explicitly (`mcp-google-multi/identity`, `/compose`, `/registry`,
 `/oauth-as`, `/accounts`, `/token-store`, `/http-transport`, `/http-config`,
 `/client`, `/config-file`, `/fs-atomic`, `/master-key`, `/mcp-token`,
 `/boot-gates`, `/tenant-purge`, `/doctor`, `/write-control`,
-`/scope-catalog`, `/auth`). Any OTHER deep import into `dist/` (previously unrestricted, e.g.
-`mcp-google-multi/dist/trim.js`) now fails with
+`/scope-catalog`, `/auth`, `/usage-metrics`, `/metrics-tap`,
+`/hint-provider`). Any OTHER deep import into `dist/` (previously
+unrestricted, e.g. `mcp-google-multi/dist/trim.js`) now fails with
 `ERR_PACKAGE_PATH_NOT_EXPORTED`. The CLI (`npx mcp-google-multi ...`) and the
 MCP server entry are unaffected. If you relied on an undeclared deep import,
 open an issue naming the module so it can be promoted to a declared entry.
+
+`/usage-metrics` and `/metrics-tap` are new declared entries: a host serving
+several callers over one process can drive its own `Metrics` instance instead
+of the single-owner default. `InitOptions` gains `eventLog` (default true;
+false means no `events.jsonl` / `events.1.jsonl` is ever created, only the
+day aggregate) and `extraErrorSlugs` (default none; a host's own closed slug
+set, unioned with `KNOWN_ERROR_SLUGS` for that instance, each entry matching
+`/^[A-Za-z][A-Za-z0-9_]{0,63}$/` or dropped). `sequencingEnabled: false` now
+also keeps `mid` off the next event: an escape-hatch method resolved during
+one `google_api_call` no longer attaches to whichever `google_api_call`
+records next, which on a shared instance could belong to a different caller.
+
+`/hint-provider` is a new declared entry: a host serving more than one
+identity over one process (a single owner never needs this) can install one
+process-global `HintProvider` with `setHintProvider(provider)`, exported
+alongside `hints()`, the `HintCase` discriminated union and the `HINT_KINDS`
+tuple. With no provider installed every remediation hint in the server is
+byte-identical to today's; a provider's `render(c: HintCase)` returns
+`{ hint, message?, retriable? }` for whichever case fired (a dead token, a
+scope gap, a write refusal, an operator-only condition, and so on), letting a
+multi-tenant host reword every operator-facing hint (an env var, a CLI
+command, a config path) into something its own tenants can act on.
+`ServiceHints` (passed to `handleGoogleApiError` by Forms, Slides, Chat,
+Analytics and Admin) gains an optional `bundle` naming the scope bundle a
+403 is about; a bare-string `ServiceHints` keeps its old meaning (the scope
+hint) and carries no bundle. `HttpHostOptions.resolveServer` may now also
+return `{ refused: { error, message } }` to answer a verified subject with a
+host-chosen 403 body instead of the generic `tenant_not_found`;
+`AuthServerDeps.resolveSubject` may now also return
+`{ denied: { description } }` to add an `error_description` to the
+`access_denied` sign-in redirect. Neither seam introduces a new slug into
+core itself. **Adding a member to `HintCase` is a breaking change for any
+provider written as an exhaustive switch (a multi-tenant host's typically
+is): such a provider fails to typecheck against a newer core until it
+handles the new case, so it ships behind a minor pin bump, never a silent
+repin.**
 
 `buildRegistry(server, ctx)` resolves every registered tool through `ctx`:
 the client, token reads, account emails (the From header, `drive_transfer`'s
@@ -486,22 +523,6 @@ threw inside the catch-all, and the unhandled rejection it produced
 terminates the process under Node's default `--unhandled-rejections=throw`.
 This applies with or without `graceMs`.
 
-`/mcp-token`: `RefreshStore` still keeps at most 2,000 rotated-away refresh
-tokens, but over that cap it now drops the oldest entry of the subject holding
-the most (ties: the subject whose oldest entry is oldest) instead of the oldest
-entry overall, so one subject's refreshes can no longer push out another's and
-disarm its theft detection. A subject is the `sub` of the family's active token
-and its families share one budget, so a subject that opens many families
-dilutes only itself. A subject's entry is dropped only while it holds at least
-as many as every other subject, so with S subjects holding spent tokens, each
-keeps at least its floor(2000 / S) most recent, and a subject evicts another's
-history only when that other holds at least as many. A single subject keeps
-exactly the last 2,000 rotations across all its families, oldest first, as
-before. A family with no active token left (revoked, refused by `accept`, or
-purged) keeps none. An older token is still refused (`invalid_grant`) without
-revoking. The store file keeps its shape and encryption: a file from an earlier
-release loads as is, and an earlier release reads a file this one wrote.
-
 `/http-transport`: a request whose handler throws before its response starts
 is answered 500 `{"error":"internal_error","message":"internal error"}`.
 Before, `message` was the thrown message, which can name server paths (a lock
@@ -509,6 +530,25 @@ timeout names the lock file). The real message now goes to
 `HttpHostOptions.log` as `500 internal_error path=<pathname>: <message>`,
 without the query string. The slug is unchanged; a caller that parsed the
 message must read the server log instead.
+
+`/http-transport`: a value taken from a request no longer reaches a log line
+as it arrived. The Host or Origin on `403 host_rejected host=` and
+`403 origin_rejected origin=` is cut to 64 characters and the message on
+`500 internal_error path=<pathname>: ` to 200; a cut value ends in
+`...(len=N)` with its full length. In every value, C0 and C1 controls, DEL,
+U+2028, U+2029 and the bidi and invisible format controls (U+061C, U+200E,
+U+200F, U+202A to U+202E, U+2066 to U+2069) are written as a literal
+`\uXXXX`, so no value can start a second line. A backslash is left as is, so
+a clean value reads exactly as before. The `200 /mcp method=` line prints the
+method only when it is a string of 1 to 64 characters from `[A-Za-z0-9_./$-]`,
+and `<invalid>` otherwise; a batch lists its first four methods, then `+N`.
+Before, the method was printed uncapped, and one whose `String()` throws
+turned an answered request into a `500 internal_error` line and a cut
+connection. The text before each value is unchanged, so a host can still
+match these lines by reason. The same escaping is exported as
+`logSafe(value, max)`: it never throws (a value that cannot be printed comes
+back as `<unprintable>`), and its output passes through it again unchanged
+under a cap it fits.
 
 Discovery cache: directory levels `loadMethodIndex` creates are now 0700. On
 the default path (`DISCOVERY_CACHE_PATH` unset) an existing directory this
@@ -537,6 +577,50 @@ The message now goes to `AuthServerDeps.log` as
 status are unchanged, and a rejection that is not an `Error` gets the same
 page instead of an unhandled route error.
 
+`/oauth-as`: the CIMD client-metadata fetch follows the CIMD draft. A
+redirect is refused (`CIMD redirect refused`) instead of followed: before,
+only the first URL was checked against `MCP_CIMD_ALLOWED_ISSUERS`, so an open
+redirect on an allowlisted host could serve a document that claimed the
+original client_id. A document over 5,120 bytes is refused (was 64 KB). One
+8 s deadline covers the whole fetch, DNS lookup included, with one retry of a
+fast transient failure: a reset, a refused connection, or a resolver that
+could not answer (was two retries per hop, no timer covered the lookup, and
+any DNS failure was final). An attempt that times out is not retried, and
+while four earlier CIMD lookups have not returned, abandoned ones included, a
+new fetch starts none and fails at once as transient. At most four fetches
+run at once, and a request for a client_id already being fetched waits on
+that fetch. Over that cap `GET /authorize` answers 503
+`{"error":"temporarily_unavailable","message":"the client could not be
+checked right now; retry shortly"}` with `Retry-After: 5`, except that a
+client whose document validated in the last 24 hours is served that document.
+Only a document that validates is cached (5 minutes, at most 256 client_ids):
+one whose `client_id` does not match, or that lists no `redirect_uris`, is
+fetched again on the next request. A refetch that times out, cannot connect
+or resolve for now, or gets HTTP 408, 429 or 5xx keeps the cached copy, and a
+copy validated in the last 24 hours answers that request and every request
+waiting on it in place of the error (before, an issuer answering 503 failed
+the sign-in); any other failure, another HTTP status included, drops the
+copy. An injected `AuthServerDeps.fetchCimd` sits behind the same cap and
+cache; its errors keep the copy only when they are transient by name or code
+(`AbortError`, `TimeoutError`, `ECONNRESET` and the like), because the HTTP
+status rule relies on an error class that is not exported.
+
+`/oauth-as`: `AuthServerDeps.log` lines escape and cap what they echo, as
+`/http-transport` does: client_ids (128 characters), aliases (64), the email
+Google returned (254), refusal slugs (64) and error messages (200, or 300 on
+`callback exchange failed`, which now escapes a line break instead of
+collapsing it to a space). `CIMD rejected` now reads
+`CIMD rejected: issuer=<scheme>//<host> not allowlisted client_id_len=<N>`:
+the client_id's path, which an unauthenticated caller picks freely, is no
+longer logged. `CIMD fetch failed` is logged once per fetch rather than once
+per waiting request, the loopback-only `redirect_uris` warning once per fetch
+rather than on every sign-in, and over the cap
+`CIMD busy: in-flight cap reached` at most once a minute, the next one adding
+`(n=K suppressed)`. `POST /register` answers 400 `invalid_client_metadata` to
+a body that is not a JSON object, or to a `redirect_uris` entry that is not a
+string. Before, a `null` body or an entry like `{"toString":1}` was a 500, and
+a number entry was coerced to a string.
+
 `/mcp-token`: `RefreshStore` now looks a presented refresh token up among the
 store's own entries only, and drops on load any record without a string
 subject and family. Before, a value such as `constructor` matched an inherited
@@ -562,18 +646,119 @@ that was reachable from the internet:
    account's Google access, and review mail forwarding, filters and delegates,
    Drive sharing, and files written by the server's user.
 
+`/mcp-token`: refresh tokens have a new format. A token is `r1.` followed by
+91 base64url characters. It carries its family id and a generation number,
+authenticated with a key derived from `MASTER_KEY` (a passphrase key goes
+through scrypt first, so the first refresh-token operation after start costs
+about 32 MB and a fraction of a second once), and the store keeps only each
+family's current generation (hashed). Presenting any token a family has
+rotated away, however long ago, now revokes the family for the rest of its
+life. Before, the store remembered at most 2,000 rotated-away tokens, and an
+older one was only refused. The store no longer keeps a list of rotated-away
+tokens, so its size follows the number of sessions, not the number of
+refreshes. A token that is not well formed is refused without touching the
+store file. Tokens issued by an earlier release keep working: each one is
+exchanged for a new-format token on its next refresh, and the rotated-away
+tokens an earlier release still remembered keep revoking the session. Until
+then an earlier-release session is stored under its live token, so deleting
+`mcp-tokens.enc` is the way to retire them all at once (every client signs in
+once). `RefreshStore.issue(nowMs, sub)` no longer takes a family id.
+`new RefreshStore(path, masterKey, { maxAgeSec, idleSec, log })` optionally
+ends a session a fixed time after its sign-in, or after a time without a
+refresh. An expired session is refused (`invalid_grant`) and removed. Both
+are unset by default: sessions last until revoked, as before. A value that is
+not a positive whole number throws `E_REFRESH_OPTION_INVALID`. With a
+lifetime set, a stored time more than five minutes ahead of the clock is
+pulled back to it. The optional `log` receives one line per revoked or
+dropped family, with a short family tag (`tag=` and 8 hex characters), and
+count lines (`n=`) for expired sessions, sessions dropped by `accept` and
+clamped timestamps. No line carries a token or a subject. A store file
+written by a newer release (any `format` other than 2) is refused with
+`E_REFRESH_STORE_FORMAT` rather than read as empty;
+`assertRefreshStoreReadable(path, masterKey)` runs the same check at boot (and
+throws `E_REFRESH_STORE_UNREADABLE` for a file that does not decrypt).
+`refreshFamilyTagger(masterKey)` returns a function that maps a well-formed
+token to a short non-secret family tag (for rate limiting and log correlation)
+without touching the store.
+
+`new RefreshStore(path, masterKey, { maxFamiliesPerSub, ... })` optionally
+bounds how many live refresh-token families one subject may hold (both
+formats counted together). Unset by default: unlimited, as before. When an
+`issue()` would put a subject over the limit, that subject's own
+least-recently-used family (by its last issue or rotation time) is dropped,
+repeatedly if needed, until it fits; a dropped family is logged exactly like
+a revoked one (`refresh family dropped: cap tag=...`) and can never be
+presented again. Only the subject signing in triggers this, and only its own
+families are ever touched; every other subject's sessions are unaffected. A
+value that is not a positive whole number throws `E_REFRESH_OPTION_INVALID`,
+same as `maxAgeSec`/`idleSec`.
+
+`/oauth-as`: `AuthServerConfig.refreshMaxAgeSec` and `refreshIdleSec` set
+`maxAgeSec` and `idleSec` on the refresh store `buildAuthServer` creates, and
+that store now logs revoked, dropped and expired families through
+`AuthServerDeps.log`. Setting either field while also passing
+`AuthServerDeps.refreshStore` throws `E_REFRESH_OPTION_CONFLICT`; set them on
+that store instead. The owner's server sets neither. With a lifetime set, keep
+the host clock synchronized: a clock that jumps forward ends every session
+(clients sign in again), and the log says so. `refreshMaxFamiliesPerSub` sets
+`maxFamiliesPerSub` on that same store the same way: unset by default
+(unlimited; the owner's server sets none), validated as a positive whole
+number, and in the same `E_REFRESH_OPTION_CONFLICT` if a `refreshStore` is
+also injected.
+
+`/mcp-token`: `ReplayGuard` no longer forgets a spent state, approval or
+authorization code that is still live to make room. Before, a full guard
+dropped its oldest entry, so a flood of cheap sign-in steps could make a
+spent artifact usable again, among them a callback the owner_gate browser
+binding had refused, which could then be finished from the browser that
+started it. `ReplayGuard.spend(jti, ttlMs, nowMs, artifactExpMs?)` returns
+`ok`, `replay` or `full`, and keeps the record at least until the artifact's
+own expiry; `consume` keeps its boolean and answers false for both refusals.
+`ReplayGuard.reserve(jti, ttlMs, nowMs)` holds a slot for an artifact about
+to be handed out: every state sent to Google is reserved when it is minted,
+so its `/callback` always finds room and a refusal there is always recorded,
+and a flood is refused at `/authorize` instead. `ReplayGuard.unspend(jti)`
+gives back a spend whose next step could not go ahead, so an approval or
+add-account link refused for a full guard works on retry. Expired entries are
+dropped only when the guard is at its cap, in one sweep at most once a
+second, and a refusal in between costs O(1). The default cap is 100,000 (was
+10,000; about 13 MB when full). On a full guard the browser steps answer 503
+`E_SIGNIN_BUSY` with `Retry-After: 60`, and `/token` answers 503
+`temporarily_unavailable` with `Retry-After: 5`, instead of reading as a
+replay; `AuthServerDeps.log` gets `replay guard full: sign-in refused` at
+most once a minute. Authorization codes are not reserved, so during a flood
+`/token` can refuse a sign-in that already passed `/callback`; the client may
+retry within the code's 60 s. A `/token` that answers 503 because
+`subjectActive` threw now gives the code back, so that retry redeems it
+(before, it answered `already redeemed`). States, approvals and authorization
+codes are signed with a key each AuthServer (each `buildAuthServer` call)
+generates, and verified against the AuthServer's clock
+(`AuthServerDeps.now`); `MCP_JWT_KEY` still signs access tokens and re-auth
+links. So a restart invalidates every sign-in in flight and the user starts
+it again, instead of a spent or unreserved one passing the new, empty guard;
+a `mintFlowState` URL works only on the AuthServer that minted it, two
+replicas behind one base do not accept each other's sign-in steps, and
+artifacts made with the exported `signState`, `signPending` or
+`signAuthzCode` under `AuthServerConfig.secret` are no longer accepted by the
+routes. `verifyState`, `verifyPending` and `verifyAuthzCode` take an optional
+`nowSec`. A flood now blocks sign-ins instead of reopening them: 100,000
+requests in any 10-minute window fill the guard, about 170 a second keep it
+full, and sign-ins recover within a second of a sustained flood stopping, or
+up to 10 minutes after a burst; a public deployment still needs a per-IP rate
+limit on `/authorize`, `/callback` and `/token` in front of it.
+
 ## 5. Auth changes
 
 ### 5.1 New: HTTP transport + `/mcp` OAuth (opt-in, additive)
 
-stdio stays the default. HTTP exists mainly so Claude Code's native `/mcp` Authenticate button (`claude mcp login`), keychain, and auto-refresh work, and so the claude.ai connector can reach the server.
+stdio stays the default. HTTP exists mainly so Claude Code's native `/mcp` Authenticate button, keychain, and auto-refresh work, and so the claude.ai connector can reach the server.
 
 | Item | Behavior |
 |---|---|
 | Model | **Federate-and-hold.** The server is its own OAuth 2.1 authorization server to the client (audience-bound token) and separately runs the Google flow, holding Google tokens server-side. It never passes the client token to Google, and never accepts a Google token from the client. |
 | Owner gate | `MCP_OWNER_EMAILS` allowlists the Google account(s) allowed to authenticate. It is **required** whenever `MCP_TRANSPORT` includes `http`; empty ⇒ startup fails with `E_OWNER_EMAILS_REQUIRED`. |
 | Client registration | CIMD **plus** a minimal DCR `/register` endpoint, on by default. |
-| Redirect URI | Now configurable (was hardcoded `http://localhost:4242/oauth2callback`); the default is preserved for local use. Remote HTTP uses `${MCP_PUBLIC_URL}/callback`. |
+| Redirect URI | The local `auth` flow binds an ephemeral loopback port (`http://localhost:<port>/oauth2callback`, was fixed at `4242`), which a Desktop app OAuth client accepts. Remote HTTP uses `${MCP_PUBLIC_URL}/callback`, registered on a Web application OAuth client. |
 | Turn it on | `MCP_TRANSPORT=http` + the connector URL in your client. Full walkthrough in **[docs/http-setup.md](./docs/http-setup.md)**, including the Cloudflare **named** tunnel path (quick tunnels are demo-only) and one-click Render/Railway deploys. |
 | Trust caveat | Behind a tunnel, **Cloudflare terminates TLS and can see the bearer token and all Gmail/Drive bytes in transit.** This is a trust boundary you accept, not a bug. |
 
@@ -589,7 +774,7 @@ The encrypted-store crypto is unchanged (AES-256-GCM). Existing `<alias>.enc` fi
 | You change a scope profile | Yes: that account only |
 | You move an account to `admin` | Yes: that account |
 
-v6 names the exact accounts that need re-auth instead of letting calls 403 later. Where your client supports it, an expired Google refresh token (the 7-day "Testing" mode trap) is surfaced as an MCP auth challenge so the client re-runs the flow and resumes the original call: self-healing that depends on the client honoring the challenge. The durable fix is still setting your Google app's Publishing status to **In production**.
+v6 names the exact accounts that need re-auth instead of letting calls 403 later. An expired Google refresh token (the 7-day "Testing" mode trap) returns `reauth_required` with a hint: over stdio the `auth --account` command, over HTTP a server-signed re-auth link. The durable fix is setting your Google app's Publishing status to **In production**.
 
 Re-auth a named account with:
 
@@ -604,7 +789,7 @@ mcp-google-multi auth --account <alias>
 | Item | Behavior |
 |---|---|
 | v5 | `MASTER_KEY` was hard-required in env; the server exited if it was missing. |
-| v6 | Resolves in order: **env → OS keychain → generate-on-setup.** Generated keys are stored in the OS keychain with a `0600`-file fallback. `doctor` shows provenance (`MASTER_KEY: env | keychain | file`). |
+| v6 | Resolves in order: **env → OS keychain → `0600` `master.key` file in the config directory → generate.** A generated key is always written to that file, with a best-effort OS keychain copy. `doctor` shows provenance (`MASTER_KEY provenance: env`, `keychain`, `file` or `generated`). |
 | Hard safety guard | If encrypted tokens already exist and **no** key is recoverable, v6 **refuses** to generate a new one and errors (`E_MASTER_KEY_MISSING_TOKENS_EXIST`), routing you to the reset path rather than silently bricking your tokens. |
 | Server deploys | Keep providing `MASTER_KEY` via env / your secret manager. |
 
@@ -624,7 +809,7 @@ This protects tokens **at rest**, not against same-user malware: exactly like a 
 0. Read [Breaking changes at a glance](#breaking-changes-at-a-glance). Back up `~/.config/mcp-google-multi/` (copy the whole directory).
 1. Upgrade Node to ≥ 22 (`nvm install 22 && nvm use 22`).
 2. Keep or place your `.env`. It can stay in the working directory / package root (still loaded), or move to `~/.config/mcp-google-multi/.env`, or point `MCP_GOOGLE_MULTI_ENV` at it. Keep `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and (if set) `MASTER_KEY` there.
-3. Install v6: `npx -y mcp-google-multi@6` (or bump the `claude mcp` entry / your MCPB bundle).
+3. Install v6: `npx -y mcp-google-multi@6` (or bump the `claude mcp` entry / your MCPB bundle). Before 6.0.0 ships, the prereleases are on the npm `staging` (beta) and `dev` (alpha) tags.
 4. Run `mcp-google-multi migrate-config`: writes `config.json` from the old env vars and prints a diff. Nothing is deleted; env still overrides.
 5. Run `mcp-google-multi doctor`. Fix anything red. It exits non-zero on failure; `--json` for scripts; `--report` emits a redacted, paste-ready bug report.
 6. Re-auth only the accounts `doctor` names: `mcp-google-multi auth --account <alias>`.
@@ -636,10 +821,13 @@ This protects tokens **at rest**, not against same-user malware: exactly like a 
 
 ## 9. Rollback and downgrade traps
 
-v6 does not touch v5 tokens and does not overwrite v5 env, so rollback is clean: reinstall `mcp-google-multi@5`, keep `.env` where v5 expects it (working directory / package root), ignore `config.json`. No data is lost. Two traps to know before you downgrade:
+v6 does not touch v5 tokens and does not overwrite v5 env, so rollback is clean: reinstall `mcp-google-multi@5`, keep `.env` where v5 expects it (working directory / package root), ignore `config.json`. No data is lost. Traps to know before you downgrade:
 
-- **`MASTER_KEY` keychain-only.** If v6 auto-provisioned `MASTER_KEY` into the OS keychain with **no** env copy, an env-only v5 cannot find it and token decryption breaks. Before downgrading, export the key from the keychain into `.env` (or, during any period you might roll back, keep `MASTER_KEY` in env rather than keychain-only). v6 also mirrors an env key into the keychain on first successful decrypt to reduce this risk.
+- **`MASTER_KEY` not in env.** If v6 auto-provisioned `MASTER_KEY` (into `master.key` and possibly the OS keychain) with **no** env copy, an env-only v5 cannot find it and token decryption breaks. Before downgrading, copy the key from `~/.config/mcp-google-multi/master.key` (or the keychain) into `.env` (or, during any period you might roll back, keep `MASTER_KEY` in env rather than keychain-only). v6 also mirrors an env key into the keychain on first successful decrypt to reduce this risk.
 - **`config.json` version.** A future `config.json` written by a newer v6 (`version: 2`) is rejected by an older reader with `E_CONFIG_VERSION_UNSUPPORTED` rather than crashing: but that also means a newer file won't load on an older binary. If you downgrade across a config-version bump, restore the older `config.json` from your backup (step 0).
+- **MCP refresh tokens after a downgrade across the refresh-format change.** An older release does not recognise the new refresh tokens. Every MCP client therefore signs in again once, and the older release's first write to `mcp-tokens.enc` discards the new-format sessions. Nothing is exposed, and after upgrading again those sessions sign in once more. Do not run two versions against one `mcp-tokens.enc` at the same time: each write by the older one signs out every new-format session.
+- **Do not restore `mcp-tokens.enc` from a backup.** A restored file is behind the clients (they are signed out anyway) and brings back sessions that were revoked for theft since the backup. Delete the file instead; every client signs in once.
+- **`E_REFRESH_STORE_FORMAT` on `/token`.** The refresh store file was written by a newer release. Upgrade, or delete `mcp-tokens.enc` to sign every MCP client out.
 
 Email and tool-visibility changes are code-level only: downgrading the package restores v5 behavior with no data implication.
 

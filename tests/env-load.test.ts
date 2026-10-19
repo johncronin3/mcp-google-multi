@@ -38,20 +38,20 @@ afterEach(() => {
 });
 
 describe('loadEnvFiles', () => {
-  it('T1: no .env on any tier loads nothing and does not throw', () => {
+  it('no .env on any tier loads nothing and does not throw', () => {
     const res = loadEnvFiles(dirs());
     expect(res.loaded).toEqual([]);
     expect(res.searched).toHaveLength(3);
   });
 
-  it('T2: .env only in the config dir reaches process.env', () => {
+  it('.env only in the config dir reaches process.env', () => {
     writeFileSync(path.join(configDir, '.env'), 'EL_A=from-config\n');
     const res = loadEnvFiles(dirs());
     expect(process.env.EL_A).toBe('from-config');
     expect(res.loaded).toEqual([path.join(configDir, '.env')]);
   });
 
-  it('T3: MCP_GOOGLE_MULTI_ENV replaces the file search entirely', () => {
+  it('MCP_GOOGLE_MULTI_ENV replaces the file search entirely', () => {
     writeFileSync(path.join(configDir, '.env'), 'EL_A=from-config\nEL_B=config-only\n');
     const pointed = path.join(base, 'pointed.env');
     writeFileSync(pointed, 'EL_A=from-pointed\n');
@@ -62,7 +62,7 @@ describe('loadEnvFiles', () => {
     expect(res.searched).toEqual([pointed]);
   });
 
-  it('T3b: a missing MCP_GOOGLE_MULTI_ENV path is fatal with E_ENV_NOT_FOUND', () => {
+  it('a missing MCP_GOOGLE_MULTI_ENV path is fatal with E_ENV_NOT_FOUND', () => {
     process.env.MCP_GOOGLE_MULTI_ENV = path.join(base, 'nope.env');
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const exit = vi
@@ -74,7 +74,7 @@ describe('loadEnvFiles', () => {
     expect(String(stderr.mock.calls[0]?.[0])).toContain('nope.env');
   });
 
-  it('T4: precedence is real env > CWD > package-root > config dir', () => {
+  it('precedence is real env > CWD > package-root > config dir', () => {
     process.env.EL_REAL = 'boot';
     writeFileSync(
       path.join(configDir, '.env'),
@@ -89,7 +89,7 @@ describe('loadEnvFiles', () => {
     expect(process.env.EL_C).toBe('config');
   });
 
-  it('T6: pre-22 Node (no process.loadEnvFile) fails fast with E_NODE_TOO_OLD, no TypeError', () => {
+  it('pre-22 Node (no process.loadEnvFile) fails fast with E_NODE_TOO_OLD, no TypeError', () => {
     const original = process.loadEnvFile;
     // @ts-expect-error simulating a pre-22 runtime
     process.loadEnvFile = undefined;

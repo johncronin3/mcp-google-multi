@@ -6,7 +6,7 @@ import { analyticsadmin as analyticsadminClient } from '@googleapis/analyticsadm
 import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient, type CuratedToolDeps } from '../client.js';
-import { handleGoogleApiError } from './_errors.js';
+import { handleGoogleApiError, invalidParams } from './_errors.js';
 
 
 /** Accepts "213025502" or "properties/213025502"; rejects the identifiers
@@ -113,10 +113,16 @@ const propertySchema = z
     'GA4 property: numeric ID like "213025502" or "properties/213025502" — NOT a "G-..." measurement ID and not "UA-...". Find yours with analytics_account_summaries.',
   );
 
+// Accepts this server's plain string form and the native GA4 API shape ({name}),
+// so a request built against GA4's own docs works unmodified.
+const metricOrDimensionRef = z.union([z.string(), z.object({ name: z.string() })]);
+const nameOf = (ref: string | { name: string }): string => (typeof ref === 'string' ? ref : ref.name);
+
+const dateRangeRef = z.object({ startDate: z.string(), endDate: z.string() });
+
 export function registerAnalyticsTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -148,18 +154,21 @@ export function registerAnalyticsTools(server: ToolRegistry, deps: CuratedToolDe
     'analytics_run_report',
     {
       description:
-        'Run a Google Analytics (GA4) report: metrics over a date range, optionally grouped by dimensions — the workhorse for questions like "how many users last week, by country". Dates accept YYYY-MM-DD or relative forms ("today", "yesterday", "28daysAgo"). Unsure which dimension/metric names are valid? Call analytics_get_metadata first.',
+        'Run a Google Analytics (GA4) report: metrics over a date range, optionally grouped by dimensions — the workhorse for questions like "how many users last week, by country". Dates accept YYYY-MM-DD or relative forms ("today", "yesterday", "28daysAgo"). Also accepts the native GA4 request shapes directly: a single dateRanges entry in place of startDate/endDate, and metrics/dimensions as {name} objects. Unsure which dimension/metric names are valid? Call analytics_get_metadata first.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         property: propertySchema,
-        startDate: z.string().describe('Start date: YYYY-MM-DD or relative ("today", "yesterday", "NdaysAgo" e.g. "28daysAgo")'),
-        endDate: z.string().describe('End date: YYYY-MM-DD or relative ("today", "yesterday", "NdaysAgo")'),
-        metrics: coerceArray(z.string()).describe(
-          'Metric API names, e.g. ["activeUsers","sessions","screenPageViews"]. Max 10. Valid names (including custom ones) come from analytics_get_metadata.',
-        ),
-        dimensions: coerceArray(z.string())
+        startDate: z.string().optional().describe('Start date: YYYY-MM-DD or relative ("today", "yesterday", "NdaysAgo" e.g. "28daysAgo"). Required unless dateRanges is given.'),
+        endDate: z.string().optional().describe('End date: YYYY-MM-DD or relative ("today", "yesterday", "NdaysAgo"). Required unless dateRanges is given.'),
+        dateRanges: coerceJson(z.array(dateRangeRef))
           .optional()
-          .describe('Dimension API names to group by, e.g. ["date"] or ["country","deviceCategory"]. Max 9. Omit for a single total row.'),
+          .describe('Native GA4 shape, as an alternative to startDate/endDate: exactly one {startDate, endDate} entry (this tool runs one range per call).'),
+        metrics: coerceArray(metricOrDimensionRef).describe(
+          'Metric API names, e.g. ["activeUsers","sessions","screenPageViews"], or the native GA4 [{"name":"activeUsers"}] form. Max 10. Valid names (including custom ones) come from analytics_get_metadata.',
+        ),
+        dimensions: coerceArray(metricOrDimensionRef)
+          .optional()
+          .describe('Dimension API names to group by, e.g. ["date"] or ["country","deviceCategory"], or the native GA4 {"name":...} form. Max 9. Omit for a single total row.'),
         dimensionFilter: coerceJson(z.record(z.string(), z.unknown()))
           .optional()
           .describe(
@@ -182,17 +191,34 @@ export function registerAnalyticsTools(server: ToolRegistry, deps: CuratedToolDe
         returnPropertyQuota: coerceBoolean.optional().describe("Include this property's remaining quota tokens in the response"),
       },
     },
-    async ({ account, property, startDate, endDate, metrics, dimensions, dimensionFilter, metricFilter, orderBys, limit, offset, metricAggregations, keepEmptyRows, returnPropertyQuota }) => {
+    async ({ account, property, startDate, endDate, dateRanges, metrics, dimensions, dimensionFilter, metricFilter, orderBys, limit, offset, metricAggregations, keepEmptyRows, returnPropertyQuota }) => {
       const prop = normalizeProperty(property);
       if ('hint' in prop) return invalidProperty(prop.hint, account);
+      if (dateRanges !== undefined && dateRanges.length > 1) {
+        return invalidParams(
+          account as Account,
+          `dateRanges has ${dateRanges.length} entries, but analytics_run_report runs a single range per call.`,
+          'Pass exactly one {startDate, endDate} entry, or call the tool once per range.',
+        );
+      }
+      const range = dateRanges?.[0];
+      const resolvedStart = range?.startDate ?? startDate;
+      const resolvedEnd = range?.endDate ?? endDate;
+      if (resolvedStart === undefined || resolvedEnd === undefined) {
+        return invalidParams(
+          account as Account,
+          'Missing a date range: pass startDate and endDate, or a single-entry dateRanges.',
+          'e.g. startDate: "28daysAgo", endDate: "today", or dateRanges: [{"startDate":"28daysAgo","endDate":"today"}].',
+        );
+      }
       try {
         const auth = await getClientFn(account as Account);
         const dataApi = analyticsdataClient({ version: 'v1beta', auth });
         const requestBody: any = {
-          dateRanges: [{ startDate, endDate }],
-          metrics: metrics.map((name) => ({ name })),
+          dateRanges: [{ startDate: resolvedStart, endDate: resolvedEnd }],
+          metrics: metrics.map((ref) => ({ name: nameOf(ref) })),
         };
-        if (dimensions?.length) requestBody.dimensions = dimensions.map((name) => ({ name }));
+        if (dimensions?.length) requestBody.dimensions = dimensions.map((ref) => ({ name: nameOf(ref) }));
         if (dimensionFilter) requestBody.dimensionFilter = dimensionFilter;
         if (metricFilter) requestBody.metricFilter = metricFilter;
         if (orderBys?.length) requestBody.orderBys = orderBys;
@@ -296,15 +322,16 @@ function invalidProperty(hint: string, account: unknown) {
   };
 }
 
-function handleAnalyticsError(error: any, account: Account) {
+export function handleAnalyticsError(error: any, account: Account) {
   return handleGoogleApiError(
     error,
     account,
     {
       scope: 'Needs the "analytics" bundle on this account: add it to the scope profile, then re-auth.',
-      // GA4 answers PERMISSION_DENIED for a property ACL too, and the old
-      // combined hint sent those callers to re-auth a scope they already had.
+      // GA4 returns PERMISSION_DENIED for a property-access issue too, not just
+      // a missing scope; keep the hints distinct, or callers get sent to re-auth a scope they already have.
       resource: 'The scope is not the problem: this Google account has no access to that GA4 property. Grant it in GA4 Admin > Property Access Management, or call analytics_account_summaries to see the properties it can read.',
+      bundle: 'analytics',
     },
   );
 }

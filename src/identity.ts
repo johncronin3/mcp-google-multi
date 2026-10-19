@@ -6,8 +6,8 @@ import { resolvePolicy, type Policy, type Transport } from './write-control.js';
 
 /**
  * The one forward-compat seam (frozen public API): the free core builds
- * exactly one context with subject "owner"; EE later instantiates N contexts
- * from N registries. Nothing here may assume a global current-account.
+ * exactly one context with subject "owner"; a multi-tenant host instantiates
+ * N contexts from N registries. Nothing here may assume a global current-account.
  * `subject` is a string (not the literal 'owner') so a context can carry a
  * tenant id; the free core still always builds 'owner'.
  */
@@ -24,10 +24,8 @@ export interface IdentityContext {
   };
 }
 
-// Only buildIdentityContext mints the owner brand. The subject string alone
-// never unlocks the owner-only surfaces (account wizard, host-file tools, the
-// operator diagnose report): a hand-built context claiming 'owner' stays a
-// non-owner context.
+// Only buildIdentityContext mints the owner brand: the subject string alone
+// never unlocks owner-only surfaces, so a hand-built context claiming 'owner' stays non-owner.
 const ownerContexts = new WeakSet<object>();
 
 export function isOwnerContext(ctx: object | undefined): boolean {
@@ -38,9 +36,10 @@ export function buildIdentityContext(
   env: NodeJS.ProcessEnv = process.env,
   opts: { transport?: Transport } = {},
 ): IdentityContext {
-  // Real closures over the single-owner state (the SAME factories EE
-  // instantiates per tenant), bound here to the global registry + token dir —
-  // behavior-identical to the module-level functions for the free core.
+  // Real closures over the single-owner state (the SAME factories a
+  // multi-tenant host instantiates per tenant), bound here to the global
+  // registry + token dir — behavior-identical to the module-level functions
+  // for the free core.
   const diskStore = createTokenStore(getTokenDir());
   // Module readToken sees the hosted in-memory overlay. createTokenStore reads
   // disk only, so a refresh persisted to Secret Manager (and not to *.enc)
@@ -53,8 +52,8 @@ export function buildIdentityContext(
     get accounts() {
       return getAccountSet();
     },
-    // The dispatch transport rides into the resolved policy as a reserved seam
-    // (cc-write-control B14); it does not change any write-control verdict.
+    // The dispatch transport rides into the resolved policy as a reserved seam;
+    // it does not change any write-control verdict.
     policy: resolvePolicy(env, { transport: opts.transport }),
     getClient: makeGetClient('owner', {
       accounts: getAccountSet,

@@ -6,24 +6,24 @@ const state = (aliases: string[], withTokens: string[]) => ({
   tokenPresent: (a: string) => withTokens.includes(a),
 });
 
-describe('planReset (B6)', () => {
+describe('planReset', () => {
   it('rejects an unknown --account', () => {
-    const r = planReset({ account: 'nope', regenerateKey: false, yes: true }, state(['ic', 'personal'], ['ic']));
+    const r = planReset({ account: 'nope', regenerateKey: false, yes: true }, state(['work', 'personal'], ['work']));
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.slug).toBe('E_VALIDATION');
   });
 
   it('default wipes all accounts; reauth lists only those that had tokens', () => {
-    const r = planReset({ regenerateKey: false, yes: true }, state(['ic', 'personal', 'fatoura'], ['ic', 'personal']));
+    const r = planReset({ regenerateKey: false, yes: true }, state(['work', 'personal', 'side'], ['work', 'personal']));
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.plan.wipeAliases).toEqual(['ic', 'personal', 'fatoura']);
-      expect(r.reauth).toEqual(['ic', 'personal']); // fatoura had no token
+      expect(r.plan.wipeAliases).toEqual(['work', 'personal', 'side']);
+      expect(r.reauth).toEqual(['work', 'personal']);
     }
   });
 
   it('--account scopes the wipe to one alias', () => {
-    const r = planReset({ account: 'personal', regenerateKey: false, yes: true }, state(['ic', 'personal'], ['ic', 'personal']));
+    const r = planReset({ account: 'personal', regenerateKey: false, yes: true }, state(['work', 'personal'], ['work', 'personal']));
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.plan.wipeAliases).toEqual(['personal']);
@@ -32,22 +32,22 @@ describe('planReset (B6)', () => {
   });
 
   it('--regenerate-key is allowed with a full (all-accounts) wipe', () => {
-    const r = planReset({ regenerateKey: true, yes: true }, state(['ic', 'personal'], ['ic', 'personal']));
+    const r = planReset({ regenerateKey: true, yes: true }, state(['work', 'personal'], ['work', 'personal']));
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.plan.regenerateKey).toBe(true);
   });
 
   it('--regenerate-key is REFUSED when another account still holds a token (brick guard)', () => {
-    const r = planReset({ account: 'personal', regenerateKey: true, yes: true }, state(['ic', 'personal'], ['ic', 'personal']));
+    const r = planReset({ account: 'personal', regenerateKey: true, yes: true }, state(['work', 'personal'], ['work', 'personal']));
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.slug).toBe('E_KEY_REGEN_BLOCKED');
-      expect(r.message).toContain('ic');
+      expect(r.message).toContain('work');
     }
   });
 
   it('--regenerate-key with --account is allowed when no OTHER account has a token', () => {
-    const r = planReset({ account: 'personal', regenerateKey: true, yes: true }, state(['ic', 'personal'], ['personal']));
+    const r = planReset({ account: 'personal', regenerateKey: true, yes: true }, state(['work', 'personal'], ['personal']));
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.plan.regenerateKey).toBe(true);
   });

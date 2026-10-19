@@ -7,6 +7,8 @@ import { getAdminAccounts, resolveScopesForAccount } from '../auth.js';
 import { allowedAccounts, isGrantEnforced } from '../session-grant.js';
 import { deskMintMessage, isHostedHttp } from '../hosted.js';
 import { hasToken, readToken, type TokenStore } from '../token-store.js';
+import { hints } from '../hint-provider.js';
+import { coerceBoolean } from './_coerce.js';
 
 export interface AccountHealthDeps {
   hasToken: (alias: string) => boolean;
@@ -14,7 +16,7 @@ export interface AccountHealthDeps {
   fileExists: (p: string) => boolean;
   now: () => number;
   /** Scopes required by registered tools — feeds doctor's tool-grained
-   * "registered but not requestable" view (B9). account_list stays compact:
+   * "registered but not requestable" view. account_list stays compact:
    * its report universe is profile ∪ granted only. */
   registeredScopes?: () => string[];
   /** Account view health is derived against; absent = the global registry. */
@@ -55,7 +57,7 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
   const config = set.configs[alias];
   const admin = getAdminAccounts(set).includes(alias);
   const configured = resolveScopesForAccount(alias, set);
-  // BR-10: env-sourced accounts are not persisted in config.json, so the
+  // Env-sourced accounts are not persisted in config.json, so the
   // account wizard cannot edit them — the deployer edits env instead.
   const base = {
     alias,
@@ -72,15 +74,20 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
 
   if (!deps.hasToken(alias)) {
     const legacy = deps.fileExists(config.tokenPath);
+    const rendered = legacy
+      ? hints()?.render({ kind: 'legacy_plaintext_token', account: alias })
+      : hints()?.render({ kind: 'reauth', account: alias });
     return {
       ...base,
       token: {
         status: 'missing',
-        hint: legacy
-          ? 'Plaintext token.json found — run: npx mcp-google-multi migrate-tokens'
-          : isHostedHttp()
-            ? deskMintMessage(alias, config.email)
-            : reauthHint(alias),
+        hint:
+          rendered?.hint ??
+          (legacy
+            ? 'Plaintext token.json found — run: npx mcp-google-multi migrate-tokens'
+            : isHostedHttp()
+              ? deskMintMessage(alias, config.email)
+              : reauthHint(alias)),
       },
       scopes: noScopes,
     };
@@ -90,9 +97,10 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
   try {
     token = deps.readToken(alias);
   } catch {
+    const rendered = hints()?.render({ kind: 'token_unreadable', account: alias });
     return {
       ...base,
-      token: { status: 'decrypt_error', hint: 'Wrong MASTER_KEY or corrupt token file — re-auth or restore the key.' },
+      token: { status: 'decrypt_error', hint: rendered?.hint ?? 'Wrong MASTER_KEY or corrupt token file — re-auth or restore the key.' },
       scopes: noScopes,
     };
   }
@@ -115,14 +123,33 @@ export function deriveAccountHealth(alias: string, deps: AccountHealthDeps = DEF
       expiryDate: expiry !== undefined ? new Date(expiry).toISOString() : undefined,
       hint:
         status === 'needs_reauth'
-          ? isHostedHttp()
-            ? deskMintMessage(alias, config.email)
-            : reauthHint(alias)
+          ? (hints()?.render({ kind: 'reauth', account: alias })?.hint ??
+            (isHostedHttp()
+              ? deskMintMessage(alias, config.email)
+              : reauthHint(alias)))
           : missing.length > 0
-            ? 'Re-auth to grant the missing scopes'
+            ? (hints()?.render({ kind: 'scopes_missing', account: alias })?.hint ?? 'Re-auth to grant the missing scopes')
             : undefined,
     },
     scopes: report,
+  };
+}
+
+export interface AccountSummary {
+  alias: string;
+  email: string;
+  admin: boolean;
+  tokenStatus: TokenStatus;
+  default: boolean;
+}
+
+function summarizeAccountHealth(health: AccountHealth, isDefault: boolean): AccountSummary {
+  return {
+    alias: health.alias,
+    email: health.email,
+    admin: health.admin,
+    tokenStatus: health.token.status,
+    default: isDefault,
   };
 }
 
@@ -130,24 +157,25 @@ export function registerAccountTools(registry: ToolRegistry, deps: AccountHealth
   const registerMeta = registry.registerMeta as unknown as (
     name: string,
     config: { description: string; inputSchema: Record<string, unknown>; _meta?: Record<string, unknown> },
-    handler: () => unknown,
+    handler: (args: { verbose?: boolean }) => unknown,
   ) => void;
   registerMeta(
     'account_list',
     {
       description:
-        'List the configured Google accounts: alias, email, admin flag, token health ' +
-        '(ok / expired_refreshable / needs_reauth / missing / decrypt_error), and granted vs configured scopes. ' +
-        'Use this to see which account aliases are available and healthy.',
-      inputSchema: {},
+        'List the configured Google accounts: alias, email, admin flag, token status ' +
+        '(ok / expired_refreshable / needs_reauth / missing / decrypt_error), and which one is the default. ' +
+        'Pass verbose: true for the full per-account report (granted vs configured scopes).',
+      inputSchema: { verbose: coerceBoolean.optional().describe('Return the full scope report instead of the terse default') },
       _meta: { 'anthropic/alwaysLoad': true },
     },
-    async () => {
+    async ({ verbose }) => {
       refreshAccountSetIfStale();
       try {
         const set = registry.accountSet();
         const aliases = isGrantEnforced() ? allowedAccounts() : [...set.aliases];
         const health: AccountHealthDeps = { ...deps, accounts: () => set };
+        const reports = aliases.map((alias) => deriveAccountHealth(alias, health));
         return {
           content: [
             {
@@ -155,7 +183,9 @@ export function registerAccountTools(registry: ToolRegistry, deps: AccountHealth
               text: JSON.stringify({
                 defaultAccount: set.defaultAccount ?? null,
                 defaultAccountSource: set.defaultAccountSource ?? null,
-                accounts: aliases.map((alias) => deriveAccountHealth(alias, health)),
+                accounts: verbose
+                  ? reports
+                  : reports.map((r) => summarizeAccountHealth(r, r.alias === set.defaultAccount)),
                 grant_filtered: isGrantEnforced(),
               }),
             },

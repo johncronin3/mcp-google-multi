@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// S1.13: the exports map is the EE-facing API surface. Every declared subpath
-// must map onto a real source module (the dist file is a build artifact of
-// exactly that source), and compose must stay import-side-effect-free.
+// The exports map is the public API surface: every declared subpath must map
+// onto a real source module, and compose must stay import-side-effect-free.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -17,7 +16,7 @@ const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')
   main: string;
 };
 
-describe('package exports map (S1.13)', () => {
+describe('package exports map', () => {
   it('every declared subpath maps ./dist/<name>.js onto an existing src/<name>.ts', () => {
     for (const [key, target] of Object.entries(pkg.exports)) {
       if (key === './package.json') {
@@ -30,9 +29,9 @@ describe('package exports map (S1.13)', () => {
     }
   });
 
-  it('the root export and main agree, and dist is the only published dir', () => {
+  it('the root export and main agree, and the published dirs are dist and skills', () => {
     expect(pkg.exports['.']).toBe(`./${pkg.main}`);
-    expect(pkg.files).toEqual(['dist']);
+    expect(pkg.files).toEqual(['dist', 'skills']);
   });
 
   it('./write-control is declared: a caller building its own context can resolve a Policy', async () => {
@@ -54,14 +53,14 @@ describe('package exports map (S1.13)', () => {
     expect(typeof auth.resolveScopesForAccount).toBe('function');
   });
 
-  it('the 6 EE-facing entry points from the build plan are all declared', () => {
+  it('the 6 public entry points are all declared', () => {
     for (const key of ['./identity', './compose', './oauth-as', './accounts', './token-store', './http-transport']) {
       expect(pkg.exports[key], key).toBeTruthy();
     }
   });
 });
 
-describe('compose is import-side-effect-free (S1.12)', () => {
+describe('compose is import-side-effect-free', () => {
   it('importing src/compose.ts never parses argv, starts a server, or exits non-zero', { timeout: 60_000 }, () => {
     const home = mkdtempSync(path.join(tmpdir(), 'mcp-gm-compose-'));
     const emptyEnv = path.join(home, 'empty.env');

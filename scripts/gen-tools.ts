@@ -8,9 +8,8 @@ import { BODY_OVERRIDES, CURATED_METHOD_IDS, CUD_OVERRIDES, DESCRIPTION_OVERRIDE
 
 const MAX_TOOL_NAME = 64;
 const RESERVED_FIELDS = new Set(['account', 'body']);
-// Above this, a flat request schema still registers as one opaque body arg:
-// a 40-field inputSchema costs more context than it saves (BODY_OVERRIDES
-// 'typed' lifts the cap per method).
+// Above this, a flat schema still goes opaque; a 40-field inputSchema costs
+// more context than it saves (BODY_OVERRIDES 'typed' lifts the cap per method).
 const MAX_TYPED_BODY_PROPS = 24;
 
 interface DiscoveryDocJson {
@@ -135,11 +134,8 @@ function paramZod(name: string, param: DiscoveryParam, looseParams: string[], co
   let inner: string;
   switch (p.type) {
     case 'string':
-      // A path param is a path SEGMENT: an empty value collapses it and the
-      // request addresses the collection instead of the resource. Required
-      // query params are the same story one level down (mimeType, requestId,
-      // orgUnitPath): empty is never a meaningful value. Declare the
-      // constraint so the client sees it; expandPath still enforces the path.
+      // Empty path params collapse the URL onto the collection, not the
+      // resource; required query params carry the same risk, declared here since expandPath only checks paths.
       inner = Array.isArray(p.enum) && p.enum.length > 0
         ? `z.enum(${JSON.stringify(p.enum)})`
         : p.location === 'path' || p.required
@@ -219,10 +215,8 @@ export function planTools(
     const bodySchema = bodyRef ? doc.schemas?.[bodyRef] : undefined;
     const bodyProperties = bodyRef ? Object.keys(bodySchema?.properties ?? {}).sort() : [];
 
-    // Typed-body tier: a fully flat request schema becomes typed top-level
-    // args; anything nested/$ref/map-like (or capped, or forced opaque) keeps
-    // the single coerceJson body. A schema without `properties` cannot be
-    // verified flat, so it stays opaque too.
+    // Flat request schemas become typed top-level args; nested/$ref/map-like,
+    // capped, forced-opaque, or property-less schemas all stay opaque JSON.
     const bodyOverride = bodyOverrides[method.id];
     let typedBody: ToolPlan['typedBody'];
     if (bodyRef && bodySchema?.properties !== undefined && bodyOverride !== 'opaque') {
@@ -281,8 +275,8 @@ function emitShapeField(field: string, zod: string): string {
 export function emitService(doc: DiscoveryDocJson, api: GenApi, alreadyEmitted: Set<string> = new Set()): { fileText: string; report: ServiceReport; names: string[]; pairs: [string, string][] } {
   const { plans, report } = planTools(doc, api, alreadyEmitted);
 
-  // Baked + INTERNED scope sets (#114): tools sharing a scope set share one
-  // frozen array. Keys sorted for deterministic regen diffs.
+  // Baked + interned scope sets: tools sharing a scope set share one frozen
+  // array; keys sorted for deterministic regen diffs.
   const scopeSetIndex = new Map<string, number>();
   const scopeSets: string[][] = [];
   for (const plan of plans) {
@@ -295,9 +289,8 @@ export function emitService(doc: DiscoveryDocJson, api: GenApi, alreadyEmitted: 
     }
   }
 
-  // Bodies from multiple Discovery docs merge into one service file
-  // (buildServiceFile slices between the outer braces), so the interned table
-  // lives INSIDE the body under a per-doc unique name.
+  // Multiple docs merge into one service file (buildServiceFile slices between
+  // the braces), so the interned table needs a per-doc unique name inside the body.
   const tableName = `S_${api.file.replace(/\.json$/, '')}`.replace(/[^a-zA-Z0-9_]/g, '_');
   const lines: string[] = [
     `export function register${api.service[0].toUpperCase()}${api.service.slice(1)}GeneratedTools(registry: ToolRegistry): void {`,

@@ -10,7 +10,7 @@ let base: string;
 beforeEach(() => { base = mkdtempSync(path.join(tmpdir(), 'attach-')); });
 afterEach(() => { rmSync(base, { recursive: true, force: true }); });
 
-describe('readAttachments security guards (A4/A5 review fixes)', () => {
+describe('readAttachments security guards', () => {
   it('relative path is rejected', async () => {
     await expect(readAttachments([{ path: 'rel/file.txt' }], 0)).rejects.toThrow(/absolute/);
   });

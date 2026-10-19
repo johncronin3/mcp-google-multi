@@ -1,9 +1,5 @@
-// B19: encrypted registry export / import (account-registry.md). Moves a whole
-// setup to another machine. The bundle is encrypted under a user PASSPHRASE
-// (portable across machines with different MASTER_KEYs) via the token-store AES
-// primitives; the bundled <alias>.enc token files stay encrypted under the
-// SOURCE MASTER_KEY (double-locked), so the target needs the same MASTER_KEY to
-// use them. Secrets (MASTER_KEY / client secret) are never in the bundle.
+// Encrypted registry export/import: the bundle is passphrase-encrypted, but
+// the bundled <alias>.enc files stay double-locked under the SOURCE MASTER_KEY.
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import * as readline from 'node:readline';
@@ -13,7 +9,7 @@ import { atomicWriteFileSync, atomicWriteWithLock } from './fs-atomic.js';
 import { ALIAS_RE, configFilePath, CONFIG_VERSION, tenantsDir } from './config-file.js';
 import { getTokenDir } from './accounts.js';
 
-/** D11 (refuse-only for v1): export/import operate on the FLAT single-owner
+/** Refuse-only for v1: export/import operate on the FLAT single-owner
  * store. A tenant-namespaced layout means the bundle would either miss every
  * tenant's tokens or exfiltrate all of them in one file — refuse instead.
  * Returns the offending dir, or null when the store is flat. */
@@ -85,12 +81,8 @@ export function buildTransferBundle(exportedAt: string, deps: TransferDeps = {})
   return { manifest: { v: 1, exportedAt, aliases: [...aliasSet].sort() }, config, tokens };
 }
 
-// Bundle envelope v2: a REAL passphrase KDF. The v1 envelope reused the
-// token store's deriveKey, whose passphrase branch is one unsalted sha256 —
-// an exported bundle could be brute-forced offline (CodeQL
-// js/insufficient-password-hash). scrypt with a per-bundle random salt fixes
-// that; v1 bundles (a prerelease-only format, never produced by any stable
-// release) are refused with a re-export hint rather than kept decryptable.
+// v2: a REAL passphrase KDF (scrypt, per-bundle salt). v1 reused the token
+// store's unsalted-sha256 passphrase branch (CodeQL js/insufficient-password-hash) and is refused outright.
 const BUNDLE_VERSION = 2;
 const SCRYPT_PARAMS = { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 } as const;
 

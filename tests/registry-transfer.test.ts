@@ -113,13 +113,12 @@ describe('encrypt/decrypt bundle (passphrase)', () => {
   });
 
   it('rejects a decrypted blob that is not a valid bundle', () => {
-    // encrypt an arbitrary object with the passphrase, then try to import it
     const blob = encryptBundle({ nope: true } as unknown as TransferBundle, 'pw');
     expect(() => decryptBundle(blob, 'pw')).toThrow(BundleDecryptError);
   });
 });
 
-describe('refuseIfMultiTenant (S1.19, invariant 9)', () => {
+describe('refuseIfMultiTenant', () => {
   const dirs: string[] = [];
   afterEach(() => {
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
@@ -184,7 +183,6 @@ describe('planImport', () => {
     const plan = planImport(bundle, local);
     expect(plan.skipped).toEqual(['work']);
     expect(plan.added).toEqual(['personal']);
-    // local work account + tokens untouched
     expect(JSON.parse(plan.mergedConfig).accounts.work.email).toBe('local@x.example');
     expect(plan.tokenWrites).toEqual({ personal: 'ENC-personal' });
   });

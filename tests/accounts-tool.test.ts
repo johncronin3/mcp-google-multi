@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest';
-import { deriveAccountHealth, type AccountHealthDeps } from '../src/tools/accounts-tool.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { accountHealthDepsFor, deriveAccountHealth, type AccountHealthDeps } from '../src/tools/accounts-tool.js';
 import { setHttpReauthLink } from '../src/reauth-hint.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 import { resolveScopesForAccount } from '../src/auth.js';
+import { accountSet, parseResult, toolHarness } from './_tool-harness.js';
 
 const ALIAS = 'test';
 const CONFIGURED = resolveScopesForAccount(ALIAS);
@@ -18,7 +20,7 @@ function deps(overrides: Partial<AccountHealthDeps>): AccountHealthDeps {
 }
 
 describe('deriveAccountHealth', () => {
-  it('missing-token hint becomes an AS re-auth link over HTTP (S1.18)', () => {
+  it('missing-token hint becomes an AS re-auth link over HTTP', () => {
     setHttpReauthLink((a) => `https://mcp.example.com/authorize?flow=alias_reauth&alias=${encodeURIComponent(a)}&exp=1&sig=s`);
     try {
       const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false }));
@@ -34,7 +36,7 @@ describe('deriveAccountHealth', () => {
     expect(h.token.status).toBe('missing');
     expect(h.token.hint).toContain('auth --account test');
     expect(h.scopes).toMatchObject({ configured: CONFIGURED.length, granted: 0 });
-    // B3 extension: missing kept for v5 consumers, now sorted; three-state
+    // missing kept for v5 consumers, now sorted; three-state
     // breakdown present.
     expect(h.scopes.missing).toEqual([...CONFIGURED].sort());
     expect(h.scopes.requestable).toEqual([...CONFIGURED].sort());
@@ -98,5 +100,87 @@ describe('deriveAccountHealth', () => {
     expect(h.token.status).toBe('needs_reauth');
     expect(h.scopes.granted).toBe(0);
     expect(h.token.expiryDate).toBeUndefined();
+  });
+});
+
+describe('deriveAccountHealth hint provider routing', () => {
+  afterEach(() => setHintProvider(null));
+
+  function echo() {
+    const seen: HintCase[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}` };
+      },
+    });
+    return seen;
+  }
+
+  it('missing (no legacy file) renders reauth', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false }));
+    expect(h.token.hint).toBe('kind:reauth');
+    expect(seen).toEqual([{ kind: 'reauth', account: ALIAS }]);
+  });
+
+  it('missing (legacy plaintext file present) renders legacy_plaintext_token, not reauth', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ hasToken: () => false, fileExists: () => true }));
+    expect(h.token.hint).toBe('kind:legacy_plaintext_token');
+    expect(seen).toEqual([{ kind: 'legacy_plaintext_token', account: ALIAS }]);
+  });
+
+  it('decrypt_error renders token_unreadable', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ readToken: () => { throw new Error('nope'); } }));
+    expect(h.token.hint).toBe('kind:token_unreadable');
+    expect(seen).toEqual([{ kind: 'token_unreadable', account: ALIAS }]);
+  });
+
+  it('needs_reauth renders reauth', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(ALIAS, deps({ readToken: () => ({ expiry_date: NOW - 1 }) }));
+    expect(h.token.hint).toBe('kind:reauth');
+    expect(seen).toEqual([{ kind: 'reauth', account: ALIAS }]);
+  });
+
+  it('a live token with scopes still missing renders scopes_missing', () => {
+    const seen = echo();
+    const h = deriveAccountHealth(
+      ALIAS,
+      deps({ readToken: () => ({ expiry_date: NOW + 60_000, refresh_token: 'r', scope: CONFIGURED[0] }) }),
+    );
+    expect(h.token.hint).toBe('kind:scopes_missing');
+    expect(seen).toEqual([{ kind: 'scopes_missing', account: ALIAS }]);
+  });
+});
+
+describe('account_list (registered tool)', () => {
+  const ACCOUNTS = accountSet(
+    { work: { email: 'work@example.com', admin: true }, home: { email: 'home@example.com' } },
+    { defaultAccount: 'work' },
+  );
+
+  it('is terse by default: alias, email, admin, token status, default flag only', async () => {
+    const { call } = toolHarness({ accounts: ACCOUNTS });
+    const payload = parseResult(await call('account_list', {}));
+    expect(payload.accounts).toEqual([
+      { alias: 'work', email: 'work@example.com', admin: true, tokenStatus: 'ok', default: true },
+      { alias: 'home', email: 'home@example.com', admin: false, tokenStatus: 'ok', default: false },
+    ]);
+  });
+
+  it('verbose: true is byte-identical to deriveAccountHealth\'s own report', async () => {
+    const { call, ctx } = toolHarness({ accounts: ACCOUNTS });
+    const health = accountHealthDepsFor(ctx.tokenStore, () => ACCOUNTS);
+    const expected = ACCOUNTS.aliases.map((alias) => deriveAccountHealth(alias, health));
+    const payload = parseResult(await call('account_list', { verbose: true }));
+    expect(payload).toEqual({
+      defaultAccount: 'work',
+      defaultAccountSource: 'config',
+      accounts: expected,
+      grant_filtered: false,
+    });
   });
 });

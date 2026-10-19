@@ -8,12 +8,8 @@ import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { signAccessToken, jwtSecretFrom, signReauthLink } from '../src/mcp-token.js';
 
-// S1.23: the ONE multi-process smoke. Every other HTTP test drives
-// HttpTransportHost in-process; the real index.ts HTTP bootstrap (env gates ->
-// owner gate -> JWT key provisioning -> AS mounting -> listener) had never
-// been exercised end to end. No network leaves the box: the test signs its own
-// bearer with the MCP_JWT_KEY it hands the subprocess, and the /authorize leg
-// stops at the 302 (the Google URL is built, never fetched).
+// The ONE multi-process smoke: other HTTP tests drive HttpTransportHost in-process, never index.ts's
+// real bootstrap end to end. No network leaves the box; the bearer is self-signed, and /authorize stops at the 302.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -59,7 +55,7 @@ function request(
   });
 }
 
-describe('index.ts HTTP bootstrap smoke (S1.23, subprocess)', () => {
+describe('index.ts HTTP bootstrap smoke (subprocess)', () => {
   let child: ChildProcess | undefined;
   let home: string | undefined;
 
@@ -142,9 +138,8 @@ describe('index.ts HTTP bootstrap smoke (S1.23, subprocess)', () => {
     expect(init.status).toBe(200);
     expect(JSON.parse(init.text).result.serverInfo.name).toBe('mcp-google-multi');
 
-    // 5. an unsigned re-auth link is refused; the server-signed one (same
-    //    provisioned key) mints a signed state and 302s toward Google (URL
-    //    built, never fetched)
+    // 5. an unsigned re-auth link is refused; the server-signed one (same provisioned key) mints a
+    //    signed state and 302s toward Google (URL built, never fetched)
     const bare = await request(port, 'GET', '/authorize?flow=alias_reauth&alias=test');
     expect(bare.status).toBe(400);
     expect(bare.text).toContain('E_STATE_INVALID');
