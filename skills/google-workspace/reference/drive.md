@@ -140,13 +140,13 @@ Permanently delete a file or folder from Google Drive. Irreversible. Use drive_t
 
 Class: read
 
-Download a binary file from Drive to local disk. For Google Workspace formats (Docs, Sheets, Slides), use drive_export instead.
+Download a binary file from Drive. Desk/stdio: writes to savePath on local disk. Hosted Cloud Run: returns base64 bytes in the MCP result (savePath ignored). For Google Workspace formats (Docs, Sheets, Slides), use drive_export instead.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `account` | string | optional | Google account alias |
 | `fileId` | string | required | Google Drive file ID |
-| `savePath` | string | required | Absolute DIRECTORY path to save into (created if missing, on the machine running the server); the file name comes from `filename` |
+| `savePath` | string | optional | Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result. |
 | `filename` | string | optional | Filename to save as (defaults to the file name in Drive) |
 
 ## `drive_empty_trash`
@@ -163,14 +163,14 @@ Permanently delete every file currently in the account's trash. Irreversible.
 
 Class: read
 
-Export a Google Workspace document (Doc, Sheet, Slide) to a standard format and save to disk. Supported: PDF, DOCX, XLSX, PPTX, TXT, CSV, Markdown (text/markdown for Docs).
+Export a Google Workspace document (Doc, Sheet, Slide) to a standard format. Desk/stdio: saves to savePath on local disk. Hosted Cloud Run: returns base64 bytes in the MCP result (savePath ignored). Supported: PDF, DOCX, XLSX, PPTX, TXT, CSV, Markdown (text/markdown for Docs).
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
 | `account` | string | optional | Google account alias |
 | `fileId` | string | required | Google Drive file ID |
 | `mimeType` | string | required | Target export MIME type (e.g. "application/pdf", "text/markdown", "application/vnd.openxmlformats-officedocument.wordprocessingml.document") |
-| `savePath` | string | required | Absolute DIRECTORY path to save into (created if missing, on the machine running the server); the file name comes from `filename` |
+| `savePath` | string | optional | Desk only: absolute directory path to save into. Ignored on hosted Cloud Run — bytes are returned in the tool result. |
 | `filename` | string | optional | Filename to save as (defaults to the Drive name plus the extension implied by mimeType) |
 
 ## `drive_get_about`
