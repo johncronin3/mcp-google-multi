@@ -128,7 +128,7 @@ Without a session grant, multi-account tools can reach **every** alias in `GOOGL
 
 | Recipe name (example) | Typical accounts |
 |----------------------|------------------|
-| Personal Brain Grant 3 | personal, stromback, opcenter, buildcoin (Cosmos-related aliases stay here) |
+| Personal Brain Grant 3 | personal, stromback, opcenter, buildcoin, usa-house, olga (Cosmos-related aliases stay here) |
 | StrombackBrain2 | `stromback` only |
 
 `GOOGLE_PROFILE` (read-only / safe-writes / full-writes) is **write-control**, not brain isolation — do not confuse the two. v6 `safe-writes` also refuses privileged org/Vault/script writes and `*_watch` push registrations (`MIGRATION-v6.md`).

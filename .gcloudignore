@@ -1,0 +1,16 @@
+# gcloud run deploy --source uses this as the build context.
+# Keep only the files the house Dockerfile COPYs, plus the Dockerfile so
+# Cloud Build runs those COPY steps instead of buildpacks.
+# bin/ and loose *.mjs scripts stay out. Last match wins.
+*
+# A file under an excluded directory cannot be re-included.
+!*/
+# Leading slash: these names must not match node_modules/**/package.json.
+!/Dockerfile
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/src/**
+!/docker/entrypoint.sh
+bin/
+*.mjs

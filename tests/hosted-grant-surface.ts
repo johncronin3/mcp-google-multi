@@ -48,7 +48,7 @@ export const REVIEWED_DELTAS = [
 ] as const;
 
 const HOSTED_ACCOUNTS =
-  'personal:personal@example.com,stromback:stromback@example.com,opcenter:opcenter@example.com,buildcoin:buildcoin@example.com';
+  'personal:personal@example.com,stromback:stromback@example.com,opcenter:opcenter@example.com,buildcoin:buildcoin@example.com,usa-house:usa-house@example.com,olga:olga@example.com';
 
 const ENV_KEYS = [
   'GOOGLE_ACCOUNTS',

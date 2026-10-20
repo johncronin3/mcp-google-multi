@@ -7,9 +7,11 @@ import { invalidateAccountSet } from '../src/accounts.js';
 import { configFilePath } from '../src/config-file.js';
 import {
   clearSessionGrant,
+  isGrantEnforced,
   resetGrantsFileCache,
   resolveGrantByName,
   runWithGrant,
+  type SessionGrantState,
 } from '../src/session-grant.js';
 import { registerAccountWizardTools, setWizardHttpConsent } from '../src/tools/account-wizard.js';
 import type { ToolRegistry } from '../src/registry.js';
@@ -18,15 +20,16 @@ vi.mock('../src/client-config.js', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../src/client-config.js')>();
   return {
     ...mod,
-    applyFileEntry: vi.fn(() => {
-      throw new Error('applyFileEntry must not run for a narrow grant');
-    }),
+    applyFileEntry: vi.fn(() => ({ ok: true, action: 'updated', path: '/tmp/client.json' })),
   };
 });
 
 import { applyFileEntry } from '../src/client-config.js';
 
 type Handler = (args: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>;
+
+const PBG3 = ['personal', 'stromback', 'opcenter', 'buildcoin', 'usa-house', 'olga'] as const;
+const SB2_OUTSIDERS = ['personal', 'opcenter', 'buildcoin', 'usa-house', 'olga'] as const;
 
 function captureHandlers(): Record<string, Handler> {
   const handlers: Record<string, Handler> = {};
@@ -54,6 +57,8 @@ const ENV_KEYS = [
   'GOOGLE_GRANT_CODE',
   'MCP_TRANSPORT',
   'MCP_PUBLIC_URL',
+  'MCP_HOSTED',
+  'K_SERVICE',
 ] as const;
 
 function grantFile(dir: string): string {
@@ -66,7 +71,7 @@ function grantFile(dir: string): string {
         {
           name: 'Personal Brain Grant 3',
           code: 'REPLACE_WITH_HOST_LOCAL_CODE',
-          accounts: ['personal', 'stromback', 'opcenter', 'buildcoin'],
+          accounts: [...PBG3],
         },
         {
           name: 'StrombackBrain2',
@@ -79,7 +84,11 @@ function grantFile(dir: string): string {
   return grantsPath;
 }
 
-describe('SB2 cannot add or re-link an account outside stromback', () => {
+function envelope(result: { content: { text: string }[] }): { error?: string; message?: string; hint?: string; account?: string } {
+  return JSON.parse(result.content[0].text) as { error?: string; message?: string; hint?: string; account?: string };
+}
+
+describe('account wizard grant boundary', () => {
   let dir: string;
 
   afterEach(() => {
@@ -99,8 +108,8 @@ describe('SB2 cannot add or re-link an account outside stromback', () => {
     vi.clearAllMocks();
   });
 
-  function activateSb2(): void {
-    dir = mkdtempSync(path.join(tmpdir(), 'gmulti-sb2-'));
+  function activate(opts: { enforce?: 'unset' | 'false' }): SessionGrantState[] {
+    dir = mkdtempSync(path.join(tmpdir(), 'gmulti-grant-wizard-'));
     for (const key of ENV_KEYS) saved[key] = process.env[key];
     armed = true;
     delete process.env.GOOGLE_ACCOUNTS;
@@ -110,28 +119,31 @@ describe('SB2 cannot add or re-link an account outside stromback', () => {
     process.env.GOOGLE_CLIENT_ID = 'wizard-test-id';
     process.env.GOOGLE_CLIENT_SECRET = 'wizard-test-secret';
     process.env.GOOGLE_GRANTS_PATH = grantFile(dir);
-    process.env.GOOGLE_GRANTS_ENFORCE = 'true';
+    process.env.MCP_HOSTED = '1';
+    process.env.K_SERVICE = 'google-multi-mcp';
+    if (opts.enforce === 'false') process.env.GOOGLE_GRANTS_ENFORCE = 'false';
+    else delete process.env.GOOGLE_GRANTS_ENFORCE;
     writeFileSync(
       configFilePath(),
       JSON.stringify({
         version: 1,
-        accounts: {
-          personal: { email: 'personal@example.com' },
-          stromback: { email: 'stromback@example.com' },
-          opcenter: { email: 'opcenter@example.com' },
-          buildcoin: { email: 'buildcoin@example.com' },
-        },
+        accounts: Object.fromEntries(PBG3.map((alias) => [alias, { email: `${alias}@example.com` }])),
       }),
     );
     invalidateAccountSet();
     resetGrantsFileCache();
     clearSessionGrant();
+    const pbg3 = resolveGrantByName('Personal Brain Grant 3');
+    const sb2 = resolveGrantByName('StrombackBrain2');
+    if (!pbg3 || !sb2) throw new Error('grants did not resolve');
+    return [pbg3, sb2];
   }
 
-  it('refuses add, reauth, and client-config writes for accounts outside the grant', async () => {
-    activateSb2();
-    const resolved = resolveGrantByName('StrombackBrain2');
-    expect(resolved?.accounts).toEqual(['stromback']);
+  it('is on by default in hosted mode and SB2 cannot reach the other five accounts', async () => {
+    const [pbg3, sb2] = activate({ enforce: 'unset' });
+    expect(isGrantEnforced()).toBe(true);
+    expect(pbg3.accounts).toEqual([...PBG3]);
+    expect(sb2.accounts).toEqual(['stromback']);
     const minted: string[] = [];
     setWizardHttpConsent({
       mintConsentUrl: (alias) => {
@@ -141,37 +153,69 @@ describe('SB2 cannot add or re-link an account outside stromback', () => {
     });
     const handlers = captureHandlers();
 
-    await runWithGrant(resolved, async () => {
-      const added = await handlers.account_add({ alias: 'outsider', email: 'outsider@example.com' });
-      expect(added.isError).toBe(true);
-      expect(added.content[0].text).toContain('account_outside_grant');
-      expect(added.content[0].text).not.toContain('opcenter');
-      expect(added.content[0].text).not.toContain('buildcoin');
-      expect(added.content[0].text).not.toContain('personal');
-
-      for (const alias of ['personal', 'opcenter', 'buildcoin']) {
-        const reauth = await handlers.account_reauth({ alias });
-        expect(reauth.isError, alias).toBe(true);
-        const body = JSON.parse(reauth.content[0].text) as { error: string; message: string; hint: string; account: string };
+    await runWithGrant(sb2, async () => {
+      for (const alias of SB2_OUTSIDERS) {
+        const added = await handlers.account_add({ alias, email: `${alias}@example.com` });
+        const body = envelope(added);
         expect(body.error, alias).toBe('account_outside_grant');
         expect(body.account, alias).toBe(alias);
-        expect(body.message, alias).toContain(alias);
         expect(body.hint, alias).toBe('This session can only add or re-link: stromback.');
+        for (const other of PBG3) {
+          if (other === alias || other === 'stromback') continue;
+          expect(body.hint, alias).not.toContain(other);
+          expect(body.message, alias).not.toContain(other);
+        }
+
+        const reauth = await handlers.account_reauth({ alias });
+        const reauthBody = envelope(reauth);
+        expect(reauthBody.error, alias).toBe('account_outside_grant');
+        expect(reauthBody.hint, alias).toBe('This session can only add or re-link: stromback.');
       }
 
       const config = await handlers.account_write_config({ write: true, client: 'claude-desktop' });
-      expect(config.isError).toBe(true);
-      expect(config.content[0].text).toContain('account_outside_grant');
-      expect(config.content[0].text).not.toContain('personal');
+      expect(envelope(config).error).toBe('account_outside_grant');
+      expect(envelope(config).hint).toBe("This session's accounts: stromback.");
       expect(applyFileEntry).not.toHaveBeenCalled();
 
       const own = await handlers.account_reauth({ alias: 'stromback' });
       expect(own.isError).toBeUndefined();
-      expect(minted).toEqual(['stromback']);
     });
+    expect(minted).toEqual(['stromback']);
+
+    minted.length = 0;
+    await runWithGrant(pbg3, async () => {
+      for (const alias of PBG3) {
+        const added = await handlers.account_add({ alias, email: `${alias}@example.com` });
+        expect(envelope(added).error, alias).not.toBe('account_outside_grant');
+        const reauth = await handlers.account_reauth({ alias });
+        expect(reauth.isError, alias).toBeUndefined();
+      }
+      const config = await handlers.account_write_config({ write: true, client: 'claude-desktop' });
+      expect(config.isError).toBeUndefined();
+      expect(config.content[0].text).not.toContain('account_outside_grant');
+      expect(applyFileEntry).toHaveBeenCalledTimes(1);
+    });
+    expect(minted).toEqual([...PBG3]);
 
     const stored = JSON.parse(readFileSync(configFilePath(), 'utf8')) as { accounts: Record<string, unknown> };
-    expect(Object.keys(stored.accounts).sort()).toEqual(['buildcoin', 'opcenter', 'personal', 'stromback']);
-    expect(stored.accounts.outsider).toBeUndefined();
+    expect(Object.keys(stored.accounts).sort()).toEqual([...PBG3].sort());
+  });
+
+  it('GOOGLE_GRANTS_ENFORCE=false is the off switch, including on a hosted process', async () => {
+    const [, sb2] = activate({ enforce: 'false' });
+    expect(isGrantEnforced()).toBe(false);
+    const minted: string[] = [];
+    setWizardHttpConsent({
+      mintConsentUrl: (alias) => {
+        minted.push(alias);
+        return `https://mcp.example.com/authorize?alias=${alias}`;
+      },
+    });
+    const handlers = captureHandlers();
+    await runWithGrant(sb2, async () => {
+      const reauth = await handlers.account_reauth({ alias: 'personal' });
+      expect(reauth.isError).toBeUndefined();
+    });
+    expect(minted).toEqual(['personal']);
   });
 });

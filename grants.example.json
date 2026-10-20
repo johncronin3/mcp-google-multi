@@ -4,7 +4,7 @@
     {
       "name": "Personal Brain Grant 3",
       "code": "REPLACE_WITH_HOST_LOCAL_CODE",
-      "accounts": ["personal", "stromback", "opcenter", "buildcoin"]
+      "accounts": ["personal", "stromback", "opcenter", "buildcoin", "usa-house", "olga"]
     },
     {
       "name": "StrombackBrain2",

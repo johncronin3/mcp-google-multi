@@ -28,7 +28,9 @@ const fixture = JSON.parse(
 describe('per-grant hosted tool surface', () => {
   it('Cosmos-related aliases stay on Personal Brain Grant 3 only', () => {
     const byName = new Map(surface.grants.map((grant) => [grant.name, grant.accounts]));
-    expect(byName.get('Personal Brain Grant 3')).toEqual(['personal', 'stromback', 'opcenter', 'buildcoin']);
+    expect(byName.get('Personal Brain Grant 3')).toEqual([
+      'personal', 'stromback', 'opcenter', 'buildcoin', 'usa-house', 'olga',
+    ]);
     expect(byName.get('StrombackBrain2')).toEqual(['stromback']);
     for (const alias of COSMOS_ALIASES) {
       expect(byName.get('Personal Brain Grant 3')).toContain(alias);

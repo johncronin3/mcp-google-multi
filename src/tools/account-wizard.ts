@@ -418,6 +418,11 @@ export function registerAccountWizardTools(
           }
           input = (form.content ?? {}) as Partial<AddForm>;
         }
+        const requested = (input.alias ?? '').trim();
+        if (requested) {
+          const early = sessionAliasRefusal(requested);
+          if (early) return early;
+        }
         const validated = validateAddForm(input, getAccountSet().aliases);
         if (!validated.ok) return errorResult(validated.slug, validated.message, validated.hint, validated.alias);
         const blocked = sessionAliasRefusal(validated.alias);
