@@ -17,7 +17,7 @@ import {
  * fixture is edited on purpose. See REVIEWED_DELTAS for the d656bec deltas.
  */
 
-const TRASH = ['gmail_trash', 'drive_trash', 'gmail_users_threads_trash'] as const;
+const TRASH = ['gmail_trash', 'drive_trash', 'gmail_users_threads_trash', 'drive_empty_trash'] as const;
 const COSMOS_ALIASES = ['personal', 'opcenter', 'buildcoin'] as const;
 
 const surface = buildHostedGrantSurface();

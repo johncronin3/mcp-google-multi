@@ -12035,7 +12035,7 @@
       "profile": "full-writes",
       "tool": "drive_empty_trash",
       "cud": "delete",
-      "callable": true,
+      "callable": false,
       "listed": true
     },
     {
@@ -25464,7 +25464,7 @@
       "profile": "full-writes",
       "tool": "drive_empty_trash",
       "cud": "delete",
-      "callable": true,
+      "callable": false,
       "listed": true
     },
     {
