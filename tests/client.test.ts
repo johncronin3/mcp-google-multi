@@ -5,6 +5,7 @@ import path from 'node:path';
 import { makeGetClient, getClient, __inflightSizeForTest, type GetClientDeps } from '../src/client.js';
 import { createTokenStore, writeToken } from '../src/token-store.js';
 import { clearKeyCacheForTest } from '../src/master-key.js';
+import { runWithGrant, type SessionGrantState } from '../src/session-grant.js';
 import type { AccountSet, Account } from '../src/accounts.js';
 
 const savedEnv: Record<string, string | undefined> = {};
@@ -69,6 +70,58 @@ describe('makeGetClient (factory + single-flight)', () => {
     // let the settle handlers run, then the lane must be empty
     await Promise.resolve();
     expect(__inflightSizeForTest()).toBe(0);
+  });
+
+  it('a pending PBG3 client is not handed to a concurrent SB2 call for the same alias', async () => {
+    const prev = process.env.GOOGLE_GRANTS_ENFORCE;
+    process.env.GOOGLE_GRANTS_ENFORCE = 'true';
+    const reads: string[] = [];
+    let release!: (token: { refresh_token: string }) => void;
+    const gate = new Promise<{ refresh_token: string }>((resolve) => {
+      release = resolve;
+    });
+    const deps: GetClientDeps = {
+      accounts: () => setOf(['personal', 'stromback']),
+      readToken: (alias) => {
+        reads.push(alias);
+        return gate;
+      },
+      updateToken: () => undefined,
+    };
+    const pbg3: SessionGrantState = {
+      code: 'test-code-pbg3-not-prod',
+      name: 'Personal Brain Grant 3',
+      accounts: ['personal', 'stromback', 'opcenter', 'buildcoin', 'usa-house', 'olga'],
+      source: 'token',
+    };
+    const sb2: SessionGrantState = {
+      code: 'test-code-sb2-not-prod',
+      name: 'StrombackBrain2',
+      accounts: ['stromback'],
+      source: 'token',
+    };
+    try {
+      const fn = makeGetClient('grant-race', deps);
+      const pending = runWithGrant(pbg3, () => fn('personal' as Account));
+      let received: unknown;
+      const outsider = runWithGrant(sb2, () => fn('personal' as Account)).then((client) => {
+        received = client;
+        return client;
+      });
+      expect(outsider).not.toBe(pending);
+      // Message is what grantBlockResult classifies as account_outside_grant.
+      await expect(outsider).rejects.toThrow(/Account "personal" is outside this session grant/);
+      expect(received).toBeUndefined();
+      expect(reads).toEqual(['personal']);
+      release({ refresh_token: 'rt-personal' });
+      const client = await pending;
+      expect(client.credentials.refresh_token).toBe('rt-personal');
+      await Promise.resolve();
+      expect(__inflightSizeForTest()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.GOOGLE_GRANTS_ENFORCE;
+      else process.env.GOOGLE_GRANTS_ENFORCE = prev;
+    }
   });
 
   it('cross-context isolation: the same alias under two contexts never shares a client or a token (#358 shape)', async () => {
