@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { denyReason, isAllowed, writeDisabledResult, type Policy, type Profile } from '../src/write-control.js';
+import { denyReason, isAllowed, writeDisabledResult, WRITE_PROFILES, type Policy, type Profile } from '../src/write-control.js';
 import type { Cud } from '../src/registry.js';
 
 const policy = (over: Partial<Policy> = {}): Policy =>
@@ -103,9 +103,19 @@ describe('denyReason', () => {
   it('is undefined when the call is permitted', () => {
     expect(denyReason(SEND, policy({ profile: 'full-writes' }))).toBeUndefined();
     expect(denyReason({ name: 'gmail_search', service: 'gmail', cud: 'read' }, policy({ readOnly: true }))).toBeUndefined();
-    // gmail_trash moves to Trash rather than deleting permanently, so
-    // safe-writes permits it like any other non-privileged write.
-    expect(denyReason(TRASH, policy({ profile: 'safe-writes' }))).toBeUndefined();
+  });
+
+  it('Trash is refused under every profile and the hint offers the per-tool allow, not another profile', () => {
+    for (const profile of WRITE_PROFILES) {
+      const p = policy({ profile });
+      expect(isAllowed(TRASH, p), profile).toBe(false);
+      expect(denyReason(TRASH, p), profile).toEqual({ rule: 'profile', profile });
+      const h = hintOf(TRASH, p);
+      expect(h, profile).toContain('GOOGLE_WRITE_ALLOW="gmail:trash"');
+      expect(h, profile).not.toContain('GOOGLE_PROFILE=');
+    }
+    expect(isAllowed(TRASH, policy({ profile: 'read-only', allow: ['gmail:trash'] }))).toBe(true);
+    expect(denyReason(TRASH, policy({ profile: 'full-writes', allow: ['gmail:trash'] }))).toBeUndefined();
   });
 
   it('reports the profile when nothing more specific refused', () => {

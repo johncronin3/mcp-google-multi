@@ -1,164 +1,96 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildRegistry } from '../src/compose.js';
-import type { IdentityContext } from '../src/identity.js';
-import { isAllowed, privilegeOf, type Policy } from '../src/write-control.js';
-import type { Cud } from '../src/registry.js';
-import { accountSet, fakeServer } from './_tool-harness.js';
+import { WRITE_PROFILES } from '../src/write-control.js';
+import {
+  REVIEWED_DELTAS,
+  buildHostedGrantSurface,
+  surfaceDrift,
+  type SurfaceRow,
+} from './hosted-grant-surface.js';
 
 /**
- * House safe-writes before #299: create and update only. Trash moves were
- * deletes and stayed denied. Grants do not select a profile; the house
- * default (GOOGLE_PROFILE unset) is read-only.
+ * Wall test 3. The hosted tool surface is built the same way production
+ * builds it and compared to tests/fixtures/hosted-grant-surface.json.
+ * That fixture is the reviewed post-fix surface (per grant × tool × profile).
+ * A tool that is newly callable, or newly listed at connect, fails until the
+ * fixture is edited on purpose. See REVIEWED_DELTAS for the d656bec deltas.
  */
-const GRANT_POLICY: Policy = { profile: 'read-only', readOnly: false, allow: [], deny: [] };
 
-const TRASH = [
-  { name: 'gmail_trash', service: 'gmail', cud: 'delete' as const },
-  { name: 'drive_trash', service: 'drive', cud: 'delete' as const },
-  { name: 'gmail_users_threads_trash', service: 'gmail', cud: 'delete' as const },
-];
-
-/** Wider-brain aliases. StrombackBrain2 is stromback only. */
+const TRASH = ['gmail_trash', 'drive_trash', 'gmail_users_threads_trash'] as const;
 const COSMOS_ALIASES = ['personal', 'opcenter', 'buildcoin'] as const;
 
-interface ToolRef {
-  name: string;
-  service: string;
-  cud: Cud;
-  scopes?: readonly string[];
-  destructiveHint: boolean;
-}
+const surface = buildHostedGrantSurface();
+const fixture = JSON.parse(
+  readFileSync(path.join(process.cwd(), 'tests/fixtures/hosted-grant-surface.json'), 'utf8'),
+) as { reviewedDeltasFromD656bec: { tool: string; change: string; why: string }[]; rows: SurfaceRow[] };
 
-function allowedBefore(tool: { name: string; service: string; cud: Cud; scopes?: readonly string[] }, policy: Policy): boolean {
-  if (tool.cud === 'read') return true;
-  if (policy.readOnly) return false;
-  if (policy.profile === 'full-writes') return true;
-  if (policy.profile === 'safe-writes') {
-    if (privilegeOf(tool) !== undefined) return false;
-    return tool.cud === 'create' || tool.cud === 'update';
-  }
-  return false;
-}
-
-function loadGrants(): { name: string; accounts: string[] }[] {
-  const raw = JSON.parse(readFileSync(path.join(process.cwd(), 'grants.example.json'), 'utf8')) as {
-    grants: { name: string; code: string; accounts: string[] }[];
-  };
-  for (const grant of raw.grants) {
-    expect(grant.code).toBe('REPLACE_WITH_HOST_LOCAL_CODE');
-  }
-  return raw.grants.map((grant) => ({ name: grant.name, accounts: [...grant.accounts] }));
-}
-
-function registeredTools(): ToolRef[] {
-  const accounts = accountSet(
-    {
-      personal: { email: 'personal@example.com' },
-      stromback: { email: 'stromback@example.com' },
-      opcenter: { email: 'opcenter@example.com' },
-      buildcoin: { email: 'buildcoin@example.com' },
-    },
-    { defaultAccount: 'personal' },
-  );
-  const ctx = {
-    subject: 'grant-allow-test',
-    accounts,
-    policy: GRANT_POLICY,
-    getClient: async () => ({ request: async () => ({ data: {} }) }),
-    tokenStore: {
-      readToken: () => null,
-      writeToken: () => undefined,
-      updateToken: () => undefined,
-      hasToken: () => false,
-    },
-  } as unknown as IdentityContext;
-  const { server } = fakeServer();
-  const registry = buildRegistry(server as never, ctx, 'eager');
-  return registry.tools.map((tool) => ({
-    name: tool.name,
-    service: tool.service,
-    cud: tool.cud,
-    scopes: tool.requiredScopes,
-    destructiveHint: tool.annotations.destructiveHint === true,
-  }));
-}
-
-describe('per-grant allowed tools before and after upstream 6.0.1', () => {
-  const tools = registeredTools();
-  const grants = loadGrants();
-
+describe('per-grant hosted tool surface', () => {
   it('Cosmos-related aliases stay on Personal Brain Grant 3 only', () => {
-    const pbg3 = grants.find((g) => g.name === 'Personal Brain Grant 3');
-    const stromback = grants.find((g) => g.name === 'StrombackBrain2');
-    expect(pbg3?.accounts).toEqual(['personal', 'stromback', 'opcenter', 'buildcoin']);
-    expect(stromback?.accounts).toEqual(['stromback']);
+    const byName = new Map(surface.grants.map((grant) => [grant.name, grant.accounts]));
+    expect(byName.get('Personal Brain Grant 3')).toEqual(['personal', 'stromback', 'opcenter', 'buildcoin']);
+    expect(byName.get('StrombackBrain2')).toEqual(['stromback']);
     for (const alias of COSMOS_ALIASES) {
-      expect(pbg3?.accounts).toContain(alias);
-      expect(stromback?.accounts).not.toContain(alias);
+      expect(byName.get('Personal Brain Grant 3')).toContain(alias);
+      expect(byName.get('StrombackBrain2')).not.toContain(alias);
     }
-    for (const grant of grants) {
+    for (const grant of surface.grants) {
       for (const alias of grant.accounts) {
-        if (/cosmos/i.test(alias)) {
-          expect(grant.name).toBe('Personal Brain Grant 3');
+        if (/cosmos/i.test(alias)) expect(grant.name).toBe('Personal Brain Grant 3');
+      }
+    }
+  });
+
+  it('matches the reviewed per-grant snapshot', () => {
+    expect(fixture.reviewedDeltasFromD656bec.map((delta) => delta.tool)).toEqual(
+      REVIEWED_DELTAS.map((delta) => delta.tool),
+    );
+    for (const delta of fixture.reviewedDeltasFromD656bec) {
+      expect(delta.why.length, delta.tool).toBeGreaterThan(20);
+    }
+    const names = new Set(surface.rows.map((row) => row.tool));
+    expect(names.has('calendar_respond_event')).toBe(true);
+    expect(names.has('gmail_delete_draft')).toBe(true);
+    expect(names.has('sheets_copy_sheet_to')).toBe(true);
+    expect(names.has('gmail_users_drafts_delete')).toBe(false);
+    const drift = surfaceDrift(surface.rows, fixture.rows);
+    expect(drift, drift.slice(0, 30).join('\n')).toEqual([]);
+  });
+
+  it('Trash is denied for every grant under every write profile', () => {
+    expect(surface.grants.map((grant) => grant.name)).toEqual(
+      expect.arrayContaining(['Personal Brain Grant 3', 'StrombackBrain2']),
+    );
+    expect(WRITE_PROFILES).toEqual(['read-only', 'safe-writes', 'full-writes']);
+    for (const grant of surface.grants) {
+      for (const profile of WRITE_PROFILES) {
+        for (const name of TRASH) {
+          const row = surface.rows.find((entry) => entry.grant === grant.name && entry.profile === profile && entry.tool === name);
+          expect(row, `${grant.name} ${profile} ${name}`).toBeTruthy();
+          expect(row?.callable, `${grant.name} ${profile} ${name}`).toBe(false);
         }
       }
     }
   });
 
-  it('neither grant allows more tools than it did before the merge', () => {
-    const before = tools.filter((tool) => allowedBefore(tool, GRANT_POLICY)).map((tool) => tool.name).sort();
-    const after = tools.filter((tool) => isAllowed(tool, GRANT_POLICY)).map((tool) => tool.name).sort();
-    expect(after).toEqual(before);
-    const added = after.filter((name) => !before.includes(name));
-    expect(added).toEqual([]);
-
-    for (const grant of grants) {
-      expect(grant.name === 'Personal Brain Grant 3' || grant.name === 'StrombackBrain2').toBe(true);
-      // The grant slices accounts. It does not widen write-control, so both
-      // grants share this allow-set and neither gained a tool.
-      expect(after.filter((name) => !before.includes(name))).toEqual([]);
-      for (const trash of TRASH) {
-        expect(isAllowed(trash, GRANT_POLICY), `${grant.name} ${trash.name}`).toBe(false);
-        expect(allowedBefore(trash, GRANT_POLICY), `${grant.name} ${trash.name} before`).toBe(false);
-      }
+  it('the read-only default blocks every non-read tool, including destructive ones', () => {
+    const nonRead = surface.rows.filter((row) => row.profile === 'read-only' && row.cud !== 'read');
+    expect(nonRead.length).toBeGreaterThan(0);
+    for (const row of nonRead) {
+      expect(row.callable, `${row.grant} ${row.tool}`).toBe(false);
     }
-  });
-
-  it('Trash stays denied for both grants, and newly destructive create/send tools are not newly allowed', () => {
-    const creates = tools.filter((tool) => tool.cud === 'create' || /_send(_|$)/.test(tool.name));
-    expect(creates.length).toBeGreaterThan(0);
-    const newlyDestructive = creates.filter((tool) => tool.destructiveHint && tool.cud !== 'delete' && tool.cud !== 'update');
-    expect(newlyDestructive.map((tool) => tool.name)).toEqual(expect.arrayContaining([
-      'gmail_send',
-      'gmail_create_draft',
-      'calendar_create_event',
-      'drive_upload',
-    ]));
-    for (const grant of ['Personal Brain Grant 3', 'StrombackBrain2']) {
-      for (const tool of newlyDestructive) {
-        expect(isAllowed(tool, GRANT_POLICY), `${grant} ${tool.name}`).toBe(false);
-        expect(allowedBefore(tool, GRANT_POLICY), `${grant} ${tool.name} before`).toBe(false);
+    const driveTrash = surface.tools.find((tool) => tool.name === 'drive_trash');
+    expect(driveTrash?.destructive).toBe(true);
+    expect(driveTrash?.listed).toBe(true);
+    const destructiveWrites = surface.tools.filter((tool) => tool.destructive && tool.cud !== 'read');
+    expect(destructiveWrites.length).toBeGreaterThan(0);
+    for (const tool of destructiveWrites) {
+      for (const grant of surface.grants) {
+        const row = surface.rows.find(
+          (entry) => entry.grant === grant.name && entry.profile === 'read-only' && entry.tool === tool.name,
+        );
+        expect(row?.callable, `${grant.name} ${tool.name}`).toBe(false);
       }
-      for (const trash of TRASH) {
-        expect(isAllowed(trash, GRANT_POLICY), `${grant} ${trash.name}`).toBe(false);
-      }
-    }
-    // #299 allows those three Trash moves only under safe-writes. That profile
-    // is not what either grant runs. Permanent deletes stay denied there too.
-    const safe: Policy = { profile: 'safe-writes', readOnly: false, allow: [], deny: [] };
-    for (const trash of TRASH) {
-      expect(allowedBefore(trash, safe)).toBe(false);
-      expect(isAllowed(trash, safe)).toBe(true);
-    }
-    const permanent = ['gmail_delete', 'drive_delete', 'drive_empty_trash', 'gmail_batch_delete'];
-    for (const name of permanent) {
-      const tool = tools.find((entry) => entry.name === name);
-      expect(tool, name).toBeTruthy();
-      expect(isAllowed(tool!, safe)).toBe(false);
-      expect(allowedBefore(tool!, safe)).toBe(false);
-      expect(isAllowed(tool!, GRANT_POLICY)).toBe(false);
     }
   });
 });

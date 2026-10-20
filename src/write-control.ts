@@ -30,7 +30,9 @@ interface ToolRef {
   scopes?: readonly string[];
 }
 
-const PROFILES: Profile[] = ['read-only', 'safe-writes', 'full-writes'];
+/** Every profile `resolvePolicy` will accept. Tests loop this so a new profile cannot skip the Trash gate. */
+export const WRITE_PROFILES: readonly Profile[] = ['read-only', 'safe-writes', 'full-writes'];
+const PROFILES: readonly Profile[] = WRITE_PROFILES;
 
 /** The irreversible set (frozen): real sends leave the
  * user's (or org's) identity unrecallably; permanent deletes bypass Trash.
@@ -128,24 +130,36 @@ export function privilegeOf(tool: ToolRef): PrivilegeKind | undefined {
   return undefined;
 }
 
-/** Moves an item to Trash rather than deleting it permanently: the owner can
- * still recover it, so safe-writes treats this like its other reversible
- * writes despite the delete-shaped verb. Named explicitly rather than matched
- * by verb, so a synthetic delete-classified check (drive_transfer's move
- * flag) never qualifies by accident, and so emptying Trash, which the same
- * verb regex also classifies as delete, is never swept in by a suffix match. */
+/**
+ * Moves to Trash. Named, not matched by a "trash" suffix, so `drive_empty_trash`
+ * and `drive_transfer`'s synthetic move ref never qualify. No profile permits
+ * these: upstream #299 opened them under safe-writes, and this house build
+ * keeps the pre-merge denial under every profile. Opt in per tool with an
+ * allow glob that matches `service:op` (`gmail:trash`), not the delete class.
+ * See docs/internals.md.
+ */
 const TRASH_MOVE_TOOLS = new Set([
   'gmail_trash',
   'drive_trash',
   'gmail_users_threads_trash',
 ]);
 
+export function isTrashMove(tool: { name: string }): boolean {
+  return TRASH_MOVE_TOOLS.has(tool.name);
+}
+
+/** True only when an allow glob matches this tool's own operation, not `service:delete`. */
+function trashExplicitlyAllowed(tool: ToolRef, policy: Policy): boolean {
+  const op = `${tool.service}:${opOf(tool)}`;
+  return policy.allow.some((g) => globToRegExp(g).test(op));
+}
+
 function profileAllows(profile: Profile, tool: ToolRef): boolean {
+  if (isTrashMove(tool)) return false;
   if (profile === 'full-writes') return true;
   if (profile === 'safe-writes') {
     if (privilegeOf(tool) !== undefined) return false;
-    if (tool.cud === 'create' || tool.cud === 'update') return true;
-    return tool.cud === 'delete' && TRASH_MOVE_TOOLS.has(tool.name);
+    return tool.cud === 'create' || tool.cud === 'update';
   }
   return false;
 }
@@ -154,6 +168,7 @@ export function isAllowed(tool: ToolRef, policy: Policy): boolean {
   if (tool.cud === 'read') return true;
   if (policy.readOnly) return false;
   if (matchesAny(tool, policy.deny)) return false;
+  if (isTrashMove(tool)) return trashExplicitlyAllowed(tool, policy);
   if (matchesAny(tool, policy.allow)) return true;
   return profileAllows(policy.profile, tool);
 }
@@ -177,6 +192,9 @@ export function denyReason(tool: ToolRef, policy: Policy): DenyReason | undefine
   if (policy.readOnly) return { rule: 'read_only' };
   const pattern = firstMatch(tool, policy.deny);
   if (pattern !== undefined) return { rule: 'deny_glob', pattern };
+  if (isTrashMove(tool)) {
+    return trashExplicitlyAllowed(tool, policy) ? undefined : { rule: 'profile', profile: policy.profile };
+  }
   if (matchesAny(tool, policy.allow)) return undefined;
   if (profileAllows(policy.profile, tool)) return undefined;
   const kind = privilegeOf(tool);

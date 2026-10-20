@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { resolvePolicy, isAllowed, describePolicy, writeDisabledResult, type Policy } from '../src/write-control.js';
+import { resolvePolicy, isAllowed, describePolicy, writeDisabledResult, WRITE_PROFILES, type Policy } from '../src/write-control.js';
 import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 import type { Cud } from '../src/registry.js';
 
@@ -72,10 +72,20 @@ describe('isAllowed', () => {
     expect(isAllowed(tool('drive_update', 'update'), safe)).toBe(true);
     expect(isAllowed(tool('drive_delete', 'delete'), safe)).toBe(false);
   });
-  it('safe-writes allows the three Trash moves, by name, despite their delete cud', () => {
-    expect(isAllowed(tool('gmail_trash', 'delete'), safe)).toBe(true);
-    expect(isAllowed(tool('drive_trash', 'delete'), safe)).toBe(true);
-    expect(isAllowed(tool('gmail_users_threads_trash', 'delete'), safe)).toBe(true);
+  it('no profile allows a Trash move; a per-tool allow glob does', () => {
+    const trash = ['gmail_trash', 'drive_trash', 'gmail_users_threads_trash'] as const;
+    for (const profile of WRITE_PROFILES) {
+      const policy: Policy = { profile, readOnly: false, allow: [], deny: [] };
+      for (const name of trash) {
+        expect(isAllowed(tool(name, 'delete'), policy), `${profile} ${name}`).toBe(false);
+      }
+    }
+    const opted: Policy = { profile: 'full-writes', readOnly: false, allow: ['gmail:trash'], deny: [] };
+    expect(isAllowed(tool('gmail_trash', 'delete'), opted)).toBe(true);
+    expect(isAllowed(tool('drive_trash', 'delete'), opted)).toBe(false);
+    const classWide: Policy = { profile: 'full-writes', readOnly: false, allow: ['gmail:delete'], deny: [] };
+    expect(isAllowed(tool('gmail_trash', 'delete'), classWide)).toBe(false);
+    expect(isAllowed(tool('gmail_delete', 'delete'), classWide)).toBe(true);
   });
   it('safe-writes still denies every permanent delete, Trash included', () => {
     expect(isAllowed(tool('gmail_delete', 'delete'), safe)).toBe(false);

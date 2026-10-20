@@ -15,7 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { ACCOUNTS } from './accounts.js';
+import { getAccountSet } from './accounts.js';
 import { isHostedHttp } from './hosted.js';
 
 export interface GrantRecord {
@@ -114,8 +114,13 @@ export function clearSessionGrant(): void {
   session = null;
 }
 
+/** Live registry, not the import-time `ACCOUNTS` snapshot: a grant names aliases that exist now. */
+function configuredAliases(): readonly string[] {
+  return getAccountSet().aliases;
+}
+
 function accountsForRecord(rec: GrantRecord): string[] {
-  const known = new Set(ACCOUNTS);
+  const known = new Set(configuredAliases());
   return rec.accounts.map((a) => a.trim()).filter((a) => a && known.has(a));
 }
 
@@ -217,15 +222,15 @@ export function setSessionGrant(code: string, label?: string): SessionGrantState
     );
   }
 
-  const known = new Set(ACCOUNTS);
+  const known = new Set(configuredAliases());
   const accounts = rec.accounts
     .map((a) => a.trim())
     .filter((a) => a && known.has(a));
 
   if (accounts.length === 0) {
     throw new Error(
-      `Grant "${rec.name}" has no accounts that match GOOGLE_ACCOUNTS ` +
-        `(configured: ${ACCOUNTS.join(', ')}).`,
+      `Grant "${rec.name}" has no accounts that match the configured registry ` +
+        `(configured: ${configuredAliases().join(', ')}).`,
     );
   }
 
@@ -249,7 +254,7 @@ export function grantFromEnvFallback(): SessionGrantState | null {
     if (!file) return null;
     const rec = file.grants.find((g) => g.code === code);
     if (!rec) return null;
-    const known = new Set(ACCOUNTS);
+    const known = new Set(configuredAliases());
     const accounts = rec.accounts.map((a) => a.trim()).filter((a) => known.has(a));
     if (accounts.length === 0) return null;
     return { code, name: rec.name, accounts, label: 'env', source: 'env' };
@@ -270,7 +275,7 @@ export function activeGrant(): SessionGrantState | null {
  * When enforcement is on and no grant → throws.
  */
 export function allowedAccounts(): string[] {
-  if (!isGrantEnforced()) return [...ACCOUNTS];
+  if (!isGrantEnforced()) return [...configuredAliases()];
   const g = activeGrant();
   if (!g) {
     throw new Error(

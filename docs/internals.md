@@ -114,6 +114,10 @@ A blank path segment collapses the path and Google routes the resulting trailing
 
 `setSessionGrant` writes process memory. Cloud Run has no sticky sessions, so a successful `set_grant` on replica A is invisible on replica B. Agents treat that `ok` as durable. Hosted (`isHostedHttp`: `MCP_HOSTED` / `K_SERVICE`) refuses the tool and points at `/oauth/authorize`. `set_grant` is CUD-overridden to `read` so the default `read-only` profile does not hide that message behind `write_disabled` (`set` otherwise infers `update`). `docker/entrypoint.sh` already exports `GOOGLE_GRANTS_PATH` from `/mnt/grants/grants.json` when unset — no second bake.
 
+### Account wizard tools are read-classified (`account-wizard.ts`)
+
+`account_add`, `account_reauth`, and `account_write_config` override cud to `read` so onboarding is not blocked by `GOOGLE_PROFILE=read-only`, and the hosted server is an owner context so they register. Write-control therefore allows them for every grant. `account_reauth` used to accept any alias in the live registry and start consent for it, which is a token write for an account the session was not given. The handlers now call `allowedAccounts()` before `writeAccountRow`, `runConsent`, or `applyFileEntry`. A miss returns `account_outside_grant` and names only the grant's aliases. `account_write_config` has no alias; it rewrites MCP client config for the process, so it refuses when any configured account is outside the grant. Grant resolution uses `getAccountSet()`, not the import-time `ACCOUNTS` snapshot, so a reloaded registry and the grant see the same aliases.
+
 ## Executor
 
 ### Request bodies on GET/HEAD (`resolveRequestBody`, `src/executor.ts`)
@@ -137,6 +141,10 @@ The seam also owns one **outbound** job (`withValidationEnvelope`). The SDK vali
 ### House connect-time curated list (`connectTimeDiscoveryMode`, `src/registry.ts`)
 
 House Streamable HTTP (`src/http.ts`) builds a fresh `McpServer` per `/mcp` request (`sessionIdGenerator` unset). `notifications/tools/list_changed` has no session to land on, and Grok Bot binds `tools/list` once at connect. With the stdio default (`lazy`), `gmail_send` and `drive_upload` stay registered and show up inside `discover_all` / `drive_discover` results, but they are absent from the snapshot Grok will call. `buildGoogleMcpServer` therefore passes `connectTimeDiscoveryMode()`: unset, `lazy`, and `curated` all advertise non-generated tools on that first list; `eager` still advertises the generated long tail. Stdio keeps `resolveDiscoveryMode()`. Bakissation `MCP_TRANSPORT=http` already forced `curated` for the same stateless reason. Listing is not a grant or a write-control bypass.
+
+### Trash is denied under every profile (`isTrashMove`, `src/write-control.ts`)
+
+Upstream #299 lets `safe-writes` call `gmail_trash`, `drive_trash`, and `gmail_users_threads_trash` because those moves are recoverable. The hosted Cloud Run default is `read-only`, so that change is invisible until someone sets `GOOGLE_PROFILE=safe-writes` (or `full-writes`). Grants do not carry a profile, so one env change would open Trash for every alias in Personal Brain Grant 3 and StrombackBrain2 together. This build keeps the pre-merge denial and extends it to `full-writes`: `profileAllows` never returns true for those three names. `isAllowed` consults an allow glob only against `service:op` (`gmail:trash`), so `gmail:delete` still does not opt in. The names are a set, not a suffix, so `drive_empty_trash` and `drive_transfer`'s synthetic move check stay on the ordinary delete path. Untrash stays an update.
 
 ### Per-server dispatch lock (`serializeFor`, `src/http-transport.ts`)
 

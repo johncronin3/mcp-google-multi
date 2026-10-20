@@ -122,7 +122,7 @@ Without a session grant, multi-account tools can reach **every** alias in `GOOGL
 1. Host-local file `grants.json` (see `grants.example.json`) maps **name + code → account aliases**.
 2. **Stdio / CLI:** call `set_grant` / `clear_grant` / `grant_status` at session start (in-process).
 3. **Hosted Grok:** enter the grant code on `/oauth/authorize`; the access JWT carries the grant *name* (`gname`) so every Cloud Run replica restores the same slice (no sticky sessions). Hosted `set_grant` is refused — it only mutates process memory and does not survive another instance.
-4. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant.
+4. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant. `account_add` and `account_reauth` refuse an alias outside that grant (`account_outside_grant`) before they write the registry or start consent. `account_write_config` refuses while any configured account sits outside the grant, because that write is process-wide.
 
 **Codes stay host-local** — never commit real codes. You may reuse the **same secret** as a My Flow grant code so operators keep one code per brain; Google only looks up its own `grants.json`.
 
@@ -160,7 +160,7 @@ Reads are never gated. **Every create/update/delete is off until you opt in** �
 | `GOOGLE_PROFILE` | Allows |
 |---|---|
 | `read-only` (default) | reads only |
-| `safe-writes` | create + update on your own data, plus moving items to or from Trash (permanent deletes and privileged writes blocked) |
+| `safe-writes` | create + update on your own data (Trash moves, permanent deletes, and privileged writes blocked) |
 | `full-writes` | everything |
 
 `GOOGLE_READ_ONLY=true` overrides all; an invalid `GOOGLE_PROFILE` falls back to `read-only`. For fine control: `GOOGLE_WRITE_ALLOW="calendar:*, sheets:update*"` and `GOOGLE_WRITE_DENY="*:delete*"` (deny wins). Each tool matches as `service:cud` and as `service:op` (its name minus the service prefix), so a tool named after its own class shares that class's pattern: `drive:update` matches `drive_update` and every other update-class Drive tool (`drive_move`, `drive_permission_update`, …). The policy applies identically to curated tools, generated tools, and the escape hatch.
@@ -176,11 +176,9 @@ The rule is derived from each method's declared scopes and name, not from a hand
 
 `GOOGLE_WRITE_ALLOW` still wins over this, because naming a tool explicitly is a deliberate opt-in. `GOOGLE_WRITE_DENY` still wins over that.
 
-### Trash is the one delete-shaped exception
+### Trash stays denied under every profile
 
-`gmail_trash`, `drive_trash`, and Gmail's generated thread-level twin only move an item to Trash, which the Drive and Gmail UIs can still recover from; `safe-writes` allows them like any other non-privileged write. Untrashing was already a plain `update` and was never refused. Every other delete, including emptying Trash, a permanent Gmail or Drive delete, and `drive_transfer`'s `move` flag, stays refused under `safe-writes`.
-
-In numbers, `safe-writes` permits 274 of 545 write tools instead of 385. It now also allows `gmail_trash`, `drive_trash`, and `gmail_users_threads_trash`, while still refusing every permanent delete, write with a privileged scope, and push-channel registration. No other `gmail`, `drive`, `calendar`, `docs`, `sheets`, `tasks` or `contacts` write is affected except the seven `*_watch` registrations.
+`gmail_trash`, `drive_trash`, and `gmail_users_threads_trash` move an item to Trash. Upstream safe-writes treats that as an ordinary write. This hosted build does not: no profile (`read-only`, `safe-writes`, or `full-writes`) permits them. Opt in to one tool with an allow glob that matches its operation, for example `GOOGLE_WRITE_ALLOW="gmail:trash"`. A delete-class pattern such as `gmail:delete` does not open Trash. `GOOGLE_WRITE_DENY` still wins over that allow. Untrash (`drive_untrash` and the generated Gmail untrash twins) is an update, so `safe-writes` still allows it. Emptying Trash, a permanent delete, and `drive_transfer`'s `move` flag stay refused under `safe-writes`.
 
 ## Services
 

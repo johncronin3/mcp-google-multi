@@ -107,15 +107,17 @@ controlled by the deployment's `GOOGLE_PROFILE`:
 
 - **`read-only`** (the default): every write refused.
 - **`safe-writes`**: ordinary creates and updates on your own data are
-  allowed, and so is moving an item to or from Trash (`gmail_trash`,
-  `drive_trash`, and their untrash equivalents) since that is recoverable.
-  Permanent deletes (emptying Trash, a hard Gmail or Drive delete),
-  `drive_transfer` with `move: true`, and privileged writes (anything needing
-  an admin, Vault, reseller, or script scope, or registering a push channel)
-  stay refused under this profile.
-- **`full-writes`**: everything permitted by OAuth scope and the account's
-  grants, privileged writes included. An operator's allow and deny patterns
-  can widen or narrow any profile.
+  allowed, including untrash. Moving an item **to** Trash (`gmail_trash`,
+  `drive_trash`, `gmail_users_threads_trash`) is refused under this profile
+  and under `full-writes`. Permanent deletes (emptying Trash, a hard Gmail
+  or Drive delete), `drive_transfer` with `move: true`, and privileged writes
+  (anything needing an admin, Vault, reseller, or script scope, or
+  registering a push channel) stay refused under `safe-writes`.
+- **`full-writes`**: writes permitted by OAuth scope and the account's
+  grants, privileged writes included. Trash moves stay refused. An operator's
+  allow and deny patterns can widen or narrow any profile; one Trash tool
+  opens only when an allow pattern matches that tool's operation
+  (`gmail:trash`, not `gmail:delete`).
 
 A write a profile refuses comes back as `{ error: "write_disabled", message,
 hint, retriable: false }` rather than a silent no-op or a generic failure.
