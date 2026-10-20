@@ -5,6 +5,7 @@ import { expandPath, isGoogleApiUrl } from './discovery-client.js';
 import { handleGoogleApiError } from './tools/_errors.js';
 import { scopeHintForMethod, type ScopeSetDeps } from './scope-observability.js';
 import { checkOutboundForMethod } from './outbound-allowlist.js';
+import { refusedAccountResult } from './session-grant.js';
 
 export const MAX_RESPONSE_CHARS = 100_000;
 
@@ -120,6 +121,9 @@ export async function executeApiMethod(method: ApiMethodRef, args: ExecuteArgs, 
       true,
     );
   }
+
+  const refused = refusedAccountResult(args.account);
+  if (refused) return refused;
 
   try {
     const getClientFn = deps.getClientFn ?? getClient;

@@ -292,6 +292,90 @@ export function assertAccountAllowed(alias: string): void {
   }
 }
 
+const ACCOUNT_ARG_KEYS = ['account', 'fromAccount', 'toAccount'] as const;
+
+function grantBlockResult(message: string, account?: string) {
+  const error = message.includes('outside this session grant') ? 'account_outside_grant' : 'grant_required';
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          error,
+          message,
+          retriable: false,
+          ...(account ? { account } : {}),
+        }),
+      },
+    ],
+    isError: true as const,
+  };
+}
+
+/**
+ * Refusal for one alias (or a CSV of aliases) before any client is built.
+ * `*` is a fan-out selector and is resolved against allowedAccounts() there.
+ * Returns null when the call may proceed.
+ */
+export function refusedAccountResult(alias: unknown) {
+  if (typeof alias !== 'string' || alias === '' || alias === '*') return null;
+  const tokens = alias.includes(',') ? alias.split(',').map((t) => t.trim()).filter(Boolean) : [alias];
+  for (const token of tokens) {
+    if (token === '*') continue;
+    try {
+      assertAccountAllowed(token);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return grantBlockResult(message, token);
+    }
+  }
+  return null;
+}
+
+/** Every account-shaped argument on a tool call, checked before the handler runs. */
+export function grantRefusalForCallArgs(args: unknown) {
+  if (!args || typeof args !== 'object') return null;
+  const rec = args as Record<string, unknown>;
+  for (const key of ACCOUNT_ARG_KEYS) {
+    const refused = refusedAccountResult(rec[key]);
+    if (refused) return refused;
+  }
+  return null;
+}
+
+/** Configured default, or null when it is unset or outside the session grant. */
+export function usableDefaultAlias(def: string | undefined): string | null | 'missing_grant' {
+  if (!isGrantEnforced()) return def ?? null;
+  try {
+    const allowed = allowedAccounts();
+    if (def && allowed.includes(def)) return def;
+    return null;
+  } catch {
+    return 'missing_grant';
+  }
+}
+
+/** Aliases a no-default hint may name. Out-of-grant aliases are omitted. */
+export function aliasesForHint(aliases: readonly string[]): string[] | 'missing_grant' {
+  if (!isGrantEnforced()) return [...aliases];
+  try {
+    const allowed = new Set(allowedAccounts());
+    return aliases.filter((alias) => allowed.has(alias));
+  } catch {
+    return 'missing_grant';
+  }
+}
+
+export function missingGrantResult() {
+  let message = 'No session grant. Fail-closed: without a grant, no accounts are visible.';
+  try {
+    allowedAccounts();
+  } catch (e) {
+    message = e instanceof Error ? e.message : String(e);
+  }
+  return grantBlockResult(message);
+}
+
 export function grantStatusSummary(): {
   enforced: boolean;
   authenticated: boolean;

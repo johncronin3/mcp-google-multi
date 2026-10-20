@@ -7,6 +7,7 @@ import { coerceJson } from './_coerce.js';
 import { getToolsets, toolsetEnabled, type Toolsets } from '../toolsets.js';
 import { editDistance, SUGGEST_MAX_INPUT } from '../scope-catalog.js';
 import { executeApiMethod, jsonResult, type ExecuteDeps, type QueryParams } from '../executor.js';
+import { refusedAccountResult } from '../session-grant.js';
 import {
   SUPPORTED_APIS,
   resolveApiAliases,
@@ -193,6 +194,8 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
       _meta: { 'anthropic/maxResultSizeChars': 100_000 },
     },
     async ({ account, api, methodId, pathParams, queryParams, body }) => {
+      const refused = refusedAccountResult(account);
+      if (refused) return refused;
       const resolved = resolveApiAliases(api as string);
       if (!resolved) {
         return jsonResult({ error: 'unknown_api', message: `Unknown api "${api}".`, hint: `Known APIs: ${apiList}`, retriable: false, account }, true);
