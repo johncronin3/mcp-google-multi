@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9,6 +9,7 @@ import {
   isGrantEnforced,
   loadGrantsFile,
   resetGrantsFileCache,
+  resolveGrantByCode,
   resolveGrantByName,
   runWithGrant,
   setSessionGrant,
@@ -17,6 +18,7 @@ import {
   jwtAccessGrantGate,
   hostedSetGrantRefusal,
   activeGrant,
+  grantDigest,
   grantFromEnvFallback,
   staticBearerGrant,
 } from '../src/session-grant.js';
@@ -262,6 +264,35 @@ describe('session-grant', () => {
     expect(bound?.name).toBe('stromback-test');
     expect(bound?.accounts).toEqual(['test']);
     expect(bound?.code).toBe('');
+  });
+
+  it('resolveGrantByCode and the env lookup compare every grant with timingSafeEqual', () => {
+    writeGrants({
+      StrombackBrain2: ['test'],
+      'Personal Brain Grant 3': ['test'],
+      'stromback-test': ['test'],
+    });
+    const grants = loadGrantsFile();
+    expect(grants?.grants).toHaveLength(3);
+    const first = 'grant-code-0-StrombackBrain2';
+    const spy = vi.spyOn(grantDigest, 'timingSafeEqual');
+    try {
+      spy.mockClear();
+      const byCode = resolveGrantByCode(first);
+      expect(byCode?.name).toBe('StrombackBrain2');
+      expect(spy).toHaveBeenCalledTimes(grants!.grants.length);
+
+      clearSessionGrant();
+      delete process.env.MCP_HOSTED;
+      process.env.GOOGLE_GRANT_CODE = first;
+      spy.mockClear();
+      const byEnv = grantFromEnvFallback();
+      expect(byEnv?.name).toBe('StrombackBrain2');
+      expect(byEnv?.source).toBe('env');
+      expect(spy).toHaveBeenCalledTimes(grants!.grants.length);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('desk GOOGLE_GRANT_CODE still applies outside a request', () => {
