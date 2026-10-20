@@ -14,4 +14,7 @@ fi
 export MCP_TRANSPORT=http
 # Fail closed even if the grants mount is empty. The static-bearer grant name stays unset.
 export GOOGLE_GRANTS_ENFORCE=1
+# Secret Manager file mount, name only. The secret is not created here.
+# Cloud Run volume: /mnt/jwt-signing-key = google-mcp-jwt-signing-key
+export MCP_JWT_SIGNING_KEY_FILE=/mnt/jwt-signing-key/google-mcp-jwt-signing-key
 exec node dist/http.js

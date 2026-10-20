@@ -100,7 +100,10 @@ Each account can point at a named **scope profile** so consent is exactly what t
 | `GOOGLE_GRANTS_PATH` | — | host-local grants file (default: `~/.config/mcp-google-multi/grants.json`) — see [Session grants](#session-grants-my-flowstyle) |
 | `GOOGLE_GRANTS_ENFORCE` | — | `true` force fail-closed grants; `false` disable even if grants file exists; default = enforce when file has ≥1 grant |
 | `GOOGLE_GRANT_CODE` | — | optional process-wide fallback code (prefer session tool `set_grant` or Grok OAuth-bound grant) |
-| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for house `POST /mcp` (Secret Manager). Grok OAuth wraps this token only. |
+| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for house `POST /mcp` (Secret Manager). Grok OAuth password field checks this value. It does not sign JWTs. |
+| `MCP_JWT_SIGNING_KEY_FILE` | hosted | File path of the house Grok JWT signing key (Secret Manager mount `google-mcp-jwt-signing-key`). At least 32 bytes. Missing, short, or unreadable fails closed on hosted and does not fall back to the bearer. |
+| `MCP_JWT_SIGNING_KEY` | desk | Same key as an env string for desk/stdio only. Ignored on hosted (`MCP_HOSTED` / `K_SERVICE`). At least 32 bytes. |
+| `MCP_OAUTH_REFRESH_TTL` | 30 days | House Grok refresh-token lifetime in seconds. Access tokens are 1 hour. Refresh keeps `gname`. |
 | `MCP_HTTP_TOKEN_GRANT` | — | Optional grant **name** bound to the static `MCP_HTTP_TOKEN` / `MCP_API_KEY` bearer. Resolved from the grants file on every request and wrapped in `runWithGrant`. Unset (the default) or unknown → that request is grantless and fails closed. It does not inherit in-process `set_grant` or `GOOGLE_GRANT_CODE`. Not set in deploy files. |
 | `MCP_PUBLIC_HOST` | hosted | Public hostname for house Streamable HTTP. Never `localhost:8787`. |
 | `MCP_HOSTED` | — | `1` force hosted (no browser, no 8000/8787/4242); `0` force desk. Cloud Run sets `K_SERVICE`. |

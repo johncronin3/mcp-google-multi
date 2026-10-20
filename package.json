@@ -80,7 +80,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "vitest run",
-    "test:http": "vitest run tests/http-mcp.test.ts tests/hosted-oauth.test.ts tests/hosted.test.ts tests/static-bearer-grant.test.ts",
+    "test:http": "vitest run tests/http-mcp.test.ts tests/hosted-oauth.test.ts tests/hosted.test.ts tests/static-bearer-grant.test.ts tests/jwt-signing-key.test.ts",
     "start:http": "node dist/http.js",
     "test:watch": "vitest",
     "gen:discovery": "tsx scripts/fetch-discovery.ts",
