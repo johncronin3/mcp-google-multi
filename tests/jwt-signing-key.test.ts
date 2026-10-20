@@ -2,7 +2,7 @@
  * House Grok JWTs are signed with a key that is not the static bearer.
  * Hosted reads MCP_JWT_SIGNING_KEY_FILE only and fails closed when it cannot.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import http from 'node:http';
@@ -480,10 +480,14 @@ describe('house Grok JWT signing key', () => {
 
   it('authorization code minted before notBefore is refused at exchange', async () => {
     expect(grantRecordByName(PBG3)?.name).toBe(PBG3);
-    const code = authorizationCode();
-    expect(Number(verifyJwt(code)?.iat)).toBeLessThan(Date.now() / 1000 + 5);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-01-15T12:00:00.000Z'));
     const original = readFileSync(grantsPath, 'utf8');
     try {
+      const code = authorizationCode();
+      const iat = Number(verifyJwt(code)?.iat);
+      const cutoffMs = (iat + 1) * 1000;
+      expect(iat * 1000).toBeLessThan(cutoffMs);
       writeFileSync(
         grantsPath,
         JSON.stringify({
@@ -492,16 +496,20 @@ describe('house Grok JWT signing key', () => {
             name: PBG3,
             code: 'test-code-pbg3-not-prod-ok',
             accounts: ALL,
-            notBefore: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            notBefore: new Date(cutoffMs).toISOString(),
           }],
         }),
         'utf8',
       );
+      vi.setSystemTime(cutoffMs + 1000);
+      expect(Date.now()).toBeGreaterThan(cutoffMs);
+      expect(verifyJwt(code)?.typ).toBe('code');
       const refused = await exchangeCode(code);
       expect(refused.status).toBe(400);
       expect(JSON.parse(refused.text).error).toBe('invalid_grant');
       expect(refused.text).not.toContain('access_token');
     } finally {
+      vi.useRealTimers();
       writeFileSync(grantsPath, original, 'utf8');
       resetGrantsFileCache();
     }
