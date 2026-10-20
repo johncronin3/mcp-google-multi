@@ -122,6 +122,10 @@ GOOGLE_GRANTS_ENFORCE=true
 Grant **codes** stay in host-local `grants.json`. Names `Personal Brain Grant 3` and
 `StrombackBrain2` are public; codes are not.
 
+## Per-call audit log
+
+On the hosted server (`MCP_HOSTED` / `K_SERVICE`), every `tools/call` writes one JSON line to stderr. Fields, and only these: `grant` (the grant **name**), `accounts` (alias list from `account` / `fromAccount` / `toAccount`), `tool`, `outcome` (`allowed`, `denied:<slug>`, or `error:<class>`), `timestamp`. Arguments, message bodies, subjects, recipients, file names, ids, tokens, and grant codes are not written.
+
 ## Copy to the next server
 
 1. Keep singular provider OAuth as a desk CLI (`auth --account` / QBO company mint).

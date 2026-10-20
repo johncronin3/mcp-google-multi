@@ -9,6 +9,8 @@ import type { ArgKind, ArgShape } from './arg-normalize.js';
 import type { Metrics } from './usage-metrics.js';
 import { MAX_SUGGESTED_KEYS, suggestKeys } from './arg-strict.js';
 import { classifyScope } from './scope-observability.js';
+import { isHostedHttp } from './hosted.js';
+import { auditToolCall } from './audit-log.js';
 
 /** Nothing granted, no profile: asks the BUNDLE CATALOG whether a scope is
  * reachable at all, independently of any account. */
@@ -317,8 +319,12 @@ export class ToolRegistry {
             },
           )
         : finalHandler;
+      // Hosted tools/call audit only. Stdio stays on `instrumented` with no wrapper.
+      const dispatched = isHostedHttp()
+        ? (...args: unknown[]) => auditToolCall(name, args[0], () => instrumented(...args))
+        : instrumented;
       const { cud: _cud, ...sdkConfig } = config;
-      return (server.registerTool as (...a: unknown[]) => unknown)(name, { ...sdkConfig, inputSchema: inputShape, annotations }, instrumented);
+      return (server.registerTool as (...a: unknown[]) => unknown)(name, { ...sdkConfig, inputSchema: inputShape, annotations }, dispatched);
     }) as McpServer['registerTool'];
   }
 
