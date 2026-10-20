@@ -45,7 +45,7 @@ delete process.env.MCP_OAUTH_REFRESH_TTL;
 const { createHttpRequestListener, publicMcpHost } = await import('../src/http.js');
 const { grantRecordByName, resetGrantsFileCache } = await import('../src/session-grant.js');
 const { invalidateAccountSet } = await import('../src/accounts.js');
-const { signJwt, verifyJwt } = await import('../src/oauth.js');
+const { pkceS256, signJwt, verifyJwt } = await import('../src/oauth.js');
 
 invalidateAccountSet();
 resetGrantsFileCache();
@@ -441,6 +441,82 @@ describe('house Grok JWT signing key', () => {
       const listed = JSON.parse(mcpText(ok.text));
       expect(listed.error).toBeUndefined();
       expect(listed.accounts.map((row: { alias: string }) => row.alias).sort()).toEqual([...ALL].sort());
+    } finally {
+      writeFileSync(grantsPath, original, 'utf8');
+      resetGrantsFileCache();
+    }
+  });
+
+  const CODE_VERIFIER = 'exchange-verifier-not-a-production-secret';
+  const CODE_REDIRECT = 'https://grok.com/connectors-oauth-exchange-code/';
+
+  function authorizationCode(): string {
+    return signJwt(
+      {
+        typ: 'code',
+        cid: 'grok',
+        ru: CODE_REDIRECT,
+        ch: pkceS256(CODE_VERIFIER),
+        sc: 'mcp:tools',
+        gname: PBG3,
+      },
+      300,
+    );
+  }
+
+  function exchangeCode(code: string) {
+    return request({
+      method: 'POST',
+      path: '/oauth/token',
+      form: {
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: CODE_REDIRECT,
+        code_verifier: CODE_VERIFIER,
+        client_id: 'grok',
+      },
+    });
+  }
+
+  it('authorization code minted before notBefore is refused at exchange', async () => {
+    expect(grantRecordByName(PBG3)?.name).toBe(PBG3);
+    const code = authorizationCode();
+    expect(Number(verifyJwt(code)?.iat)).toBeLessThan(Date.now() / 1000 + 5);
+    const original = readFileSync(grantsPath, 'utf8');
+    try {
+      writeFileSync(
+        grantsPath,
+        JSON.stringify({
+          version: 1,
+          grants: [{
+            name: PBG3,
+            code: 'test-code-pbg3-not-prod-ok',
+            accounts: ALL,
+            notBefore: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          }],
+        }),
+        'utf8',
+      );
+      const refused = await exchangeCode(code);
+      expect(refused.status).toBe(400);
+      expect(JSON.parse(refused.text).error).toBe('invalid_grant');
+      expect(refused.text).not.toContain('access_token');
+    } finally {
+      writeFileSync(grantsPath, original, 'utf8');
+      resetGrantsFileCache();
+    }
+  });
+
+  it('authorization code whose grant was removed is refused at exchange', async () => {
+    const code = authorizationCode();
+    expect(grantRecordByName(PBG3)?.name).toBe(PBG3);
+    const original = readFileSync(grantsPath, 'utf8');
+    try {
+      writeFileSync(grantsPath, JSON.stringify({ version: 1, grants: [] }), 'utf8');
+      const refused = await exchangeCode(code);
+      expect(refused.status).toBe(400);
+      expect(JSON.parse(refused.text).error).toBe('invalid_grant');
+      expect(refused.text).not.toContain('access_token');
     } finally {
       writeFileSync(grantsPath, original, 'utf8');
       resetGrantsFileCache();

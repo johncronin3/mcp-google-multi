@@ -104,6 +104,10 @@ describe('Cloud Run deploy template', () => {
     expect(run.stderr).toMatch(/exit 2/);
     expect(run.stdout).not.toMatch(/gcloud/);
   });
+
+  it('TRAIL.md points at deploy/google-mcp.sh', () => {
+    expect(read('TRAIL.md')).toContain('deploy/google-mcp.sh');
+  });
 });
 
 describe('Railway config (B17)', () => {

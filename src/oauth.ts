@@ -304,6 +304,19 @@ async function formOrJson(req: IncomingMessage): Promise<Record<string, string>>
   );
 }
 
+/**
+ * Refresh and authorization-code exchange share this. A named grant that is
+ * gone, or a token issued before notBefore, must not mint a new iat.
+ * An empty gname is left to the caller, matching the previous refresh path.
+ */
+function liveGrantAdmits(payload: JwtPayload): boolean {
+  const gname = typeof payload.gname === 'string' ? payload.gname.trim() : '';
+  if (!gname) return true;
+  const rec = grantRecordByName(gname);
+  if (!rec || tokenPredatesGrant(Number(payload.iat), rec)) return false;
+  return true;
+}
+
 function issueTokens(clientId: string, scope: string, grantName: string | undefined): Record<string, unknown> {
   const extra: JwtPayload = { cid: clientId, sc: scope, sub: 'google-multi' };
   if (grantName) extra.gname = grantName;
@@ -422,14 +435,9 @@ async function tokenPost(req: IncomingMessage, res: ServerResponse): Promise<voi
       json(res, 400, { error: 'invalid_grant' }, headers);
       return;
     }
-    const gname = typeof payload.gname === 'string' ? payload.gname.trim() : '';
-    if (gname) {
-      const rec = grantRecordByName(gname);
-      const iat = Number(payload.iat);
-      if (!rec || tokenPredatesGrant(iat, rec)) {
-        json(res, 400, { error: 'invalid_grant' }, headers);
-        return;
-      }
+    if (!liveGrantAdmits(payload)) {
+      json(res, 400, { error: 'invalid_grant' }, headers);
+      return;
     }
     json(
       res,
@@ -459,6 +467,10 @@ async function tokenPost(req: IncomingMessage, res: ServerResponse): Promise<voi
   }
   const verifier = data.code_verifier || '';
   if (!verifier || pkceS256(verifier) !== payload.ch) {
+    json(res, 400, { error: 'invalid_grant' }, headers);
+    return;
+  }
+  if (!liveGrantAdmits(payload)) {
     json(res, 400, { error: 'invalid_grant' }, headers);
     return;
   }

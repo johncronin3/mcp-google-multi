@@ -149,11 +149,17 @@ function assertGrantSecret(g: GrantRecord): void {
   }
 }
 
+/**
+ * Object so tests can spy. `node:crypto`'s namespace is not configurable,
+ * so `vi.spyOn(crypto, 'timingSafeEqual')` cannot see this call.
+ */
+export const grantDigest = { timingSafeEqual };
+
 /** SHA-256 then timingSafeEqual so unequal lengths still compare in constant time. */
 function secretEquals(provided: string, expected: string): boolean {
   const a = createHash('sha256').update(provided, 'utf8').digest();
   const b = createHash('sha256').update(expected, 'utf8').digest();
-  return timingSafeEqual(a, b);
+  return grantDigest.timingSafeEqual(a, b);
 }
 
 /** Lookup by secret code. Does not activate. Used by OAuth authorize (layer 3). */
