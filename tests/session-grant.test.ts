@@ -16,6 +16,7 @@ import {
   jwtAccessGrantGate,
   hostedSetGrantRefusal,
   activeGrant,
+  staticBearerGrant,
 } from '../src/session-grant.js';
 
 // ACCOUNTS come from process env at module load — setup.ts / env must define them.
@@ -42,6 +43,8 @@ describe('session-grant', () => {
     delete process.env.GOOGLE_GRANTS_PATH;
     delete process.env.GOOGLE_GRANTS_ENFORCE;
     delete process.env.GOOGLE_GRANT_CODE;
+    delete process.env.MCP_HTTP_TOKEN_GRANT;
+    delete process.env.MCP_HOSTED;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -170,6 +173,44 @@ describe('session-grant', () => {
     clearSessionGrant();
     expect(activeGrant()).toBeNull();
     expect(() => allowedAccounts()).toThrow(/No session grant/);
+  });
+
+  it('staticBearerGrant is null unless MCP_HTTP_TOKEN_GRANT names a grant', () => {
+    writeGrants({ 'stromback-test': ['test'], 'Personal Brain Grant 3': ['test'] });
+    delete process.env.MCP_HTTP_TOKEN_GRANT;
+    expect(staticBearerGrant()).toBeNull();
+    process.env.MCP_HTTP_TOKEN_GRANT = '   ';
+    expect(staticBearerGrant()).toBeNull();
+    process.env.MCP_HTTP_TOKEN_GRANT = 'missing-grant';
+    expect(staticBearerGrant()).toBeNull();
+    process.env.MCP_HTTP_TOKEN_GRANT = 'stromback-test';
+    const bound = staticBearerGrant();
+    expect(bound?.name).toBe('stromback-test');
+    expect(bound?.accounts).toEqual(['test']);
+    expect(bound?.code).toBe('');
+  });
+
+  it('desk GOOGLE_GRANT_CODE still applies outside a request', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    process.env.GOOGLE_GRANT_CODE = 'code_0_StrombackBrain2';
+    expect(activeGrant()?.source).toBe('env');
+    expect(allowedAccounts()).toEqual(['test']);
+  });
+
+  it('hosted activeGrant ignores in-process set_grant and GOOGLE_GRANT_CODE', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    process.env.MCP_HOSTED = '1';
+    setSessionGrant('code_0_StrombackBrain2');
+    process.env.GOOGLE_GRANT_CODE = 'code_0_StrombackBrain2';
+    expect(activeGrant()).toBeNull();
+    expect(grantStatusSummary().authenticated).toBe(false);
+    expect(grantStatusSummary().accounts).toEqual([]);
+    expect(() => allowedAccounts()).toThrow(/No session grant/);
+    runWithGrant(resolveGrantByName('StrombackBrain2'), () => {
+      expect(activeGrant()?.name).toBe('StrombackBrain2');
+      expect(allowedAccounts()).toEqual(['test']);
+    });
+    expect(activeGrant()).toBeNull();
   });
 
   it('hostedSetGrantRefusal is set only when hosted', () => {

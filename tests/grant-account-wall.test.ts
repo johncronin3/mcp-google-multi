@@ -243,6 +243,19 @@ describe('SB2 wall: paths that skip fan-out', () => {
     expect(getClient).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
     expect(minted).toEqual([]);
+
+    const listed = buildListed();
+    await runWithGrant(null, async () => {
+      const diagnosed = parseResult(await listed.call('diagnose'));
+      expect(diagnosed.error).toBe('grant_required');
+      const blob = JSON.stringify(diagnosed);
+      for (const alias of EVERY_ALIAS) {
+        expect(blob, alias).not.toContain(alias);
+      }
+      expect(blob).not.toContain('@');
+    });
+    expect(listed.getClient).not.toHaveBeenCalled();
+    expect(listed.tokenReads).toEqual([]);
   });
 
   it('an SB2 session sees nothing outside stromback from discover, diagnose, and grant_status', async () => {

@@ -36,7 +36,7 @@ import {
   isJwtAccessToken,
   isOAuthPath,
 } from './oauth.js';
-import { jwtAccessGrantGate, resolveGrantByName, runWithGrant } from './session-grant.js';
+import { jwtAccessGrantGate, resolveGrantByName, runWithGrant, staticBearerGrant } from './session-grant.js';
 
 export { DEFAULT_PUBLIC_MCP_HOST, publicMcpHost };
 
@@ -217,10 +217,13 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   }
 
   try {
+    // JWT restores gname. A static bearer restores only MCP_HTTP_TOKEN_GRANT
+    // (unset → null). Neither path inherits in-process set_grant or GOOGLE_GRANT_CODE.
+    // OAuth/consent (handleOAuth) is not this branch.
     if (jwt) {
       await runWithGrant(tokenGrant, () => handleMcp(req, res));
     } else {
-      await handleMcp(req, res);
+      await runWithGrant(staticBearerGrant(), () => handleMcp(req, res));
     }
   } catch (err) {
     console.error('google-multi-mcp http error:', err);

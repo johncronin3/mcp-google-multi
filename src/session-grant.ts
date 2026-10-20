@@ -7,7 +7,9 @@
  *
  * Hosted HTTP restores the slice from the Grok access JWT (`gname`) via
  * AsyncLocalStorage so Cloud Run replicas need no sticky sessions.
- * Stdio / static Bearer still use in-process set_grant.
+ * Stdio still uses in-process set_grant. A static MCP bearer does not:
+ * it is wrapped in runWithGrant of MCP_HTTP_TOKEN_GRANT (unset = null).
+ * On hosted, a request has only that ALS grant or null.
  * Codes never appear in repo examples as real values.
  */
 
@@ -151,8 +153,20 @@ export function resolveGrantByName(name: string): SessionGrantState | null {
 }
 
 /**
+ * Named grant for a static MCP_HTTP_TOKEN / MCP_API_KEY bearer.
+ * Unset, blank, or unknown → null (fail closed). Resolved on every call.
+ * Never the in-process set_grant session and never GOOGLE_GRANT_CODE.
+ */
+export function staticBearerGrant(env: NodeJS.ProcessEnv = process.env): SessionGrantState | null {
+  const name = (env.MCP_HTTP_TOKEN_GRANT || '').trim();
+  if (!name) return null;
+  return resolveGrantByName(name);
+}
+
+/**
  * HTTP-gate reason when a layer-2 access JWT must carry a resolvable layer-3 `gname`.
- * See docs/internals.md (session grants). Static Bearer is not this path.
+ * See docs/internals.md (session grants). Static Bearer is not this path:
+ * it enters runWithGrant(staticBearerGrant()) instead of this 403.
  */
 export function jwtAccessGrantGate(
   grantName: string | undefined,
@@ -266,6 +280,10 @@ export function grantFromEnvFallback(): SessionGrantState | null {
 export function activeGrant(): SessionGrantState | null {
   const store = als.getStore();
   if (store) return store.grant;
+  // Hosted has no sticky session. A request's grant is only the ALS value
+  // set at the HTTP entry (JWT gname or MCP_HTTP_TOKEN_GRANT). No module
+  // set_grant and no GOOGLE_GRANT_CODE.
+  if (isHostedHttp()) return null;
   return session ?? grantFromEnvFallback();
 }
 
@@ -406,16 +424,10 @@ export function grantStatusSummary(): {
 } {
   const file = loadGrantsFile();
   const enforced = isGrantEnforced();
-  const store = als.getStore();
-  const sess = store ? store.grant : session;
-  const envG = !sess && !store ? grantFromEnvFallback() : null;
-  const g = sess ?? envG;
+  const g = activeGrant();
   const code = g?.code;
-  const source: 'session' | 'env' | 'token' | null = sess
-    ? (sess.source === 'token' ? 'token' : 'session')
-    : envG
-      ? 'env'
-      : null;
+  const source: 'session' | 'env' | 'token' | null =
+    g?.source === 'token' ? 'token' : g?.source === 'env' ? 'env' : g ? 'session' : null;
   return {
     enforced,
     authenticated: Boolean(g),

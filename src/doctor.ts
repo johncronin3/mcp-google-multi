@@ -16,7 +16,7 @@ import { safeMessage, stringifyEnvelope } from './tools/_errors.js';
 import { resolveHttpConfig, HttpConfigError, type HttpConfig } from './http-config.js';
 import { parseOwnerEmails } from './http-transport.js';
 import { hints } from './hint-provider.js';
-import { aliasesVisibleToSession, isGrantEnforced } from './session-grant.js';
+import { aliasesVisibleToSession, allowedAccounts, isGrantEnforced, missingGrantResult } from './session-grant.js';
 
 // One engine (runDiagnostics), two skins; `doctor` (CLI glyph) and `diagnose`
 // (agent tool, structured). Read-only: no mutation, only probes.
@@ -556,6 +556,15 @@ export function registerDiagnoseTool(registry: ToolRegistry, ctx?: DiagnoseConte
     },
     async () => {
       try {
+        // Empty intersection with a real grant is an empty report. No grant
+        // is grant_required — same envelope as account_list.
+        if (isGrantEnforced()) {
+          try {
+            allowedAccounts();
+          } catch {
+            return missingGrantResult();
+          }
+        }
         const scoped: DiagnosticsDeps = {
           ...deps,
           accountSet: () => grantScopedAccountSet(deps.accountSet()),

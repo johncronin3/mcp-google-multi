@@ -11,6 +11,20 @@
 !/package-lock.json
 !/tsconfig.json
 !/src/**
+# Last match wins. Re-exclude secrets the src allow would otherwise upload.
+src/**/.env*
+src/**/*.enc
+src/**/*.pem
+src/**/*.key
+src/**/*.p12
+src/**/*.pfx
+src/**/*.token
+src/**/master.key
+src/**/id_rsa
+src/**/id_rsa.*
+src/**/credentials.json
+src/**/*credentials*.json
+src/**/mcp-tokens.enc
 !/docker/entrypoint.sh
 bin/
 *.mjs
