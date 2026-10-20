@@ -2,9 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { ToolRegistry } from '../src/registry.js';
 
-// S1.20: the wizard's transport seams. applyFileEntry is hard-mocked to THROW:
-// if any path under test reaches it over HTTP, the test fails loudly instead
-// of editing real client configs on the dev machine.
+// applyFileEntry is hard-mocked to THROW, so any path reaching it over HTTP
+// fails loudly instead of editing real client configs on the dev machine.
 vi.mock('../src/client-config.js', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../src/client-config.js')>();
   return {
@@ -34,10 +33,12 @@ function captureHandlers(awaitingRestart?: () => string[]): { handlers: Record<s
 
 const savedEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
-  for (const k of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'MCP_TRANSPORT', 'MCP_PUBLIC_URL', 'GOOGLE_ACCOUNTS']) savedEnv[k] = process.env[k];
+  for (const k of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'MCP_TRANSPORT', 'MCP_PUBLIC_URL', 'GOOGLE_ACCOUNTS', 'K_SERVICE', 'MCP_HOSTED']) savedEnv[k] = process.env[k];
   process.env.GOOGLE_CLIENT_ID = 'wizard-test-id';
   process.env.GOOGLE_CLIENT_SECRET = 'wizard-test-secret';
   delete process.env.GOOGLE_ACCOUNTS;
+  delete process.env.K_SERVICE;
+  delete process.env.MCP_HOSTED;
 });
 afterEach(() => {
   setWizardHttpConsent(null);
@@ -48,7 +49,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('runConsent over HTTP (S1.20)', () => {
+describe('runConsent over HTTP', () => {
   it('account_reauth hands out the minted consent URL up front and never binds a loopback', async () => {
     const { handlers } = captureHandlers();
     const minted: string[] = [];
@@ -89,7 +90,7 @@ describe('runConsent over HTTP (S1.20)', () => {
   });
 });
 
-describe('account_add refresh nudge (S1.10-A)', () => {
+describe('account_add refresh nudge', () => {
   it('a successful add fires sendToolListChanged so clients re-fetch the live enums', async () => {
     const { handlers, server } = captureHandlers();
     setWizardHttpConsent({ mintConsentUrl: (alias) => `https://mcp.example.com/authorize?flow=alias_reauth&alias=${alias}` });
@@ -99,7 +100,7 @@ describe('account_add refresh nudge (S1.10-A)', () => {
   });
 });
 
-describe('account_write_config over HTTP (S1.20)', () => {
+describe('account_write_config over HTTP', () => {
   it('write:true never touches the filesystem: snippet only, with the refusal named', async () => {
     process.env.MCP_TRANSPORT = 'http';
     process.env.MCP_PUBLIC_URL = 'https://mcp.example.com';

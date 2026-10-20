@@ -1,4 +1,5 @@
 import type { Cud } from './registry.js';
+import { hints } from './hint-provider.js';
 
 export type Profile = 'read-only' | 'safe-writes' | 'full-writes';
 export type Transport = 'stdio' | 'http';
@@ -9,12 +10,11 @@ export interface Policy {
   allow: string[];
   deny: string[];
   /**
-   * B14 reserved seam (cc-write-control "HTTP posture", LOCKED to OQ-5
-   * "annotations only"): the dispatch transport is threaded into the resolved
-   * policy for the EE/future seam, but in v6 alpha it does NOT stiffen the
+   * Reserved seam (HTTP posture is "annotations only"): the dispatch
+   * transport is threaded into the resolved policy for a future seam, but in v6 alpha it does NOT stiffen the
    * profile or alter any `isAllowed` verdict. "Stricter on HTTP" is achieved
    * entirely by the `anthropic/requiresUserInteraction` annotation on the
-   * irreversible set (A12), emitted identically on both transports.
+   * irreversible set, emitted identically on both transports.
    * Optional so existing Policy literals (codegen/tests) need no change;
    * resolvePolicy always populates it.
    */
@@ -25,15 +25,16 @@ interface ToolRef {
   name: string;
   service: string;
   cud: Cud;
-  /** The method's required OAuth scopes, when the caller knows them. Absent
-   * means "unknown", which is treated as not privileged: a missing scope list
-   * must not silently widen the gate OR silently break an ordinary write. */
+  // Absent means "unknown", treated as not privileged: a missing scope list
+  // must not silently widen the gate or break an ordinary write.
   scopes?: readonly string[];
 }
 
-const PROFILES: Profile[] = ['read-only', 'safe-writes', 'full-writes'];
+/** Every profile `resolvePolicy` will accept. Tests loop this so a new profile cannot skip the Trash gate. */
+export const WRITE_PROFILES: readonly Profile[] = ['read-only', 'safe-writes', 'full-writes'];
+const PROFILES: readonly Profile[] = WRITE_PROFILES;
 
-/** The irreversible set (frozen, cc-write-control): real sends leave the
+/** The irreversible set (frozen): real sends leave the
  * user's (or org's) identity unrecallably; permanent deletes bypass Trash.
  * Includes the callable GENERATED twins of the curated ops — the surface is
  * always callable by name, so a prompt-free twin would defeat the layer.
@@ -46,12 +47,12 @@ export const IRREVERSIBLE_TOOLS = new Set([
   'gmail_send',
   'gmail_send_draft',
   'gmail_delete',
+  'gmail_delete_draft',
   'gmail_batch_delete',
   'drive_delete',
   'drive_empty_trash',
   // generated twins (permanent deletes / real sends)
   'gmail_users_threads_delete',
-  'gmail_users_drafts_delete',
   'chat_spaces_messages_delete',
   'cloudidentity_customers_userinvitations_send',
   'vault_matters_holds_delete',
@@ -107,9 +108,8 @@ function matchesAny(tool: ToolRef, globs: string[]): boolean {
   return firstMatch(tool, globs) !== undefined;
 }
 
-/** Scopes that authorize acting on the whole organization, on legal holds, on
- * billing, or on deployed code. A write behind one of these is not a "safe"
- * write in any useful sense of the word, whatever its HTTP verb. */
+// Scopes that authorize acting on the whole organization, legal holds,
+// billing, or deployed code: not a "safe" write, whatever its HTTP verb.
 const PRIVILEGED_SCOPE_RE =
   /\/auth\/(admin\.directory|admin\.datatransfer|cloud-identity|apps\.licensing|apps\.order|apps\.groups\.settings|apps\.groups\.migration|ediscovery|script\.projects|script\.deployments)/;
 
@@ -130,7 +130,37 @@ export function privilegeOf(tool: ToolRef): PrivilegeKind | undefined {
   return undefined;
 }
 
+/**
+ * Moves to Trash, plus emptying it. Named, not matched by a "trash" suffix, so
+ * `drive_transfer`'s synthetic move ref never qualifies. No profile permits
+ * these. Opt in per tool with an allow glob that matches `service:op`
+ * (`gmail:trash`, `drive:empty_trash`). A `*trash` glob matches a move to
+ * Trash and does not match emptying it. See docs/internals.md.
+ */
+const TRASH_MOVE_TOOLS = new Set([
+  'gmail_trash',
+  'drive_trash',
+  'gmail_users_threads_trash',
+  'drive_empty_trash',
+]);
+
+export function isTrashMove(tool: { name: string }): boolean {
+  return TRASH_MOVE_TOOLS.has(tool.name);
+}
+
+/** True only when an allow glob matches this tool's own operation, not `service:delete`. */
+function trashExplicitlyAllowed(tool: ToolRef, policy: Policy): boolean {
+  const op = `${tool.service}:${opOf(tool)}`;
+  return policy.allow.some((g) => {
+    if (!globToRegExp(g).test(op)) return false;
+    // `*trash` matches `drive:empty_trash` only because the op ends in "trash".
+    if (op.endsWith(':empty_trash') && !g.includes('empty_trash')) return false;
+    return true;
+  });
+}
+
 function profileAllows(profile: Profile, tool: ToolRef): boolean {
+  if (isTrashMove(tool)) return false;
   if (profile === 'full-writes') return true;
   if (profile === 'safe-writes') {
     if (privilegeOf(tool) !== undefined) return false;
@@ -143,6 +173,7 @@ export function isAllowed(tool: ToolRef, policy: Policy): boolean {
   if (tool.cud === 'read') return true;
   if (policy.readOnly) return false;
   if (matchesAny(tool, policy.deny)) return false;
+  if (isTrashMove(tool)) return trashExplicitlyAllowed(tool, policy);
   if (matchesAny(tool, policy.allow)) return true;
   return profileAllows(policy.profile, tool);
 }
@@ -166,6 +197,9 @@ export function denyReason(tool: ToolRef, policy: Policy): DenyReason | undefine
   if (policy.readOnly) return { rule: 'read_only' };
   const pattern = firstMatch(tool, policy.deny);
   if (pattern !== undefined) return { rule: 'deny_glob', pattern };
+  if (isTrashMove(tool)) {
+    return trashExplicitlyAllowed(tool, policy) ? undefined : { rule: 'profile', profile: policy.profile };
+  }
   if (matchesAny(tool, policy.allow)) return undefined;
   if (profileAllows(policy.profile, tool)) return undefined;
   const kind = privilegeOf(tool);
@@ -175,6 +209,20 @@ export function denyReason(tool: ToolRef, policy: Policy): DenyReason | undefine
     return { rule: 'privileged', profile: policy.profile, kind };
   }
   return { rule: 'profile', profile: policy.profile };
+}
+
+const CUD_CLASSES: readonly string[] = ['read', 'create', 'update', 'delete'];
+
+// The allow-list vocabulary is service:cud or service:op, never the tool
+// name, so suggesting the name would hand back a pattern that never matches.
+function allowSuggestion(tool: ToolRef): string {
+  const op = opOf(tool);
+  const pattern = `${tool.service}:${op}`;
+  // An op spelled like a cud class (drive_update) is also that class's pattern.
+  if (CUD_CLASSES.includes(op)) {
+    return `allow it with GOOGLE_WRITE_ALLOW="${pattern}", which also allows every other ${op}-class ${tool.service} tool`;
+  }
+  return `allow just this one with GOOGLE_WRITE_ALLOW="${pattern}"`;
 }
 
 function denyHint(tool: ToolRef, reason: DenyReason): string {
@@ -188,25 +236,31 @@ function denyHint(tool: ToolRef, reason: DenyReason): string {
     const what = reason.kind === 'push_registration'
       ? 'registers a push channel, which sends this account\'s activity to an external URL'
       : 'needs a scope that acts on the whole organization, on legal holds, on billing, or on deployed code';
-    return `"${tool.name}" ${what}, so "${reason.profile}" refuses it whatever its verb. Use GOOGLE_PROFILE=full-writes, or allow just this one with GOOGLE_WRITE_ALLOW="${tool.service}:${opOf(tool)}".`;
+    return `"${tool.name}" ${what}, so "${reason.profile}" refuses it whatever its verb. Use GOOGLE_PROFILE=full-writes, or ${allowSuggestion(tool)}.`;
   }
   const usable = profilesAllowing(tool).filter((p) => p !== reason.profile);
   const profiles = usable.length > 0
     ? `Use GOOGLE_PROFILE=${usable.join(' or ')}`
     : 'No profile permits this operation';
-  // The allow-list vocabulary is service:cud or service:op, never the tool
-  // name, so suggesting the name would hand back a pattern that never matches.
-  return `Profile "${reason.profile}" does not permit ${tool.cud}. ${profiles}, or allow just this one with GOOGLE_WRITE_ALLOW="${tool.service}:${opOf(tool)}".`;
+  return `Profile "${reason.profile}" does not permit ${tool.cud}. ${profiles}, or ${allowSuggestion(tool)}.`;
 }
 
 export function writeDisabledResult(tool: ToolRef, policy: Policy, account?: string) {
   // Recomputed rather than passed in: every call site has already run
   // isAllowed, and a hint that disagrees with the verdict is worse than none.
   const reason = denyReason(tool, policy) ?? { rule: 'profile' as const, profile: policy.profile };
+  const rendered = hints()?.render({
+    kind: 'write_denied',
+    tool: { name: tool.name, service: tool.service, cud: tool.cud },
+    reason,
+    policy,
+  });
   const envelope = {
     error: 'write_disabled',
-    message: `"${tool.name}" (${tool.cud}) is disabled by the current write-control policy (profile: ${policy.profile}${policy.readOnly ? ', GOOGLE_READ_ONLY=true' : ''}).`,
-    hint: denyHint(tool, reason),
+    message:
+      rendered?.message ??
+      `"${tool.name}" (${tool.cud}) is disabled by the current write-control policy (profile: ${policy.profile}${policy.readOnly ? ', GOOGLE_READ_ONLY=true' : ''}).`,
+    hint: rendered?.hint ?? denyHint(tool, reason),
     retriable: false,
     ...(account ? { account } : {}),
   };

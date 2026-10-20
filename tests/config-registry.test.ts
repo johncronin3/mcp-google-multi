@@ -30,7 +30,7 @@ const spyExit = () => {
 };
 
 describe('resolveAccounts', () => {
-  it('BR-2: non-empty GOOGLE_ACCOUNTS takes the whole registry from env', () => {
+  it('non-empty GOOGLE_ACCOUNTS takes the whole registry from env', () => {
     writeFileSync(
       cfgPath,
       JSON.stringify({ version: 1, accounts: { fileacct: { email: 'f@x.com' } } }),
@@ -69,11 +69,9 @@ describe('resolveAccounts', () => {
     expect(set.configs.b.admin).toBe(true);
   });
 
-  it('empty registry is non-fatal at module-load severity (gap #23): returns an empty set, never exits', () => {
-    // The refuse-to-start moved off module load so the bootstrap/diagnostic CLIs
-    // (doctor/reset/import/config check) can run on a fresh install. The SERVER
-    // still refuses empty via assertServerAccountsConfigured(); the dispatch
-    // reload ('throw') still raises (see the reload-safety test below).
+  it('empty registry is non-fatal at module-load severity: returns an empty set, never exits', () => {
+    // The refuse-to-start moved off module load so bootstrap/diagnostic CLIs can run on a fresh install;
+    // the SERVER still enforces it via assertServerAccountsConfigured(), and dispatch reload still throws.
     const { exit } = spyExit();
     const set = resolveAccounts({} as NodeJS.ProcessEnv, cfgPath);
     expect(set.aliases).toEqual([]);
@@ -112,7 +110,7 @@ describe('resolveAccounts', () => {
   });
 });
 
-describe('resolveAccounts tokenDir threading (S1.6)', () => {
+describe('resolveAccounts tokenDir threading', () => {
   it('opts.tokenDir scopes every tokenPath/encPath; default stays the global dir', () => {
     writeFileSync(cfgPath, JSON.stringify({ version: 1, accounts: { work: { email: 'w@x.com' } } }));
     const scoped = resolveAccounts({} as NodeJS.ProcessEnv, cfgPath, 'exit', { tokenDir: path.join(base, 'tenant-tokens') });
@@ -147,7 +145,7 @@ describe('resolveAccounts emptyOk (a context with nothing linked yet)', () => {
   });
 });
 
-describe('fileStamp (exported for tenant-scoped resolvers, S1.6)', () => {
+describe('fileStamp (exported for tenant-scoped resolvers)', () => {
   it('stamps version:mtime for an existing file and version:0 for a missing one', () => {
     writeFileSync(cfgPath, '{}');
     const stamped = fileStamp(cfgPath, CONFIG_VERSION);
@@ -263,6 +261,17 @@ describe('fs-atomic', () => {
     writeFileSync(lock, String(o.pid), { mode: 0o600 });
     if (o.id) linkSync(lock, `${lock}.${o.pid}.${o.id.ns}.${o.id.start}.${o.id.boot}.${'ab'.repeat(6)}.owner`);
     utimesSync(lock, new Date(o.mtimeMs), new Date(o.mtimeMs));
+    return lock;
+  };
+  // A fallback holder's lock: no hard link, the owner file instead records
+  // the lock's dev/ino/mtimeNs once bound.
+  const plantFallbackLock = (p: string, o: { pid: number; id: Identity; mtimeMs: number }) => {
+    const lock = lockOf(p);
+    writeFileSync(lock, String(o.pid), { mode: 0o600 });
+    utimesSync(lock, new Date(o.mtimeMs), new Date(o.mtimeMs));
+    const st = fs.lstatSync(lock, { bigint: true });
+    const owner = `${lock}.${o.pid}.${o.id.ns}.${o.id.start}.${o.id.boot}.${'ab'.repeat(6)}.owner`;
+    writeFileSync(owner, `${st.dev}:${st.ino}:${st.mtimeNs}`);
     return lock;
   };
   // Each Date.now() call advances 6 s: the 5 s timeout fires on the first
@@ -518,6 +527,29 @@ describe('fs-atomic', () => {
     expect(droppings(p)).toEqual([path.basename(lockOf(p))]);
   });
 
+  // releaseLock only removes the lock when BOTH its recorded identity still
+  // matches AND our owner file still exists; each of the next two tests
+  // drops just one of those and leaves the other true.
+  it('release keeps the lock when our owner file is gone, even though the lock itself is unchanged', () => {
+    const p = path.join(base, 'a.json');
+    withFileLock(p, () => {
+      for (const n of droppings(p).filter((f) => f.endsWith('.owner'))) rmSync(path.join(base, n));
+    });
+    expect(readFileSync(lockOf(p), 'utf8')).toBe(String(process.pid));
+    expect(droppings(p)).toEqual([path.basename(lockOf(p))]);
+  });
+
+  it('release keeps the lock when it no longer matches our recorded identity, even though our owner file still exists', () => {
+    const p = path.join(base, 'a.json');
+    withFileLock(p, () => {
+      const lock = lockOf(p);
+      rmSync(lock);
+      writeFileSync(lock, '4242', { mode: 0o600 });
+    });
+    expect(readFileSync(lockOf(p), 'utf8')).toBe('4242');
+    expect(droppings(p)).toEqual([path.basename(lockOf(p))]);
+  });
+
   it('on a filesystem that gives each name of a file its own inode number, the lock is still released', () => {
     const realLstat = fs.lstatSync.bind(fs);
     vi.spyOn(fs, 'lstatSync').mockImplementation(((target: string, options?: { bigint?: boolean }) => {
@@ -594,6 +626,215 @@ describe('fs-atomic', () => {
     const p = path.join(base, 'a.json');
     symlinkSync(path.join(base, 'nowhere'), lockOf(p));
     fastClock();
+    expectBroken(p);
+  });
+
+  describe('locking without hard links (link() denied)', () => {
+    const denyLink = (code: 'EACCES' | 'EPERM') =>
+      vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+        const err = new Error(`${code}: operation not permitted, link`) as NodeJS.ErrnoException;
+        err.code = code;
+        throw err;
+      });
+
+    it.each(['EACCES', 'EPERM'] as const)('locks without a hard link when link() fails with %s', (code) => {
+      denyLink(code);
+      const p = path.join(base, 'f.json');
+      let ran = false;
+      withFileLock(p, () => {
+        ran = true;
+        expect(readFileSync(lockOf(p), 'utf8')).toBe(String(process.pid));
+      });
+      expect(ran).toBe(true);
+      expect(droppings(p)).toEqual([]);
+    });
+
+    it('never lets a second writer in while the fallback lock is held', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      let innerRan = false;
+      withFileLock(p, () => {
+        fastClock();
+        expect(() => withFileLock(p, () => void (innerRan = true))).toThrow(/Timed out waiting/);
+      });
+      expect(innerRan).toBe(false);
+      expect(droppings(p)).toEqual([]);
+    });
+
+    it('breaks a stale fallback lock, the same as a stale linked one', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      plantLock(p, { pid: absentPid(), mtimeMs: Date.now() });
+      expectBroken(p);
+    });
+
+    it('creates the fallback lock at 0600', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      withFileLock(p, () => {
+        if (process.platform !== 'win32') expect(statSync(lockOf(p)).mode & 0o777).toBe(0o600);
+      });
+    });
+
+    it('a non-EEXIST error creating the fallback lock is not swallowed', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      const err = new Error('EIO: i/o error, open') as NodeJS.ErrnoException;
+      err.code = 'EIO';
+      // writeFileSync (the owner file) calls fs.openSync internally too; only
+      // the lock path itself (never a ".owner" name) is this test's target.
+      const realOpenSync = fs.openSync.bind(fs);
+      vi.spyOn(fs, 'openSync').mockImplementation(((...args: unknown[]) => {
+        if (typeof args[0] === 'string' && !args[0].endsWith('.owner')) throw err;
+        return (realOpenSync as (...a: unknown[]) => number)(...args);
+      }) as unknown as typeof fs.openSync);
+      expect(() => withFileLock(p, () => {})).toThrow('EIO');
+    });
+
+    it('does not fall back for a link() error other than EACCES or EPERM', () => {
+      const err = new Error('EIO: i/o error, link') as NodeJS.ErrnoException;
+      err.code = 'EIO';
+      vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+        throw err;
+      });
+      const p = path.join(base, 'f.json');
+      expect(() => withFileLock(p, () => {})).toThrow('EIO');
+    });
+
+    it('on a write error after the exclusive open, the empty lock is removed and the error rethrown', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      const err = new Error('ENOSPC: no space left on device, write') as NodeJS.ErrnoException;
+      err.code = 'ENOSPC';
+      // writeFileSync (the owner file) calls fs.writeSync with a Buffer internally;
+      // only the fallback lock's own write passes the pid as a bare string.
+      const realWriteSync = fs.writeSync.bind(fs);
+      vi.spyOn(fs, 'writeSync').mockImplementation(((...args: unknown[]) => {
+        if (typeof args[1] === 'string') throw err;
+        return (realWriteSync as (...a: unknown[]) => number)(...args);
+      }) as unknown as typeof fs.writeSync);
+      expect(() => withFileLock(p, () => {})).toThrow('ENOSPC');
+      expect(existsSync(lockOf(p))).toBe(false);
+      expect(droppings(p)).toEqual([]);
+    });
+
+    it('when binding the fallback lock to its owner file fails, the lock is removed and the error rethrown, and the next call succeeds at once', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      const err = new Error('ENOSPC: no space left on device, write') as NodeJS.ErrnoException;
+      err.code = 'ENOSPC';
+      // The first writeFileSync is the owner file's initial placeholder (has a
+      // 'wx' flag option); this targets only the later binding-record write.
+      const realWriteFileSync = fs.writeFileSync.bind(fs);
+      let thrown = false;
+      vi.spyOn(fs, 'writeFileSync').mockImplementation(((target: string, ...rest: unknown[]) => {
+        if (!thrown && String(target).endsWith('.owner') && rest.length === 1) {
+          thrown = true;
+          throw err;
+        }
+        return (realWriteFileSync as (...a: unknown[]) => void)(target, ...rest);
+      }) as unknown as typeof fs.writeFileSync);
+      expect(() => withFileLock(p, () => {})).toThrow('ENOSPC');
+      expect(existsSync(lockOf(p))).toBe(false);
+      expect(droppings(p)).toEqual([]);
+      vi.restoreAllMocks();
+      let ran = false;
+      withFileLock(p, () => void (ran = true));
+      expect(ran).toBe(true);
+    });
+
+    it('treats an empty fallback lock younger than the write grace as held, not dead', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      const lock = lockOf(p);
+      writeFileSync(lock, '', { mode: 0o600 });
+      const at = Date.now();
+      let call = 0;
+      vi.spyOn(Date, 'now').mockImplementation(() => {
+        call += 1;
+        if (call === 1) return at; // deadline computed from "now"
+        if (call === 2) return at + 100; // age check: well inside the 2 s grace
+        return at + 10_000; // immediately past the deadline, to end the test
+      });
+      let ran = false;
+      expect(() => withFileLock(p, () => void (ran = true))).toThrow(/Timed out waiting/);
+      expect(ran).toBe(false);
+      expect(existsSync(lock)).toBe(true);
+      expect(readFileSync(lock, 'utf8')).toBe('');
+      expect(existsSync(`${lock}.break`)).toBe(false);
+    });
+
+    it('breaks an empty fallback lock once it is older than the write grace', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      const lock = lockOf(p);
+      writeFileSync(lock, '', { mode: 0o600 });
+      utimesSync(lock, new Date(Date.now() - 3_000), new Date(Date.now() - 3_000));
+      expectBroken(p);
+    });
+
+    it('a fallback holder whose lock was broken does not remove its successor\'s lock, and a third writer cannot enter while the successor holds it', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      withFileLock(p, () => {
+        // The waiter judged this holder dead, broke its lock, and a successor
+        // took over, all before this holder released.
+        for (const n of droppings(p)) rmSync(path.join(base, n));
+        writeFileSync(lockOf(p), String(process.pid), { mode: 0o600 });
+      });
+      expect(readFileSync(lockOf(p), 'utf8')).toBe(String(process.pid));
+      expect(droppings(p)).toEqual([path.basename(lockOf(p))]);
+      fastClock();
+      let thirdRan = false;
+      expect(() => withFileLock(p, () => void (thirdRan = true))).toThrow(/Timed out waiting/);
+      expect(thirdRan).toBe(false);
+    });
+
+    it('a fresh fallback lock of a live holder in another PID namespace is kept, like the linked control', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      // A pid absent here: only recognizing the owner file keeps this from
+      // being probed (and wrongly declared dead) in our own namespace.
+      const pid = absentPid();
+      const lock = plantFallbackLock(p, { pid, id: { ...SELF_ID, ns: OTHER_NS }, mtimeMs: Date.now() - 30_000 });
+      expectKept(p, lock, pid);
+    });
+
+    it('a stale fallback lock from another PID namespace is still broken after the lease', () => {
+      denyLink('EACCES');
+      const p = path.join(base, 'f.json');
+      plantFallbackLock(p, { pid: process.ppid, id: { ...SELF_ID, ns: OTHER_NS }, mtimeMs: Date.now() - 61_000 });
+      expectBroken(p);
+    });
+
+    it('an unbound fallback lock, mid-creation, counts as held like an empty one, even from another namespace', () => {
+      const p = path.join(base, 'f.json');
+      const pid = absentPid();
+      const lock = lockOf(p);
+      // The pid is written but the owner file has not yet been rewritten with
+      // the binding record: the window between the two fallback-lock writes.
+      writeFileSync(lock, String(pid), { mode: 0o600 });
+      writeFileSync(`${lock}.${pid}.${OTHER_NS}.1.${OTHER_BOOT}.${'ab'.repeat(6)}.owner`, String(pid));
+      const at = Date.now();
+      let call = 0;
+      vi.spyOn(Date, 'now').mockImplementation(() => {
+        call += 1;
+        if (call === 1) return at;
+        if (call === 2) return at + 100;
+        return at + 10_000;
+      });
+      let ran = false;
+      expect(() => withFileLock(p, () => void (ran = true))).toThrow(/Timed out waiting/);
+      expect(ran).toBe(false);
+      expect(existsSync(lock)).toBe(true);
+    });
+  });
+
+  it('recovers an empty lock dated in the future, after a clock step back', () => {
+    const p = path.join(base, 'a.json');
+    const lock = lockOf(p);
+    writeFileSync(lock, '', { mode: 0o600 });
+    utimesSync(lock, new Date(Date.now() + 10_000), new Date(Date.now() + 10_000));
     expectBroken(p);
   });
 });

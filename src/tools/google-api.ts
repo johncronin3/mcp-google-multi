@@ -17,6 +17,8 @@ import {
   searchMethods,
   MAX_SEARCH_QUERY,
 } from '../discovery-client.js';
+import { hints } from '../hint-provider.js';
+import { refusedAccountResult } from '../session-grant.js';
 
 
 // Policy/toolset namespace for each API alias must match the NAMED tools' service
@@ -82,7 +84,7 @@ function describeMethod(m: DiscoveryMethod) {
 }
 
 export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps: EscapeDeps = {}): void {
-  // Live per-registry account validation (S1.10), same as the curated files.
+  // Live per-registry account validation, same as the curated files.
   const accountEnum = accountArgLive(() => registry.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   const toolsets = deps.toolsets ?? getToolsets();
@@ -92,16 +94,18 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
   };
   const enabledApis = Object.keys(SUPPORTED_APIS).filter(apiEnabled);
   const apiList = enabledApis.join(', ');
-  const toolsetDisabled = (alias: string) =>
-    jsonResult(
+  const toolsetDisabled = (alias: string) => {
+    const rendered = hints()?.render({ kind: 'toolset_disabled', api: alias, service: serviceForAlias(alias) });
+    return jsonResult(
       {
         error: 'toolset_disabled',
-        message: `API "${alias}" maps to service "${serviceForAlias(alias)}", which is excluded by GOOGLE_TOOLSETS.`,
-        hint: 'Add the service to GOOGLE_TOOLSETS (or unset it) to use this API.',
+        message: rendered?.message ?? `API "${alias}" maps to service "${serviceForAlias(alias)}", which is excluded by GOOGLE_TOOLSETS.`,
+        hint: rendered?.hint ?? 'Add the service to GOOGLE_TOOLSETS (or unset it) to use this API.',
         retriable: false,
       },
       true,
     );
+  };
 
   registry.registerMeta(
     'google_api_search',
@@ -193,6 +197,8 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
       _meta: { 'anthropic/maxResultSizeChars': 100_000 },
     },
     async ({ account, api, methodId, pathParams, queryParams, body }) => {
+      const refused = refusedAccountResult(account);
+      if (refused) return refused;
       const resolved = resolveApiAliases(api as string);
       if (!resolved) {
         return jsonResult({ error: 'unknown_api', message: `Unknown api "${api}".`, hint: `Known APIs: ${apiList}`, retriable: false, account }, true);
@@ -211,9 +217,8 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
       }
       let method = index.find((m) => m.id === methodId);
       if (!method) {
-        // Some discovery docs keep a legacy id prefix (the searchconsole doc's
-        // methods are webmasters.*): when the caller prefixed with our api
-        // alias, retry under the doc's own prefix before failing.
+        // Some discovery docs keep a legacy id prefix (searchconsole's methods are
+        // webmasters.*): retry under the doc's own prefix if the caller used our api alias.
         const docPrefix = index[0]?.id.split('.')[0];
         const [head, ...rest] = String(methodId).split('.');
         if (docPrefix && (head === apiKey || head === api) && head !== docPrefix && rest.length > 0) {
@@ -243,9 +248,8 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
       const cud = cudFromMethod(method);
       const policyService = serviceForAlias(apiKey);
       const lastSegment = method.id.split('.').pop() ?? method.id;
-      // The escape hatch self-gates, so it needs the same scope signal the
-      // registry wrapper gets; without it a privileged method would slip past
-      // safe-writes here while its generated twin is refused.
+      // The escape hatch self-gates, so it needs the same scope signal as the registry
+      // wrapper, or a privileged method would slip past safe-writes here while its generated twin is refused.
       const toolRef = { name: `${policyService}_${lastSegment}`, service: policyService, cud, scopes: method.scopes };
       if (cud !== 'read' && !isAllowed(toolRef, policy)) {
         return writeDisabledResult(toolRef, policy, account as string);

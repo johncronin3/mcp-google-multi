@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9,13 +9,18 @@ import {
   isGrantEnforced,
   loadGrantsFile,
   resetGrantsFileCache,
+  resolveGrantByCode,
   resolveGrantByName,
   runWithGrant,
   setSessionGrant,
+  codeSha8,
   grantStatusSummary,
   jwtAccessGrantGate,
   hostedSetGrantRefusal,
   activeGrant,
+  grantDigest,
+  grantFromEnvFallback,
+  staticBearerGrant,
 } from '../src/session-grant.js';
 
 // ACCOUNTS come from process env at module load — setup.ts / env must define them.
@@ -42,13 +47,15 @@ describe('session-grant', () => {
     delete process.env.GOOGLE_GRANTS_PATH;
     delete process.env.GOOGLE_GRANTS_ENFORCE;
     delete process.env.GOOGLE_GRANT_CODE;
+    delete process.env.MCP_HTTP_TOKEN_GRANT;
+    delete process.env.MCP_HOSTED;
     rmSync(dir, { recursive: true, force: true });
   });
 
   function writeGrants(accountsMap: Record<string, string[]>) {
     const grants = Object.entries(accountsMap).map(([name, accounts], i) => ({
       name,
-      code: `code_${i}_${name.replace(/\s+/g, '_')}`,
+      code: `grant-code-${i}-${name.replace(/\s+/g, '_')}`,
       accounts,
     }));
     writeFileSync(
@@ -77,7 +84,7 @@ describe('session-grant', () => {
       'Personal Brain Grant 3': ['test'],
       StrombackBrain2: ['test'],
     });
-    const st = setSessionGrant('code_1_StrombackBrain2', 'stromback');
+    const st = setSessionGrant('grant-code-1-StrombackBrain2', 'stromback');
     expect(st.name).toBe('StrombackBrain2');
     expect(st.accounts).toEqual(['test']);
     expect(allowedAccounts()).toEqual(['test']);
@@ -95,15 +102,87 @@ describe('session-grant', () => {
     expect(isGrantEnforced()).toBe(false);
   });
 
-  it('grant_status reports prefix not full code', () => {
+  it('grant_status reports code_sha8, never a prefix, including codes of 12 characters or fewer', () => {
     writeGrants({ StrombackBrain2: ['test'] });
-    const full = 'code_0_StrombackBrain2';
+    const full = 'grant-code-0-StrombackBrain2';
     setSessionGrant(full);
     const s = grantStatusSummary();
     expect(s.authenticated).toBe(true);
-    expect(s.code_prefix).toBe(`${full.slice(0, 12)}…`);
-    expect(s.code_prefix).not.toBe(full);
+    expect(s.code_sha8).toBe(codeSha8(full));
+    expect(s.code_sha8).toHaveLength(8);
+    expect(s.code_sha8).toMatch(/^[0-9a-f]{8}$/);
+    expect(full.startsWith(s.code_sha8!)).toBe(false);
+    expect(JSON.stringify(s)).not.toContain(full);
+    expect(JSON.stringify(s)).not.toContain('code_prefix');
     expect(s.accounts).toEqual(['test']);
+
+    const short = '123456789012';
+    expect(short).toHaveLength(12);
+    const hash = codeSha8(short);
+    expect(hash).toHaveLength(8);
+    expect(hash).toMatch(/^[0-9a-f]{8}$/);
+    expect(short.startsWith(hash)).toBe(false);
+    expect(short.includes(hash)).toBe(false);
+  });
+
+  it('load rejects a short code or a code equal to the grant name, and the message omits the code', () => {
+    const short = '123456789012';
+    writeFileSync(
+      grantsPath,
+      JSON.stringify({ version: 1, grants: [{ name: 'StrombackBrain2', code: short, accounts: ['test'] }] }),
+      'utf8',
+    );
+    resetGrantsFileCache();
+    expect(() => loadGrantsFile()).toThrow(/Grant "StrombackBrain2" is refused/);
+    try {
+      loadGrantsFile();
+      expect.unreachable();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      expect(message).not.toContain(short);
+    }
+
+    const name = 'Grant Alpha Example Name XX';
+    const same = name.toLowerCase();
+    expect(same.length).toBeGreaterThanOrEqual(24);
+    expect(same).not.toBe(name);
+    writeFileSync(
+      grantsPath,
+      JSON.stringify({ version: 1, grants: [{ name, code: same, accounts: ['test'] }] }),
+      'utf8',
+    );
+    resetGrantsFileCache();
+    expect(() => loadGrantsFile()).toThrow(new RegExp(`Grant "${name}" is refused`));
+    try {
+      loadGrantsFile();
+      expect.unreachable();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      expect(message).toContain(name);
+      expect(message).not.toContain(same);
+    }
+  });
+
+  it('hosted fails closed on a refused grant even when enforcement is off', () => {
+    const short = '123456789012';
+    writeFileSync(
+      grantsPath,
+      JSON.stringify({ version: 1, grants: [{ name: 'StrombackBrain2', code: short, accounts: ['test'] }] }),
+      'utf8',
+    );
+    resetGrantsFileCache();
+    process.env.MCP_HOSTED = '1';
+    process.env.GOOGLE_GRANTS_ENFORCE = 'false';
+    process.env.GOOGLE_GRANT_CODE = short;
+    expect(grantFromEnvFallback()).toBeNull();
+    try {
+      allowedAccounts();
+      expect.unreachable();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      expect(message).toMatch(/Grant "StrombackBrain2" is refused/);
+      expect(message).not.toContain(short);
+    }
   });
 
   it('resolveGrantByName restores a slice without the code (JWT replica path)', () => {
@@ -145,7 +224,7 @@ describe('session-grant', () => {
 
   it('ALS isolates token restore from in-process set_grant (second replica)', () => {
     writeGrants({ StrombackBrain2: ['test'] });
-    setSessionGrant('code_0_StrombackBrain2');
+    setSessionGrant('grant-code-0-StrombackBrain2');
     expect(activeGrant()?.source).toBe('session');
     expect(allowedAccounts()).toEqual(['test']);
 
@@ -170,6 +249,75 @@ describe('session-grant', () => {
     clearSessionGrant();
     expect(activeGrant()).toBeNull();
     expect(() => allowedAccounts()).toThrow(/No session grant/);
+  });
+
+  it('staticBearerGrant is null unless MCP_HTTP_TOKEN_GRANT names a grant', () => {
+    writeGrants({ 'stromback-test': ['test'], 'Personal Brain Grant 3': ['test'] });
+    delete process.env.MCP_HTTP_TOKEN_GRANT;
+    expect(staticBearerGrant()).toBeNull();
+    process.env.MCP_HTTP_TOKEN_GRANT = '   ';
+    expect(staticBearerGrant()).toBeNull();
+    process.env.MCP_HTTP_TOKEN_GRANT = 'missing-grant';
+    expect(staticBearerGrant()).toBeNull();
+    process.env.MCP_HTTP_TOKEN_GRANT = 'stromback-test';
+    const bound = staticBearerGrant();
+    expect(bound?.name).toBe('stromback-test');
+    expect(bound?.accounts).toEqual(['test']);
+    expect(bound?.code).toBe('');
+  });
+
+  it('resolveGrantByCode and the env lookup compare every grant with timingSafeEqual', () => {
+    writeGrants({
+      StrombackBrain2: ['test'],
+      'Personal Brain Grant 3': ['test'],
+      'stromback-test': ['test'],
+    });
+    const grants = loadGrantsFile();
+    expect(grants?.grants).toHaveLength(3);
+    const first = 'grant-code-0-StrombackBrain2';
+    const spy = vi.spyOn(grantDigest, 'timingSafeEqual');
+    try {
+      spy.mockClear();
+      const byCode = resolveGrantByCode(first);
+      expect(byCode?.name).toBe('StrombackBrain2');
+      expect(spy).toHaveBeenCalledTimes(grants!.grants.length);
+
+      clearSessionGrant();
+      delete process.env.MCP_HOSTED;
+      process.env.GOOGLE_GRANT_CODE = first;
+      spy.mockClear();
+      const byEnv = grantFromEnvFallback();
+      expect(byEnv?.name).toBe('StrombackBrain2');
+      expect(byEnv?.source).toBe('env');
+      expect(spy).toHaveBeenCalledTimes(grants!.grants.length);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('desk GOOGLE_GRANT_CODE still applies outside a request', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    process.env.GOOGLE_GRANT_CODE = 'grant-code-0-StrombackBrain2';
+    expect(activeGrant()?.source).toBe('env');
+    expect(allowedAccounts()).toEqual(['test']);
+    expect(grantFromEnvFallback()?.name).toBe('StrombackBrain2');
+  });
+
+  it('hosted activeGrant ignores in-process set_grant and GOOGLE_GRANT_CODE', () => {
+    writeGrants({ StrombackBrain2: ['test'] });
+    process.env.MCP_HOSTED = '1';
+    setSessionGrant('grant-code-0-StrombackBrain2');
+    process.env.GOOGLE_GRANT_CODE = 'grant-code-0-StrombackBrain2';
+    expect(grantFromEnvFallback()).toBeNull();
+    expect(activeGrant()).toBeNull();
+    expect(grantStatusSummary().authenticated).toBe(false);
+    expect(grantStatusSummary().accounts).toEqual([]);
+    expect(() => allowedAccounts()).toThrow(/No session grant/);
+    runWithGrant(resolveGrantByName('StrombackBrain2'), () => {
+      expect(activeGrant()?.name).toBe('StrombackBrain2');
+      expect(allowedAccounts()).toEqual(['test']);
+    });
+    expect(activeGrant()).toBeNull();
   });
 
   it('hostedSetGrantRefusal is set only when hosted', () => {

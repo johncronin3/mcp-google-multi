@@ -10,9 +10,8 @@ import { handleGoogleApiError, invalidParams } from './_errors.js';
 
 // Admin SDK requires Workspace super-admin (or delegated admin) on the account — personal @gmail.com accounts 403 on every endpoint.
 export function registerAdminTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   // ─── Reports / audit log ───────────────────────────────────────────────
@@ -81,7 +80,14 @@ export function registerAdminTools(server: ToolRegistry, deps: CuratedToolDeps =
         account: accountEnum.describe('Google account alias (must be a Workspace admin)'),
         customer: z.string().default('my_customer').optional(),
         domain: z.string().optional(),
-        query: z.string().optional().describe('Search query, e.g. "name:John"'),
+        query: z.string().optional().describe(
+          'Directory search query: space-separated clauses of field+operator+value, ANDed together. ' +
+          '"=" is exact match, ":" is a contains/startsWith match. Searchable fields include email, name ' +
+          '(matches the concatenated givenName+familyName), givenName, familyName, isAdmin, isDelegatedAdmin, ' +
+          'orgName, orgTitle, orgDepartment, manager, directManager, addressCountry. Prefix/wildcard matching ' +
+          'is a trailing "*" on a ":" clause, e.g. "email:admin*" for every address starting with "admin". ' +
+          'Examples: \'name:John\', \'isAdmin=true\', \'orgTitle:Manager orgName=Engineering\'.',
+        ),
         maxResults: z.number().min(1).max(500).optional(),
         pageToken: z.string().optional(),
         orderBy: z.enum(['email', 'familyName', 'givenName']).optional(),
@@ -258,7 +264,7 @@ export function registerAdminTools(server: ToolRegistry, deps: CuratedToolDeps =
   );
 }
 
-function handleAdminError(error: any, account: Account) {
+export function handleAdminError(error: any, account: Account) {
   const admin = 'Admin tools require Workspace super-admin privileges AND the account must be listed as an admin account (then re-authenticated). Personal Gmail accounts cannot use these endpoints.';
-  return handleGoogleApiError(error, account, { scope: admin, resource: admin });
+  return handleGoogleApiError(error, account, { scope: admin, resource: admin, bundle: 'admin' });
 }

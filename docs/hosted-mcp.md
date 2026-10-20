@@ -23,7 +23,7 @@ Grok.com Custom connectors **always** ask for OAuth client/endpoints. They do no
 Bearer. Without `/.well-known/oauth-authorization-server`, DCR `/oauth/register`, `/oauth/authorize`,
 and `/oauth/token`, Grok storms `POST /mcp` → Cloud Run **429 no available instance**.
 
-CLI / Hermes still send `Authorization: Bearer <MCP_HTTP_TOKEN>` (layer 2, no OAuth).
+CLI / Hermes still send `Authorization: Bearer <MCP_HTTP_TOKEN>` (layer 2, no OAuth). With grants enforced, that static bearer is grantless unless `MCP_HTTP_TOKEN_GRANT` names a grant. The variable is off by default and is not set in deploy config.
 
 ## Endpoints to implement
 
@@ -35,18 +35,28 @@ Public origin = `https://$MCP_PUBLIC_HOST` (never `localhost:8787` in hosted mod
 | GET | `/.well-known/oauth-authorization-server` | none |
 | GET | `/.well-known/oauth-protected-resource` | none |
 | POST | `/oauth/register` | none (DCR; return `client_id: grok`) |
-| GET/POST | `/oauth/authorize` | HTML form: MCP token + optional session grant code |
+| GET/POST | `/oauth/authorize` | HTML form: MCP token + the grant's secret code (required on hosted) |
 | POST | `/oauth/token` | authorization_code + PKCE S256, or refresh_token |
 | POST | `/mcp` | Bearer: static MCP token **or** HMAC access JWT |
 
-Access tokens are HMAC-SHA256 JWTs signed with `MCP_HTTP_TOKEN` so replicas share no store.
+Access tokens are HMAC-SHA256 JWTs. Hosted signs them with the Secret Manager file
+`google-mcp-jwt-signing-key` (`MCP_JWT_SIGNING_KEY_FILE`). Desk may set `MCP_JWT_SIGNING_KEY`.
+The static bearer (`MCP_HTTP_TOKEN` / `MCP_API_KEY`) is not the signing key. Access lifetime
+is 1 hour. Refresh defaults to 30 days (`MCP_OAUTH_REFRESH_TTL`, seconds) and keeps `gname`.
 Claim `gname` is the session grant **name** (layer 3). Never put grant codes or Google tokens in the JWT.
+Refresh refuses a `gname` that is not in the current `grants.json`, and both refresh and `/mcp` refuse a token whose `iat` is earlier than that grant's optional `notBefore`. Authorization-code exchange applies those same two checks to the code JWT before it mints tokens, so a code issued before `notBefore`, or for a grant that was removed, is `invalid_grant` and does not receive a fresh `iat`. Name lookup re-reads the file, so a removal applies without a restart. `/mcp` answers 401 for a removed `gname` and serves no tools. The authorize page does not list grant names. On hosted, that form always requires the grant's secret code, compared in constant time, whether or not `GOOGLE_GRANTS_ENFORCE` is set. A bearer holder who does not know the code gets no token. Desk/stdio still requires the code only when enforcement is on.
+A missing, short, or unreadable hosted key fails closed: `/oauth/authorize`, `/oauth/token`, and
+JWT verification refuse, and they do not fall back to the bearer. Mounting a new key invalidates
+every existing Grok JWT; the connector re-authorizes at `/oauth/authorize` with a grant code.
 
 On each `/mcp` request, if the Bearer is a JWT, restore the grant with `resolveGrantByName(gname)`
 into `AsyncLocalStorage`. When grants are enforced, a JWT missing or unknown `gname` is rejected
-at the `/mcp` gate (HTTP 403) — do not wait for a tool to fail. In-process `set_grant` is for
-stdio/CLI only; on hosted (`MCP_HOSTED` / `K_SERVICE`) the tool refuses and tells you to bind
-the grant on `/oauth/authorize`. Codes never go in the JWT.
+at the `/mcp` gate (HTTP 403) — do not wait for a tool to fail. A static bearer is wrapped in
+`runWithGrant(staticBearerGrant())`: `MCP_HTTP_TOKEN_GRANT` is an optional grant name, resolved
+on every request; unset or unknown is null and fails closed. It does not use in-process
+`set_grant` or `GOOGLE_GRANT_CODE`. On hosted (`MCP_HOSTED` / `K_SERVICE`) `activeGrant()` is
+only that request grant or null, `GOOGLE_GRANT_CODE` is ignored, and `set_grant` refuses. A grant code shorter than 24 characters, or equal to its name ignoring case, is rejected on load. The error names the grant only, and hosted fails closed even when enforcement is off. Stdio/CLI still calls `set_grant` and may use `GOOGLE_GRANT_CODE`.
+Codes never go in the JWT.
 
 ## Hosted must not
 
@@ -109,7 +119,8 @@ On grok.com this MCP is **not** a catalog tile. **New Connector** → **Custom**
 
 ```
 PORT=8080
-MCP_HTTP_TOKEN=  # layer 2 — Secret Manager, never commit
+MCP_HTTP_TOKEN=  # layer 2 — Secret Manager, never commit. Not the JWT signing key.
+MCP_JWT_SIGNING_KEY_FILE=/mnt/jwt-signing-key/google-mcp-jwt-signing-key
 MCP_PUBLIC_HOST=google-multi-mcp-tdhsljvruq-uc.a.run.app
 GOOGLE_ACCOUNTS=alias:email,...
 MASTER_KEY=

@@ -11,9 +11,8 @@ import { listResult, sliceClean } from '../trim.js';
 
 
 export function registerCalendarTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -68,6 +67,8 @@ export function registerCalendarTools(server: ToolRegistry, deps: CuratedToolDep
       },
     },
     async ({ account, calendarId, query, timeMin, timeMax, maxResults, pageToken }) => {
+      const tzError = missingTimeZoneError('timeMin', timeMin) ?? missingTimeZoneError('timeMax', timeMax);
+      if (tzError) return invalidParams(account as Account, tzError, MISSING_TIME_ZONE_HINT);
       const rangeError = timeRangeError(timeMin, timeMax);
       if (rangeError) return invalidParams(account as Account, rangeError, TIME_RANGE_HINT);
       try {
@@ -265,6 +266,57 @@ export function registerCalendarTools(server: ToolRegistry, deps: CuratedToolDep
     },
   );
 
+  // attendeesOmitted plus a single-entry attendees array patches only the caller's own RSVP.
+  server.registerTool(
+    'calendar_respond_event',
+    {
+      description: 'RSVP to a calendar event as this account (accepted/declined/tentative) without touching any other attendee',
+      inputSchema: {
+        account: accountEnum.describe('Google account alias'),
+        eventId: z.string().min(1).describe('Calendar event ID'),
+        calendarId: z.string().default('primary').optional()
+          .describe('Calendar ID (default: primary)'),
+        response: z.enum(['accepted', 'declined', 'tentative']).describe('RSVP response'),
+        comment: z.string().optional().describe('Optional comment attached to the response'),
+      },
+    },
+    async ({ account, eventId, calendarId, response, comment }) => {
+      try {
+        const auth = await getClientFn(account as Account);
+        const cal = calendarClient({ version: 'v3', auth });
+        const cid = calendarId ?? 'primary';
+
+        const current = await cal.events.get({ calendarId: cid, eventId });
+        const attendees = current.data.attendees ?? [];
+        const accountEmail = server.accountSet().configs[account as Account]?.email;
+        const self = attendees.find((a) => a.self)
+          ?? attendees.find((a) => a.email?.toLowerCase() === accountEmail?.toLowerCase());
+        if (!self?.email) {
+          return invalidParams(
+            account as Account,
+            `Event "${eventId}" has no attendee entry for this account, so there is nothing to RSVP to.`,
+            'RSVP only applies to events where this account is invited as a guest; check calendar_get_event to see the attendee list.',
+          );
+        }
+
+        const res = await cal.events.patch({
+          calendarId: cid,
+          eventId,
+          requestBody: {
+            attendeesOmitted: true,
+            attendees: [{ email: self.email, responseStatus: response, ...(comment !== undefined ? { comment } : {}) }],
+          },
+        });
+
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(formatEvent(res.data), null, 2) }],
+        };
+      } catch (error: any) {
+        return handleCalendarError(error, account as Account);
+      }
+    },
+  );
+
   server.registerTool(
     'calendar_delete_event',
     {
@@ -374,6 +426,8 @@ export function registerCalendarTools(server: ToolRegistry, deps: CuratedToolDep
       },
     },
     async ({ account, calendarId, eventId, timeMin, timeMax, maxResults, pageToken }) => {
+      const tzError = missingTimeZoneError('timeMin', timeMin) ?? missingTimeZoneError('timeMax', timeMax);
+      if (tzError) return invalidParams(account as Account, tzError, MISSING_TIME_ZONE_HINT);
       const rangeError = timeRangeError(timeMin, timeMax);
       if (rangeError) return invalidParams(account as Account, rangeError, TIME_RANGE_HINT);
       try {
@@ -420,6 +474,8 @@ export function registerCalendarTools(server: ToolRegistry, deps: CuratedToolDep
             'Pass at least one calendar ID, e.g. ["primary"]. Use calendar_list_calendars to see the IDs this account can read.',
           );
         }
+        const tzError = missingTimeZoneError('timeMin', timeMin) ?? missingTimeZoneError('timeMax', timeMax);
+        if (tzError) return invalidParams(account as Account, tzError, MISSING_TIME_ZONE_HINT);
         const rangeError = timeRangeError(timeMin, timeMax);
         if (rangeError) return invalidParams(account as Account, rangeError, TIME_RANGE_HINT);
         const auth = await getClientFn(account as Account);
@@ -433,10 +489,8 @@ export function registerCalendarTools(server: ToolRegistry, deps: CuratedToolDep
           },
         });
         return {
-          // freebusy answers 200 with NO `calendars` key on an empty items
-          // list, and JSON.stringify(undefined) returns undefined, not a
-          // string: the SDK then rejected our own result with -32602. The
-          // value is a map keyed by calendar id, so the fallback is {}.
+          // Empty items returns 200 with no `calendars` key; JSON.stringify(undefined)
+          // would make the SDK reject our own result, so fall back to {}.
           content: [{ type: 'text' as const, text: JSON.stringify(res.data.calendars ?? {}, null, 2) }],
         };
       } catch (error: any) {
@@ -499,6 +553,19 @@ export function timeRangeError(timeMin: string | undefined, timeMax: string | un
 export const TIME_RANGE_HINT =
   'Swap the two values or widen the window: timeMin must be strictly earlier than timeMax. ' +
   'An empty result from this tool then always means "nothing scheduled", never "bad range".';
+
+const TZ_SUFFIX_RE = /(Z|[+-]\d{2}:?\d{2})$/;
+
+/** The Calendar API requires timeMin/timeMax as RFC3339 with a mandatory
+ * offset; a bare local datetime is silently ambiguous rather than rejected,
+ * so catch it here with a message that names the field. */
+export function missingTimeZoneError(field: 'timeMin' | 'timeMax', value: string | undefined): string | null {
+  if (value === undefined || TZ_SUFFIX_RE.test(value)) return null;
+  return `${field} ("${value}") has no "Z" or UTC offset, so its timezone is ambiguous.`;
+}
+
+export const MISSING_TIME_ZONE_HINT =
+  'Add "Z" for UTC or an explicit offset, e.g. "2026-04-04T00:00:00Z" or "2026-04-04T00:00:00+01:00".';
 
 export function formatEvent(event: any, opts: { full?: boolean } = {}) {
   const full = opts.full ?? true;

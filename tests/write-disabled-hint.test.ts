@@ -1,21 +1,22 @@
 import { describe, it, expect } from 'vitest';
-import { denyReason, isAllowed, writeDisabledResult, type Policy, type Profile } from '../src/write-control.js';
+import { denyReason, isAllowed, writeDisabledResult, WRITE_PROFILES, type Policy, type Profile } from '../src/write-control.js';
 import type { Cud } from '../src/registry.js';
 
 const policy = (over: Partial<Policy> = {}): Policy =>
   ({ profile: 'safe-writes', readOnly: false, allow: [], deny: [], ...over });
 
 const TRASH = { name: 'gmail_trash', service: 'gmail', cud: 'delete' as const };
+const DELETE = { name: 'drive_delete', service: 'drive', cud: 'delete' as const };
 const SEND = { name: 'gmail_send', service: 'gmail', cud: 'create' as const };
 
-const hintOf = (tool: typeof TRASH | typeof SEND, p: Policy) =>
+const hintOf = (tool: typeof TRASH | typeof DELETE | typeof SEND, p: Policy) =>
   JSON.parse(writeDisabledResult(tool, p).content[0].text).hint as string;
 
 describe('the hint never proposes the setting that just refused', () => {
-  // The bug: a delete refused under safe-writes was told to "Enable via
-  // GOOGLE_PROFILE=safe-writes|full-writes". Following that changes nothing.
+  // A delete refused under safe-writes was once told to "Enable via
+  // GOOGLE_PROFILE=safe-writes|full-writes"; following that changes nothing.
   it('does not offer the current profile back to the caller', () => {
-    const h = hintOf(TRASH, policy({ profile: 'safe-writes' }));
+    const h = hintOf(DELETE, policy({ profile: 'safe-writes' }));
     expect(h).toContain('full-writes');
     expect(h).not.toContain('=safe-writes');
     expect(h).not.toContain('or safe-writes');
@@ -72,7 +73,29 @@ describe('the suggested allow pattern is one the matcher accepts', () => {
   });
 
   it('suggests the operation, not the blunt service wildcard', () => {
-    expect(hintOf(TRASH, policy({ profile: 'safe-writes' }))).toContain('"gmail:trash"');
+    expect(hintOf(TRASH, policy({ profile: 'read-only' }))).toContain('"gmail:trash"');
+  });
+
+  // #312: drive_update's op IS its cud, so "drive:update" also matches
+  // drive_move, drive_permission_update and the rest of the update class.
+  it('does not call a class-wide pattern "just this one"', () => {
+    const UPDATE = { name: 'drive_update', service: 'drive', cud: 'update' as Cud };
+    const h = hintOf(UPDATE as typeof TRASH, policy({ profile: 'read-only' }));
+    expect(h).toContain('GOOGLE_WRITE_ALLOW="drive:update"');
+    expect(h).not.toContain('just this one');
+    expect(h).toContain('every other update-class drive tool');
+    for (const sibling of ['drive_move', 'drive_permission_update']) {
+      expect(isAllowed({ name: sibling, service: 'drive', cud: 'update' }, policy({ profile: 'read-only', allow: ['drive:update'] }))).toBe(true);
+    }
+  });
+
+  it('a "just this one" pattern permits no sibling of the same class', () => {
+    const MOVE = { name: 'drive_move', service: 'drive', cud: 'update' as Cud };
+    const h = hintOf(MOVE as typeof TRASH, policy({ profile: 'read-only' }));
+    expect(h).toContain('allow just this one with GOOGLE_WRITE_ALLOW="drive:move"');
+    for (const sibling of ['drive_update', 'drive_permission_update']) {
+      expect(isAllowed({ name: sibling, service: 'drive', cud: 'update' }, policy({ profile: 'read-only', allow: ['drive:move'] }))).toBe(false);
+    }
   });
 });
 
@@ -82,7 +105,20 @@ describe('denyReason', () => {
     expect(denyReason({ name: 'gmail_search', service: 'gmail', cud: 'read' }, policy({ readOnly: true }))).toBeUndefined();
   });
 
+  it('Trash is refused under every profile and the hint offers the per-tool allow, not another profile', () => {
+    for (const profile of WRITE_PROFILES) {
+      const p = policy({ profile });
+      expect(isAllowed(TRASH, p), profile).toBe(false);
+      expect(denyReason(TRASH, p), profile).toEqual({ rule: 'profile', profile });
+      const h = hintOf(TRASH, p);
+      expect(h, profile).toContain('GOOGLE_WRITE_ALLOW="gmail:trash"');
+      expect(h, profile).not.toContain('GOOGLE_PROFILE=');
+    }
+    expect(isAllowed(TRASH, policy({ profile: 'read-only', allow: ['gmail:trash'] }))).toBe(true);
+    expect(denyReason(TRASH, policy({ profile: 'full-writes', allow: ['gmail:trash'] }))).toBeUndefined();
+  });
+
   it('reports the profile when nothing more specific refused', () => {
-    expect(denyReason(TRASH, policy({ profile: 'safe-writes' }))).toEqual({ rule: 'profile', profile: 'safe-writes' });
+    expect(denyReason(DELETE, policy({ profile: 'safe-writes' }))).toEqual({ rule: 'profile', profile: 'safe-writes' });
   });
 });

@@ -9,9 +9,8 @@ import { handleGoogleApiError, invalidParams } from './_errors.js';
 
 
 export function registerChatTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -143,9 +142,10 @@ export function registerChatTools(server: ToolRegistry, deps: CuratedToolDeps = 
   );
 }
 
-function handleChatError(error: any, account: Account) {
+export function handleChatError(error: any, account: Account) {
   return handleGoogleApiError(error, account, {
     scope: 'Chat tools require the optional "chat" scope bundle: add it to this account\'s scope profile, then re-auth.',
     resource: `Google Chat denied this space or message to "${account}". The scope is not the problem: check that the account is a member of the space, and that Chat is turned on for the Workspace.`,
+    bundle: 'chat',
   });
 }

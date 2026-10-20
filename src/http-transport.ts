@@ -1,24 +1,23 @@
-// B12: the Streamable HTTP transport host (cc-transport-hosting T2/T3). Owns the
+// Streamable HTTP transport host: node:http server, route table, front guard,
+// and stateless per-request /mcp dispatch. See docs/internals.md.
 import type { McpServer, Transport, AuthInfo } from "@modelcontextprotocol/server";
 import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
-
-// node:http server, the route table, the front guard (Host / Origin / DNS-rebind),
-// and the stateless per-request /mcp dispatch. The OAuth AS endpoints and Bearer
-// verification are a seam filled by B13 (oauth-authorization-server); B12 ships a
-// loopback-owner authenticator so the local-HTTP model works before the AS lands.
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import type { HttpConfig } from './http-config.js';
 import { withArgNormalization, type ArgShape, type StrictArgOptions, withValidationEnvelope, type ValidationEnvelopeOptions } from './arg-normalize.js';
+import { logSafe } from './trim.js';
+// A host wrapping the log callbacks it hands core needs this, and trim has no package export.
+export { logSafe } from './trim.js';
 export type AuthOutcome =
   | { ok: true; sub?: string }
   | { ok: false; status: number; body: string; headers?: Record<string, string> };
 
-/** Bearer / owner check for POST /mcp. B12 default = loopback-owner; B13 swaps in JWT verify. */
+/** Bearer / owner check for POST /mcp. Default = loopback-owner; the AS swaps in JWT verify. */
 export type Authenticator = (req: IncomingMessage) => AuthOutcome | Promise<AuthOutcome>;
 
-/** A mounted extra route (the AS endpoints, B13). Return true if it wrote a response. */
+/** A mounted extra route (the AS endpoints). Return true if it wrote a response. */
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean | Promise<boolean>;
 
 /** What a verified subject resolves to: ITS server plus the per-request hooks
@@ -33,7 +32,7 @@ export interface ServerTarget {
 }
 
 export interface HttpHostOptions {
-  /** The ONE McpServer + registry built at boot (P1 / BV gap #4: never per request). */
+  /** The ONE McpServer + registry built at boot (never per request). */
   server: McpServer;
   config: HttpConfig;
   version: string;
@@ -46,8 +45,14 @@ export interface HttpHostOptions {
    * per-request hooks come from the resolved target ONLY: the host-level
    * argShapeFor / strictArgs / validationEnvelope describe the boot server's
    * registry, never another subject's. */
-  resolveServer?: (claims: { sub: string }) => Promise<ServerTarget | null> | ServerTarget | null;
-  /** Extra routes keyed by exact pathname (AS endpoints mount here in B13). */
+  resolveServer?: (
+    claims: { sub: string },
+  ) =>
+    | Promise<ServerTarget | null | { refused: { error: string; message: string } }>
+    | ServerTarget
+    | null
+    | { refused: { error: string; message: string } };
+  /** Extra routes keyed by exact pathname (AS endpoints mount here). */
   routes?: Record<string, RouteHandler>;
   log?: (line: string) => void;
   /** Max /mcp JSON body bytes (DoS guard). */
@@ -74,13 +79,30 @@ export interface HttpHostOptions {
 }
 
 // A hung handler that keeps the connection open would otherwise hold the global
-// serialize() lock forever. Generous by default so slow-but-valid calls (large
-// Drive exports, fan-out) still finish; the point is only to guarantee release.
+// serialize() lock forever; generous by default so slow-but-valid calls still finish.
 const DISPATCH_TIMEOUT_DEFAULT = 120_000;
-/** MCP 2025-06-18 dropped JSON-RPC batching, and the SDK screens every frame
- * of a batch synchronously in one tick: without a cap one body multiplies the
- * per-call work by however many frames fit in it. */
+// Without a cap, one body multiplies per-call work by however many
+// JSON-RPC frames the SDK's synchronous batch screening finds in it.
 const MAX_BATCH_FRAMES = 16;
+
+// A refusal's body reaches the wire verbatim, so it's validated: no new slug
+// literal enters core, and an overlong message can't leak an operator path/env var.
+const REFUSAL_SLUG_RE = /^[a-z][a-z0-9_]{0,39}$/;
+const MAX_REFUSAL_MESSAGE_CHARS = 300;
+// C0/C1 controls, format chars (bidi overrides, zero-width joiners) and
+// line/paragraph separators; ordinary non-ASCII letters stay allowed.
+const NON_PRINTABLE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+function isValidRefusal(r: { error: unknown; message: unknown }): boolean {
+  return (
+    typeof r.error === 'string' &&
+    REFUSAL_SLUG_RE.test(r.error) &&
+    typeof r.message === 'string' &&
+    r.message.length > 0 &&
+    r.message.length <= MAX_REFUSAL_MESSAGE_CHARS &&
+    !NON_PRINTABLE_RE.test(r.message)
+  );
+}
 
 export function parseOwnerEmails(env: NodeJS.ProcessEnv = process.env): string[] {
   return (env.MCP_OWNER_EMAILS ?? '')
@@ -91,7 +113,7 @@ export function parseOwnerEmails(env: NodeJS.ProcessEnv = process.env): string[]
 
 /** Front guard: an Origin, if present, must be allowlisted; a Host must be
  * allowlisted. Absent Origin passes (native/CLI/backend clients — the claude.ai
- * connector calls /mcp server-to-server with no Origin, BV-4). */
+ * connector calls /mcp server-to-server with no Origin). */
 export function originAllowed(origin: string | undefined, allowed: string[]): boolean {
   if (!origin) return true;
   return allowed.includes(origin);
@@ -106,12 +128,23 @@ export function hostAllowed(host: string | undefined, allowed: string[]): boolea
   return allowed.includes(host) || allowed.includes(bare);
 }
 
-/** JSON-RPC method name(s) for an observability log line — no params, no PII. */
+const METHOD_NAME = /^[A-Za-z0-9_./$-]{1,64}$/;
+const BATCH_METHODS_SHOWN = 4;
+
+/** JSON-RPC method name(s) for an observability log line: no params, no PII.
+ * The method is the caller's: anything not shaped like a method name, which
+ * includes a value whose String() throws, is logged as `<invalid>`. */
 export function jsonRpcMethod(body: unknown): string {
-  const one = (b: unknown): string | undefined =>
-    b && typeof b === 'object' && 'method' in b ? String((b as { method: unknown }).method) : undefined;
-  if (Array.isArray(body)) return body.map(one).filter(Boolean).join(',') || 'batch';
-  return one(body) ?? 'unknown';
+  const one = (b: unknown): string | undefined => {
+    if (!b || typeof b !== 'object' || !('method' in b)) return undefined;
+    const m = (b as { method: unknown }).method;
+    return typeof m === 'string' && METHOD_NAME.test(m) ? m : '<invalid>';
+  };
+  if (!Array.isArray(body)) return one(body) ?? 'unknown';
+  const names = body.map(one).filter((n): n is string => n !== undefined);
+  if (names.length === 0) return 'batch';
+  const rest = names.length - BATCH_METHODS_SHOWN;
+  return rest > 0 ? `${names.slice(0, BATCH_METHODS_SHOWN).join(',')},+${rest}` : names.join(',');
 }
 
 
@@ -119,21 +152,17 @@ export function jsonRpcMethod(body: unknown): string {
  * cut every connection immediately. */
 const MAX_GRACE_MS = 2 ** 31 - 1;
 
-// A lingering close: a socket destroyed while its client is still sending (a
-// body pipelined after the close) is reset by the kernel, which drops whatever
-// of the last response is still unsent. So the socket only ends its side and
-// waits for the client's FIN, or for the grace to end.
+// A lingering close (ends the socket, never destroys it); see docs/internals.md (Graceful close).
 function endAfterFlush(socket: Socket): void {
   if (socket.destroyed || socket.writableEnded) return;
+  // Disarm the keep-alive timer Node arms on finish, or it destroys the
+  // socket ~6s later and cuts a slow reader's unread tail the same way an early destroy does.
+  socket.setTimeout(0);
   socket.end();
 }
 
-// A request that arrives while closing is never answered, so Node keeps it
-// until the socket closes, and a flood pipelined behind a held response would
-// pile up without limit. Reading stops for good instead, which lets TCP flow
-// control stop the client. Node resumes a socket after every parsed request
-// and on drain, so resume becomes a no-op. Such a socket never sees the
-// client's FIN either: the grace ends it.
+// Stops reading for good so TCP flow control stops the client, instead of
+// piling up a flood pipelined behind a held response; see docs/internals.md (Graceful close).
 function stopReading(socket: Socket): void {
   socket.pause();
   socket.resume = () => socket;
@@ -151,20 +180,17 @@ function pathOf(req: IncomingMessage): string {
 
 export class HttpTransportHost {
   private httpServer?: Server;
-  // Serialize the connect→dispatch critical section PER SERVER: a McpServer
-  // captures its transport per request (protocol.js), but the gap between
-  // connect() and the dispatch capturing it would still race under true
-  // concurrency, so all traffic to ONE server runs under one mutex. The free
-  // core has one lane (the boot server); with resolveServer each resolved
-  // server gets its own, however subjects map onto servers.
+  // Per-server dispatch mutex; see docs/internals.md.
   private readonly locks = new Map<McpServer, Promise<unknown>>();
   // Requests holding a lane slot, per server; used only with maxQueuedPerLane.
   private readonly depth = new Map<McpServer, number>();
-  // What a graceful close waits on: open sockets, per socket the requests it
-  // has accepted whose response has not settled and the last of them, and
-  // every handle() that has not settled.
+  // What a graceful close waits on: open sockets and every handle() not yet
+  // settled; see docs/internals.md (Graceful close).
   private readonly sockets = new Set<Socket>();
   private readonly pending = new Map<Socket, { count: number; last: ServerResponse }>();
+  // Sockets that have accepted a request: nothing pending means the last
+  // response finished writing, but its tail can still sit in kernel buffers.
+  private readonly served = new WeakSet<Socket>();
   private readonly handling = new Set<Promise<void>>();
   private closing = false;
   private graceful?: Promise<void>;
@@ -179,9 +205,8 @@ export class HttpTransportHost {
       () => undefined,
     );
     this.locks.set(key, tail);
-    // An idle lane drops out, so the map holds only in-flight subjects rather
-    // than every subject ever seen. A request that chained on this tail has
-    // already replaced it, so the identity check never frees a live lane.
+    // An idle lane drops out of the map; the identity check below skips a
+    // later request that already replaced this tail, so it never frees a live lane.
     void tail.then(() => {
       if (this.locks.get(key) === tail) this.locks.delete(key);
     });
@@ -196,13 +221,13 @@ export class HttpTransportHost {
     const { config } = this.opts;
     const server = createServer((req, res) => {
       const socket = req.socket;
-      // Once closing, a connection ends after the last request it accepted
-      // before the close, so one arriving now is never handled (RFC 9112 9.6).
-      // Its body is left unread: nothing reads the socket again.
+      // Once closing, a request arriving now is never handled (RFC 9112 §9.6)
+      // and its body is left unread.
       if (this.closing) {
         stopReading(socket);
         return;
       }
+      this.served.add(socket);
       const entry = this.pending.get(socket);
       if (entry) {
         entry.count++;
@@ -219,10 +244,8 @@ export class HttpTransportHost {
       };
       res.once('finish', settle);
       res.once('close', settle);
-      // Never rejects: close() waits on it, and a catch-all that itself threw
-      // must neither reject close() nor surface as an unhandled rejection.
-      // The thrown message can name server paths (a lock timeout does), so it
-      // goes only to the host's log.
+      // Never rejects (close() waits on it); the thrown message can name
+      // server paths, so it goes only to the host's log.
       const done = this.handle(req, res)
         .catch((e) => {
           try {
@@ -230,7 +253,7 @@ export class HttpTransportHost {
           } finally {
             // A throwing log must not reach the destroy below: the answer is sent.
             try {
-              this.log(`500 internal_error path=${pathOf(req)}: ${e instanceof Error ? e.message : 'non-Error throw'}`);
+              this.log(`500 internal_error path=${pathOf(req)}: ${e instanceof Error ? logSafe(e.message, 200) : 'non-Error throw'}`);
             } catch {
               // nowhere left to report it
             }
@@ -285,33 +308,30 @@ export class HttpTransportHost {
       this.httpServer = undefined;
       return;
     }
-    // Starting over would destroy every socket in its lingering close.
+    // Starting over would arm a second grace, and a shorter one would cut
+    // what the first still lets finish.
     this.graceful ??= this.closeGracefully(s, graceMs).finally(() => (this.graceful = undefined));
     return this.graceful;
   }
 
   private async closeGracefully(s: Server, graceMs: number): Promise<void> {
     this.closing = true;
-    // Node's close() also destroys every connection it deems idle, and that
-    // includes one whose response has ended but is still flushing: a large
-    // body would be cut short. Idle sockets are closed below instead.
+    // Node's close() also destroys idle connections, which would cut short a
+    // large response still flushing; idle sockets are closed below instead.
     const nodeIdleCloser = s.closeIdleConnections;
     s.closeIdleConnections = () => undefined;
     const closed = new Promise<void>((resolve) => s.close(() => resolve()));
     s.closeIdleConnections = nodeIdleCloser;
-    // Every request accepted before now is answered, and a connection ends
-    // after the last of them: that one says so if it has not started, and the
-    // settle hook in start() ends the socket once it finishes. Node itself
-    // destroys a socket once a Connection: close response is flushed, which
-    // resets it just as endAfterFlush explains, so that end lingers too.
+    // Socket bookkeeping below; see docs/internals.md (Graceful close).
     for (const socket of this.sockets) {
       const entry = this.pending.get(socket);
-      if (!entry) {
+      if (!entry && !this.served.has(socket)) {
         socket.destroy();
         continue;
       }
       socket.destroySoon = () => endAfterFlush(socket);
-      if (!entry.last.headersSent) entry.last.setHeader('Connection', 'close');
+      if (!entry) endAfterFlush(socket);
+      else if (!entry.last.headersSent) entry.last.setHeader('Connection', 'close');
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<void>((resolve) => {
@@ -364,12 +384,12 @@ export class HttpTransportHost {
   private frontGuard(req: IncomingMessage, res: ServerResponse): boolean {
     const { allowedHosts, allowedOrigins } = this.opts.config;
     if (!hostAllowed(req.headers.host, allowedHosts)) {
-      this.log(`403 host_rejected host=${req.headers.host ?? ''}`);
+      this.log(`403 host_rejected host=${logSafe(req.headers.host ?? '', 64)}`);
       this.fail(res, 403, 'host_rejected', 'Host not allowed (DNS-rebinding guard).');
       return false;
     }
     if (!originAllowed(req.headers.origin, allowedOrigins)) {
-      this.log(`403 origin_rejected origin=${req.headers.origin ?? ''}`);
+      this.log(`403 origin_rejected origin=${logSafe(req.headers.origin ?? '', 64)}`);
       this.fail(res, 403, 'origin_rejected', 'Origin not allowed.');
       return false;
     }
@@ -382,10 +402,7 @@ export class HttpTransportHost {
       return this.fail(res, 405, 'method_not_allowed', 'POST /mcp only (stateless mode; no GET SSE).');
     }
     if (!this.frontGuard(req, res)) return;
-    // Registered before anything awaits: a client that leaves while its request
-    // waits on the lane must not have it dispatched once its turn comes. A
-    // response queued behind another on its connection never emits 'close', so
-    // the socket is checked too.
+    // Registered before anything awaits (client-gone skip); see docs/internals.md.
     let gone = false;
     res.once('close', () => (gone = true));
     const socket = req.socket;
@@ -402,8 +419,8 @@ export class HttpTransportHost {
 
     const sub = auth.sub ?? 'owner';
 
-    // Tenant resolution (the seam EE fills): map the verified subject to ITS
-    // server. Absent resolver = the one boot server for every subject.
+    // Tenant resolution (a multi-tenant host fills this seam): map the
+    // verified subject to ITS server. Absent resolver = the one boot server for every subject.
     let target: ServerTarget | null = {
       server: this.opts.server,
       argShapeFor: this.opts.argShapeFor,
@@ -411,11 +428,25 @@ export class HttpTransportHost {
       validationEnvelope: this.opts.validationEnvelope,
     };
     if (this.opts.resolveServer) {
+      let resolved: ServerTarget | null | { refused: { error: string; message: string } };
       try {
-        target = await this.opts.resolveServer({ sub });
+        resolved = await this.opts.resolveServer({ sub });
       } catch {
-        target = null;
+        resolved = null;
       }
+      if (resolved && 'refused' in resolved) {
+        const { refused } = resolved;
+        if (isValidRefusal(refused)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: refused.error, message: refused.message }));
+          this.log(`403 ${refused.error} path=/mcp`);
+          return;
+        }
+        // An invalid shape falls through to today's exact answer rather than
+        // forwarding something unvalidated.
+        resolved = null;
+      }
+      target = resolved;
       if (!target) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'tenant_not_found', message: 'no tenant is provisioned for this subject' }));
@@ -452,9 +483,8 @@ export class HttpTransportHost {
     sub: string,
     clientGone: () => boolean,
   ): Promise<void> {
-    // Thread the verified subject to tool handlers: the Node transport forwards
-    // req.auth verbatim as ctx.http.authInfo. Token/clientId stay empty — the
-    // bearer value must not re-enter the dispatch path via handler context.
+    // Thread the verified subject to tool handlers via ctx.http.authInfo;
+    // token/clientId stay empty so the bearer value never re-enters the dispatch path.
     (req as IncomingMessage & { auth?: AuthInfo }).auth = {
       token: '',
       clientId: '',
@@ -473,28 +503,16 @@ export class HttpTransportHost {
       return this.fail(res, 400, 'batch_too_large', `a JSON-RPC batch may hold at most ${maxFrames} messages`);
     }
 
-    // Host/Origin are enforced by the front guard above (uniformly for /mcp and
-    // the mounted AS routes), so the SDK's own DNS-rebind guard is disabled: its
-    // exact-Host match is stricter than the front guard and would 403 valid
-    // Hosts (double enforcement, differing rules).
+    // The SDK's own DNS-rebind guard is disabled: Host/Origin are already
+    // enforced above, and its stricter exact-Host match would 403 valid Hosts.
     const transport = new NodeStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
       enableDnsRebindingProtection: false,
     });
-    // The shared McpServer holds exactly one connected transport at a time, so
-    // connect + dispatch + DISCONNECT all run inside the mutex: the next request
-    // can never hit "Already connected". The serialized section is guaranteed to
-    // settle three ways — the handler finishes, the client disconnects (res
-    // 'close'), or a dispatch deadline fires — so neither a client that holds the
-    // connection open nor a hung upstream can wedge the lock. The transport is
-    // closed in a finally (which resets server._transport) before the lock
-    // releases. (A shared initialized-state persists across stateless requests;
-    // benign for the single-owner design.)
+    // connect + dispatch + disconnect run inside the per-server mutex, keyed
+    // on the server identity, never the subject; see docs/internals.md.
     const deadlineMs = this.opts.dispatchTimeoutMs ?? DISPATCH_TIMEOUT_DEFAULT;
-    // The lock lane is the SERVER identity, never the subject: two subjects
-    // reaching one server (the boot server, or a resolver mapping several
-    // subjects to one) would otherwise race it through the connect gap.
     const { server: mcpServer, argShapeFor, strictArgs, validationEnvelope } = target;
     await this.serializeFor(mcpServer, async () => {
       if (clientGone()) {
@@ -507,8 +525,7 @@ export class HttpTransportHost {
         timer = setTimeout(() => resolve('timeout'), deadlineMs);
         timer.unref?.();
       });
-      // Same composition as the stdio leg: the envelope rewrite is innermost,
-      // so the tap above it still classifies the original validation prose.
+      // Envelope rewrite innermost, as on stdio; see docs/internals.md (Argument normalization).
       const enveloped = withValidationEnvelope(transport, validationEnvelope ?? {});
       const tapped = this.opts.metricsTap ? this.opts.metricsTap(enveloped) : enveloped;
       await mcpServer.connect(
@@ -516,9 +533,8 @@ export class HttpTransportHost {
           ? withArgNormalization(tapped, argShapeFor ?? (() => undefined), this.opts.log, this.opts.onArgRename, strictArgs)
           : tapped,
       );
-      // Reflect the dispatch into a non-rejecting arm: if the deadline wins the
-      // race, an orphaned handler settling later must not surface as an unhandled
-      // rejection — but a genuine dispatch error still propagates (rethrown below).
+      // Non-rejecting arm: an orphaned handler settling after the deadline wins
+      // must not surface as an unhandled rejection; a real error is rethrown below.
       let dispatchErr: unknown;
       const dispatchArm = transport
         .handleRequest(req, res, body)
@@ -552,7 +568,7 @@ export class HttpTransportHost {
   private health(res: ServerResponse): void {
     const { config, ownerConfigured, version } = this.opts;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    // No secrets, no owner emails (cc-transport-hosting /health rule).
+    // No secrets, no owner emails.
     res.end(
       JSON.stringify({
         status: 'ok',

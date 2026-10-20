@@ -9,6 +9,7 @@ import { handleGoogleApiError, invalidParams, safeMessage, stringifyEnvelope } f
 import { hostFilesRefused, openLocalReadStream, prepareLocalDest } from './_local-files.js';
 import { checkOutbound, outboundDeniedEnvelope, resolveOutboundAllowlist } from '../outbound-allowlist.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
+import { refusedAccountResult } from '../session-grant.js';
 import { capText, listResult } from '../trim.js';
 import {
   deskSavePathRequiredMessage,
@@ -21,6 +22,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import mime from 'mime-types';
 
 function asDownloadBuffer(data: unknown): Buffer {
@@ -56,6 +58,7 @@ function deskSavePathMissing() {
 
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
 const FALLBACK_MAX_BYTES = 1024 * 1024 * 1024; // 1GB
+const MAX_UPLOAD_BASE64_BYTES = 10 * 1024 * 1024; // 10MB decoded
 
 const GOOGLE_WORKSPACE_TYPES = new Set([
   'application/vnd.google-apps.document',
@@ -64,9 +67,8 @@ const GOOGLE_WORKSPACE_TYPES = new Set([
   'application/vnd.google-apps.drawing',
 ]);
 
-// drive_read inlines only textual content. Beyond text/*, RFC 6839 structured-
-// syntax suffixes (+json/+xml/...) and a few bare application/* types are text
-// in practice — image/svg+xml was the motivating false "binary" refusal.
+// drive_read inlines only textual content; RFC 6839 +json/+xml/... suffixes and
+// a few bare application/* types count too (image/svg+xml was the motivating case).
 const TEXTUAL_EXACT = new Set([
   'application/json',
   'application/xml',
@@ -125,16 +127,13 @@ export const DRIVE_QUERY_HINT =
   "\"mimeType = 'application/pdf'\", or \"'me' in owners\". " +
   'Reference: https://developers.google.com/drive/api/guides/search-files';
 
-// A bare keyword is not valid Drive `q` syntax (Google 400s "Invalid Value"), yet
-// it is the natural thing to pass to a "search" tool, so wrap it as a full-text
-// match. A query already carrying a comparison operator or a quoted literal is a
-// structured query and is passed through untouched.
+// A bare keyword isn't valid Drive `q` syntax (400s "Invalid Value"), so wrap it
+// as a full-text match; a query with a comparison operator is passed through untouched.
 export function normalizeDriveQuery(raw: string): string {
   const q = raw.trim();
   if (q === '') return q;
-  // Structured iff it carries a comparison operator or the membership form
-  // "<value> in (parents|owners|writers|readers)". A bare apostrophe does NOT
-  // count (names like O'Brien are keywords, not query syntax).
+  // Structured iff it has a comparison operator or the membership form "<value> in
+  // (parents|owners|writers|readers)"; a bare apostrophe (e.g. O'Brien) doesn't count.
   const hasComparison = /(\bcontains\b|!=|<=|>=|[=<>])/i.test(q);
   const hasMembership = /\bin\s+(parents|owners|writers|readers)\b/i.test(q);
   if (hasComparison || hasMembership) return q;
@@ -142,9 +141,8 @@ export function normalizeDriveQuery(raw: string): string {
   return `fullText contains '${escaped}'`;
 }
 
-// Drive rejects a malformed query with HTTP 400 / reason "invalid" and the opaque
-// message "Invalid Value"; detect that so drive_search returns query-syntax help
-// instead of a generic upstream_error.
+// Drive 400s a malformed query with the opaque reason "invalid"/"Invalid Value";
+// detect it so drive_search returns query-syntax help instead of a generic upstream_error.
 export function isDriveInvalidQuery(error: any): boolean {
   const raw = error?.code ?? error?.status ?? error?.response?.status;
   const status = typeof raw === 'string' ? Number(raw) : raw;
@@ -170,9 +168,8 @@ export function resolveShareNotification(opts: {
 }
 
 export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const requiredAccountEnum = accountArgLive(() => server.accountAliases());
   const getClientFn = deps.getClientFn ?? getClient;
@@ -192,12 +189,14 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
         driveId: z.string().optional().describe('Optional shared drive ID'),
         pageToken: z.string().min(1).optional()
           .describe('Continuation token from a previous call\'s nextPageToken'),
+        orderBy: z.string().optional()
+          .describe('Sort key(s) for files.list, e.g. "modifiedTime desc" or "folder,name". Default: Drive\'s relevance ranking for the query, an arbitrary stable order otherwise.'),
       },
     },
-    async ({ account, query, maxResults, driveId, pageToken }) => {
+    async ({ account, query, maxResults, driveId, pageToken, orderBy }) => {
       try {
-        // normalizeDriveQuery trims to '' and Drive reads that as "everything",
-        // so a blank query returned a raw directory listing as a search result.
+        // normalizeDriveQuery trims to '' and Drive reads that as "everything", so
+        // a blank query would list the whole drive as a "search" result.
         if (query.trim() === '') {
           return invalidParams(
             account as Account,
@@ -211,9 +210,8 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
         const params: any = {
           q: normalizeDriveQuery(query),
           pageSize: maxResults ?? 10,
-          // nextPageToken and incompleteSearch live OUTSIDE files(...): omit
-          // them from the mask and Drive drops them, so a partial result was
-          // indistinguishable from a complete one.
+          // nextPageToken and incompleteSearch live OUTSIDE files(...): omit them from
+          // the mask and Drive drops them, making a partial result indistinguishable from a complete one.
           fields: 'nextPageToken,incompleteSearch,files(id,name,mimeType,modifiedTime,webViewLink,size,parents,driveId)',
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
@@ -224,6 +222,7 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
           params.corpora = 'drive';
         }
         if (pageToken) params.pageToken = pageToken;
+        if (orderBy) params.orderBy = orderBy;
 
         const res = await drive.files.list(params);
         const incomplete = res.data.incompleteSearch === true;
@@ -239,9 +238,8 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
         };
       } catch (error: any) {
         if (isDriveInvalidQuery(error)) {
-          // Through safeMessage and stringifyEnvelope like every other
-          // envelope: this path used to read the upstream body directly, so a
-          // non-JSON response landed here uncapped.
+          // Goes through safeMessage/stringifyEnvelope like every other envelope
+          // so a non-JSON upstream response can't land here uncapped.
           return {
             content: [{ type: 'text' as const, text: stringifyEnvelope({
               error: 'invalid_query',
@@ -426,26 +424,69 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
 
   // ─── Write / upload / download ─────────────────────────────────────────
 
-  registerHostFileTool(
+  server.registerTool(
     'drive_upload',
     {
-      description: 'Upload a local file to Google Drive. Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
+      description: 'Upload a file to Google Drive, from inline base64 content or (when this server exposes the host filesystem) a local path. Pass `convertTo` to import it as a native, editable Google Doc/Sheet/Slides/Drawing instead of storing the raw bytes.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        localPath: z.string().min(1).describe('Absolute path of the SOURCE file on disk to upload (on the machine running the server; this is not savePath)'),
         filename: z.string().describe('Name as it appears in Drive'),
-        mimeType: z.string().optional().describe('Source MIME type of the local file (inferred from extension if omitted). With `convertTo`, this is the format Drive imports from.'),
+        contentBase64: z.string().optional().describe(`Base64-encoded file content. Exactly one of contentBase64${localFiles ? ' or localPath' : ''} is required. Decoded size is capped at ${MAX_UPLOAD_BASE64_BYTES / (1024 * 1024)} MB.`),
+        ...(localFiles
+          ? {
+              localPath: z.string().min(1).optional().describe('Absolute path of the SOURCE file on disk to upload (on the machine running the server; this is not savePath). Exactly one of contentBase64 or localPath is required.'),
+            }
+          : {}),
+        mimeType: z.string().optional().describe('Source MIME type of the content (inferred from filename if omitted). With `convertTo`, this is the format Drive imports from.'),
         convertTo: z.enum(CONVERT_TO_VALUES).optional().describe('Convert the upload into this native Google Workspace type on import: "document" | "spreadsheet" | "presentation" | "drawing" (full application/vnd.google-apps.* ids also accepted). E.g. upload .md/.html/.docx/.txt with convertTo=document to get a real Google Doc. Source must be an importable format. Omit to store the file as-is.'),
         parentFolderId: z.string().optional().describe('Parent folder ID, not parentId. Defaults to My Drive root'),
       },
     },
-    async ({ account, localPath, filename, mimeType: mimeTypeArg, convertTo, parentFolderId }) => {
+    async (args) => {
+      const { account, filename, contentBase64, mimeType: mimeTypeArg, convertTo, parentFolderId } = args;
+      // Declared only when the context may read host files (see the shape).
+      const { localPath: localPathArg } = args as { localPath?: string };
+      if (localPathArg && !localFiles) return hostFilesRefused(account, 'localPath');
+      const hasBase64 = contentBase64 !== undefined;
+      const hasLocalPath = !!localPathArg;
+      if (hasBase64 === hasLocalPath) {
+        return invalidParams(
+          account as Account,
+          `Pass exactly one of contentBase64${localFiles ? ' or localPath' : ''}.`,
+          localFiles
+            ? 'Use contentBase64 for inline content, or localPath for a file already on the machine running the server.'
+            : 'Pass contentBase64 with the file\'s base64-encoded content.',
+        );
+      }
       try {
+        let media: { mimeType: string; body: Readable };
+        if (hasBase64) {
+          const maxB64Length = Math.ceil(MAX_UPLOAD_BASE64_BYTES / 3) * 4 + 4;
+          if (contentBase64!.length > maxB64Length) {
+            return invalidParams(
+              account as Account,
+              `Base64-encoded contentBase64 string length ${contentBase64!.length} exceeds the ${maxB64Length} character limit (implies decoded size over ${MAX_UPLOAD_BASE64_BYTES} bytes).`,
+              'Upload a smaller file, or use localPath if this server exposes the host filesystem.',
+            );
+          }
+          const buf = Buffer.from(contentBase64!, 'base64');
+          if (buf.length > MAX_UPLOAD_BASE64_BYTES) {
+            return invalidParams(
+              account as Account,
+              `Decoded contentBase64 is ${buf.length} bytes, over the ${MAX_UPLOAD_BASE64_BYTES} byte cap.`,
+              'Upload a smaller file, or use localPath if this server exposes the host filesystem.',
+            );
+          }
+          media = { mimeType: mimeTypeArg ?? (mime.lookup(filename) || 'application/octet-stream'), body: Readable.from(buf) };
+        } else {
+          media = {
+            mimeType: mimeTypeArg ?? (mime.lookup(localPathArg!) || 'application/octet-stream'),
+            body: await openLocalReadStream(localPathArg!),
+          };
+        }
+
         const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
-
-        const resolvedMime = mimeTypeArg ?? (mime.lookup(localPath) || 'application/octet-stream');
-        const fileStream = await openLocalReadStream(localPath);
 
         const res = await drive.files.create({
           requestBody: {
@@ -454,10 +495,7 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
             // Setting a google-apps target type makes Drive convert the media on import.
             ...(convertTo ? { mimeType: resolveConvertTarget(convertTo) } : {}),
           },
-          media: {
-            mimeType: resolvedMime,
-            body: fileStream,
-          },
+          media,
           fields: 'id,name,mimeType,webViewLink,size',
           supportsAllDrives: true,
         });
@@ -488,6 +526,8 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
     },
     async ({ account, fileId, savePath, filename }) => {
       try {
+        const refused = refusedAccountResult(account);
+        if (refused) return refused;
         const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
@@ -540,6 +580,8 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
     },
     async ({ account, fileId, mimeType: exportMime, savePath, filename }) => {
       try {
+        const refused = refusedAccountResult(account);
+        if (refused) return refused;
         const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
@@ -858,10 +900,23 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
       },
     },
     async ({ account, fileId, type, role, emailAddress, domain, sendNotification, emailMessage, transferOwnership, expirationTime }) => {
+      if ((type === 'user' || type === 'group') && !emailAddress) {
+        return invalidParams(
+          account as Account,
+          `type is "${type}" but emailAddress was not supplied.`,
+          'Pass emailAddress, the grantee to share with.',
+        );
+      }
+      if (type === 'domain' && !domain) {
+        return invalidParams(
+          account as Account,
+          'type is "domain" but domain was not supplied.',
+          'Pass domain, e.g. "example.com".',
+        );
+      }
       {
-        // Outbound allowlist (off unless GOOGLE_OUTBOUND_ALLOWLIST is set):
-        // user/group grantees must match; a domain share needs its exact
-        // "@domain" entry; "anyone" (link sharing) is refused while active.
+        // Outbound allowlist (off unless GOOGLE_OUTBOUND_ALLOWLIST is set): user/group
+        // grantees must match, a domain share needs its exact "@domain" entry, "anyone" is refused while active.
         const list = resolveOutboundAllowlist();
         if (list) {
           if ((type === 'user' || type === 'group') && emailAddress) {

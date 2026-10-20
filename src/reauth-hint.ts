@@ -1,8 +1,7 @@
-// B13 in-call re-auth (BV-1): a dead/missing per-account Google token is a
-// leg-C failure. Over stdio the fix is the `auth --account` CLI; over HTTP the
-// user cannot run a CLI, so the hint becomes a clickable, server-signed link
-// into the AS's clientless alias_reauth flow (AuthServer.reauthLink). The HTTP
-// bootstrap installs the linker when the AS starts; stdio never does.
+// Over stdio the fix is the `auth --account` CLI; over HTTP it's a clickable,
+// server-signed link instead, installed by the AS bootstrap. See docs/internals.md.
+
+import { hints } from './hint-provider.js';
 
 let httpReauthLink: ((alias: string) => string) | null = null;
 
@@ -11,6 +10,8 @@ export function setHttpReauthLink(linker: ((alias: string) => string) | null): v
 }
 
 export function reauthHint(account: string): string {
+  const rendered = hints()?.render({ kind: 'reauth', account });
+  if (rendered) return rendered.hint;
   if (httpReauthLink) {
     return `Re-authenticate "${account}" in your browser, then retry: ${httpReauthLink(account)}`;
   }

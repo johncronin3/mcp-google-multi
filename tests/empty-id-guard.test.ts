@@ -7,11 +7,8 @@ import type { Policy } from '../src/write-control.js';
 
 const POLICY: Policy = { profile: 'read-only', readOnly: true, allow: [], deny: [] };
 
-// A value that lands in the URL path is a path SEGMENT. An empty one collapses
-// it, so the request addresses the collection and a `get` silently answers with
-// a LIST (searchconsole_sites_get with siteUrl:"" returned the whole site list
-// as success). Display names are excluded on purpose: an empty folder or label
-// name is a plain user error, not a different request.
+// A value in a URL path SEGMENT: empty collapses it, so `get` can silently list instead (e.g. siteUrl:""
+// returning the whole site list); display names are excluded, since an empty one is just a user error.
 const IDENTIFIER = /(Id|Key|Url|Path)$/;
 const EXTRA_IDENTIFIERS = new Set(['resourceName', 'groupResourceName']);
 

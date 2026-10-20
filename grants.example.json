@@ -4,12 +4,13 @@
     {
       "name": "Personal Brain Grant 3",
       "code": "REPLACE_WITH_HOST_LOCAL_CODE",
-      "accounts": ["personal", "stromback", "opcenter", "buildcoin"]
+      "accounts": ["personal", "stromback", "opcenter", "buildcoin", "usa-house", "olga"]
     },
     {
       "name": "StrombackBrain2",
       "code": "REPLACE_WITH_HOST_LOCAL_CODE",
-      "accounts": ["stromback"]
+      "accounts": ["stromback"],
+      "notBefore": "1970-01-01T00:00:00.000Z"
     }
   ]
 }

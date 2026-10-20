@@ -18,9 +18,8 @@ export function tenantsDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(configDir(env), 'tenants');
 }
 
-// A tenant id becomes a filesystem path segment exactly like an account
-// alias, so it rides the same traversal guard. 'owner' is the single-owner
-// context's subject and client lane, so no tenant may take it.
+// A tenant id becomes a filesystem path segment like an account alias (same
+// traversal guard); 'owner' is the single-owner subject, so no tenant may take it.
 function assertTenantId(tenantId: string): void {
   if (!ALIAS_RE.test(tenantId) || isReservedAlias(tenantId) || tenantId === 'owner') {
     throw new Error(`E_TENANT_ID_INVALID: invalid tenant id "${tenantId}".`);
@@ -62,9 +61,7 @@ const accountEntrySchema = z.strictObject({
 });
 
 // .strict() everywhere: any unknown or secret-shaped key (clientSecret,
-// masterKey, jwtKey, clientId) fails validation, structurally enforcing
-// secrets-env-only. scopeProfiles/defaultAccount/discovery/toolsets are part
-// of the frozen envelope; their consumers land in later slices.
+// masterKey, jwtKey, clientId) fails validation, structurally enforcing secrets-env-only.
 export const RESERVED_ALIASES = ['__proto__', 'constructor', 'prototype'];
 
 export function isReservedAlias(name: string): boolean {
@@ -87,9 +84,8 @@ const configSchema = z.strictObject({
   defaultAccount: z.string().optional(),
   discovery: z.enum(['lazy', 'curated', 'eager']).optional(),
   toolsets: z.string().optional(),
-  // Local usage metrics (metrics-feature-spec): absent = off. Downgrade rule:
-  // a pre-6.0 build reading a config carrying this key fails E_CONFIG_INVALID
-  // (strictObject); remove the key first.
+  // Absent = off. A pre-6.0 build reading a config carrying this key fails
+  // E_CONFIG_INVALID (strictObject); remove the key first to downgrade.
   usageMetrics: z.boolean().optional(),
 });
 
@@ -159,9 +155,8 @@ export function loadConfigFile(
       `${filePath}: ${issue.path.join('.') || '(root)'}: ${issue.message}. Secrets never belong in config.json.`,
     );
   }
-  // Post-schema because zod's key regex passes these; a __proto__ record key
-  // is a prototype-pollution foothold, and Object.prototype member names break
-  // plain-object lookups downstream.
+  // Post-schema: zod's key regex passes these, but a __proto__ record key is
+  // a prototype-pollution foothold downstream.
   const data = result.data as ConfigFile;
   for (const [section, keys] of [
     ['accounts', Object.keys(data.accounts ?? {})],

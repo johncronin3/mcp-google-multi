@@ -5,14 +5,8 @@ import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { withFileLock, atomicWriteFileSync } from './fs-atomic.js';
 
-// Local usage metrics (metrics-feature-spec.md). Default OFF at every layer;
-// when off, nothing here initializes and the dispatch chain carries no wrapper.
-// Zero network egress is structural: this module's import set is a tested
-// allowlist (fs/path/os/crypto/perf_hooks/fs-atomic), so egress code cannot
-// even be expressed here. Every string persisted is a member of a server-owned
-// closed vocabulary, matches a pinned shape regex, or is other/unknown_*/
-// _overflow; free text is unrepresentable in the file format. No identity
-// dimension of any kind: no aliases, hashes, emails, or exact account counts.
+// Local usage metrics, default OFF; zero network egress is structural (a
+// tested import allowlist). See docs/usage-metrics.md.
 
 export const METRICS_DIR_NAME = 'metrics';
 const FLUSH_MS = 60_000;
@@ -30,26 +24,27 @@ const LAT_BOUNDS = [100, 250, 500, 1000, 2500, 5000, 10000, 30000] as const;
 const CHARS_BOUNDS = [64, 256, 1024, 4096, 16384, 65536] as const;
 
 // methodId backstop shape gate: even a tampered discovery cache cannot turn
-// arbitrary strings into recorded values (spec section 1).
+// arbitrary strings into recorded values.
 const METHOD_ID_RE = /^[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9]+)+$/;
 const METHOD_ID_MAX = 128;
 const TOOL_NAME_RE = /^[a-z][a-z0-9_]{0,63}$/;
 // Declared argument keys are camelCase identifiers, some dotted
 // (groupKey.id, debugOptions.enableDebugging).
 const ARG_KEY_RE = /^[A-Za-z][A-Za-z0-9_.]{0,63}$/;
+const EXTRA_ERROR_SLUG_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 
 /** Union of every `error:` slug literal emitted anywhere in src/ (kept honest
  * by a set-equality grep test). Anything outside buckets to `other`. */
 export const KNOWN_ERROR_SLUGS: ReadonlySet<string> = new Set([
-  'E_ALIAS_EXISTS', 'E_CIMD_INVALID', 'E_ENV_ACCOUNTS_MODE', 'E_MCP_TOKEN_INVALID',
+  'E_ALIAS_EXISTS', 'E_CIMD_INVALID', 'E_CIMD_SSRF_BLOCKED', 'E_ENV_ACCOUNTS_MODE', 'E_MCP_TOKEN_INVALID',
   'E_NO_DEFAULT_ACCOUNT', 'E_UNKNOWN_BUNDLE', 'E_VALIDATION', 'Unauthorized', 'ambiguous',
   'api_not_enabled', 'auth_required', 'bad_request', 'binary', 'binary_unsupported',
   'confirmation_declined', 'diagnose_failed', 'discovery_unavailable', 'dispatch_timeout',
   'elicitation_unsupported', 'fanout_failed', 'forbidden',
-  'grant_required', 'grant_unknown', 'hosted_set_grant_refused',
+  'account_outside_grant', 'grant_required', 'grant_unknown', 'hosted_set_grant_refused',
   'insufficient_scope', 'internal', 'invalid_client', 'invalid_client_metadata',
   'invalid_grant', 'invalid_params', 'invalid_query', 'invalid_request',
-  'invalid_scope', 'mcp_http_unconfigured', 'network_error', 'not_found', 'rate_limited',
+  'invalid_scope', 'jwt_signing_key_unavailable', 'mcp_http_unconfigured', 'network_error', 'not_found', 'rate_limited',
   'reauth_required', 'recipient_not_allowed', 'temporarily_unavailable', 'tenant_not_found', 'too_large', 'toolset_disabled', 'unknown_api',
   'unknown_argument', 'unknown_method', 'unsupported_grant_type', 'unsupported_type',
   'untrusted_host', 'upstream_error', 'validation_error', 'write_disabled',
@@ -176,11 +171,26 @@ export interface InitOptions {
   now?: () => number;
   monotonic?: () => number;
   log?: (line: string) => void;
-  /** Default true. The retry and bigram chains correlate CONSECUTIVE calls,
-   * which is only meaningful when one caller owns the whole process; a host
-   * serving several callers sets false so their sequences never cross-link.
-   * DayAgg shape is unchanged (retries/bigrams stay empty maps). */
+  /** Default true. Three chains correlate CONSECUTIVE calls, which is only
+   * meaningful when one caller owns the whole process: the retry and bigram
+   * chains, and pendingMid (the escape hatch's resolved methodId, attached to
+   * the next google_api_call event's `mid`). A host serving several callers
+   * sets false so none of the three ever cross-link a call between tenants.
+   * DayAgg shape is unchanged (retries/bigrams stay empty maps);
+   * escape.methods still counts every resolved call either way. */
   sequencingEnabled?: boolean;
+  /** Default true. When false, no events.jsonl / events.1.jsonl is ever
+   * created or appended to; only agg/ exists. A host serving several callers
+   * sets false: each event line carries a minute timestamp, the boot id and a
+   * per-process sequence number, which can be joined against a per-caller log
+   * such as an audit trail; the day aggregate keeps the same counters without
+   * order. */
+  eventLog?: boolean;
+  /** Default none. A host's own closed slug set, unioned with
+   * KNOWN_ERROR_SLUGS for this instance only; each entry must match
+   * /^[A-Za-z][A-Za-z0-9_]{0,63}$/ or it is dropped silently. Absent,
+   * behavior is byte-identical to today. */
+  extraErrorSlugs?: readonly string[];
 }
 
 function emptyDay(day: string): DayAgg {
@@ -291,9 +301,14 @@ export class Metrics {
   private failures = 0;
   private disabled = false;
   private readonly sequencing: boolean;
+  private readonly eventLog: boolean;
+  private readonly errorSlugs: ReadonlySet<string>;
 
   constructor(opts: InitOptions) {
     this.sequencing = opts.sequencingEnabled !== false;
+    this.eventLog = opts.eventLog !== false;
+    const extras = (opts.extraErrorSlugs ?? []).filter((s) => EXTRA_ERROR_SLUG_RE.test(s));
+    this.errorSlugs = extras.length ? new Set([...KNOWN_ERROR_SLUGS, ...extras]) : KNOWN_ERROR_SLUGS;
     this.dir = opts.dir ?? path.join(stateDir(opts.env), METRICS_DIR_NAME);
     this.aggDir = path.join(this.dir, 'agg');
     this.eventsFile = path.join(this.dir, 'events.jsonl');
@@ -324,7 +339,7 @@ export class Metrics {
         }
       }
       this.pruneAggs();
-      this.pruneEventAge(this.eventsFile);
+      if (this.eventLog) this.pruneEventAge(this.eventsFile);
     } catch (e) {
       this.log(`local usage metrics: init failed (${(e as Error).message}); disabled for this process\n`);
       this.disabled = true;
@@ -391,7 +406,7 @@ export class Metrics {
         const first = r?.content?.[0]?.text;
         if (typeof first === 'string' && first.length < 65_536) {
           const env = JSON.parse(first) as { error?: unknown; hint?: unknown };
-          if (typeof env.error === 'string') slug = KNOWN_ERROR_SLUGS.has(env.error) ? env.error : 'other';
+          if (typeof env.error === 'string') slug = this.errorSlugs.has(env.error) ? env.error : 'other';
           hinted = typeof env.hint === 'string' && env.hint.length > 0;
         }
       } catch { slug = 'other'; }
@@ -419,9 +434,8 @@ export class Metrics {
       addInto(f as unknown as Record<string, number>, fan);
     }
 
-    // retry self-correction chain (spec section 1): in-memory only. Both
-    // chains link consecutive calls, so they only run when one caller owns
-    // the process (sequencingEnabled).
+    // retry self-correction chain, in-memory only; links consecutive calls,
+    // so it only runs when one caller owns the process (sequencingEnabled).
     const nowM = this.mono();
     if (this.sequencing) {
       const prev = this.lastError.get(entry.name);
@@ -440,26 +454,28 @@ export class Metrics {
       this.lastTool = { name: entry.name, at: nowM };
     }
 
-    const event: Record<string, unknown> = {
-      ts: new Date(this.now()).toISOString().slice(0, 16) + ':00Z',
-      boot: this.bootId,
-      seq: this.seq++,
-      tool: entry.name,
-      ok,
-      ms: Math.round(ms),
-      chars: charsBucket(chars),
-      src: 'handler',
-    };
-    if (slug) event.err = slug;
-    if (hinted !== undefined) event.hint = hinted;
-    if (fan) event.fan = fan;
-    // mid: set mid-dispatch by recordEscapeMethod, attached to the escape
-    // call's own event line (per-event field, never a synthetic event).
-    if (entry.name === 'google_api_call' && this.pendingMid) {
-      event.mid = this.pendingMid;
-      this.pendingMid = undefined;
+    if (this.eventLog) {
+      const event: Record<string, unknown> = {
+        ts: new Date(this.now()).toISOString().slice(0, 16) + ':00Z',
+        boot: this.bootId,
+        seq: this.seq++,
+        tool: entry.name,
+        ok,
+        ms: Math.round(ms),
+        chars: charsBucket(chars),
+        src: 'handler',
+      };
+      if (slug) event.err = slug;
+      if (hinted !== undefined) event.hint = hinted;
+      if (fan) event.fan = fan;
+      // mid: set mid-dispatch by recordEscapeMethod, attached to the escape
+      // call's own event line (per-event field, never a synthetic event).
+      if (this.sequencing && entry.name === 'google_api_call' && this.pendingMid) {
+        event.mid = this.pendingMid;
+        this.pendingMid = undefined;
+      }
+      this.events.push(JSON.stringify(event));
     }
-    this.events.push(JSON.stringify(event));
     this.dirty = true;
   }
 
@@ -471,7 +487,7 @@ export class Metrics {
         this.deltas.escape.unknown_method += 1;
       } else if (idOrNull.length <= METHOD_ID_MAX && METHOD_ID_RE.test(idOrNull)) {
         addInto(this.deltas.escape.methods, idOrNull);
-        this.pendingMid = idOrNull;
+        if (this.sequencing) this.pendingMid = idOrNull;
       }
       this.dirty = true;
     } catch { /* never throws outward */ }
@@ -530,12 +546,14 @@ export class Metrics {
       } else {
         addInto(this.deltas.rpc, RPC_CODES.has(kind) ? `rpc_error_${kind}` : 'rpc_error_other');
       }
-      this.events.push(JSON.stringify({
-        ts: new Date(this.now()).toISOString().slice(0, 16) + ':00Z',
-        boot: this.bootId, seq: this.seq++,
-        tool: tool && TOOL_NAME_RE.test(tool) ? tool : 'other',
-        ok: false, ms: 0, chars: 'le64', src: 'rpc',
-      }));
+      if (this.eventLog) {
+        this.events.push(JSON.stringify({
+          ts: new Date(this.now()).toISOString().slice(0, 16) + ':00Z',
+          boot: this.bootId, seq: this.seq++,
+          tool: tool && TOOL_NAME_RE.test(tool) ? tool : 'other',
+          ok: false, ms: 0, chars: 'le64', src: 'rpc',
+        }));
+      }
       this.dirty = true;
     } catch { /* never throws outward */ }
   }

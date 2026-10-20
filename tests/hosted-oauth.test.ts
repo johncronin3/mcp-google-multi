@@ -36,6 +36,8 @@ writeFileSync(
 );
 
 process.env.MCP_HTTP_TOKEN = TOKEN;
+process.env.MCP_JWT_SIGNING_KEY = '0123456789abcdef0123456789abcdef';
+delete process.env.MCP_JWT_SIGNING_KEY_FILE;
 process.env.MCP_PUBLIC_HOST = PUBLIC_HOST;
 process.env.GOOGLE_GRANTS_PATH = grantsPath;
 process.env.GOOGLE_GRANTS_ENFORCE = 'true';
@@ -188,8 +190,9 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     expect(text).toMatch(/not<\/strong> Google login|not Google login/i);
     expect(text).toContain('MCP HTTP token');
     expect(text).toContain('Session grant');
-    expect(text).toContain('StrombackBrain2');
-    expect(text).toContain('Personal Brain Grant 3');
+    expect(text).toContain('Enter the grant code you were given');
+    expect(text).not.toContain('StrombackBrain2');
+    expect(text).not.toContain('Personal Brain Grant 3');
     expect(text).not.toContain(GRANT_CODE);
     expect(text).not.toContain('mega-OAuth');
   });
@@ -285,6 +288,122 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     expect(listed.text).toContain('test');
   });
 
+  async function hostedAuthorize(enforce: string, run: () => Promise<void>): Promise<void> {
+    const prevHosted = process.env.MCP_HOSTED;
+    const prevEnforce = process.env.GOOGLE_GRANTS_ENFORCE;
+    const prevKeyFile = process.env.MCP_JWT_SIGNING_KEY_FILE;
+    const keyPath = path.join(dir, 'jwt-signing-key');
+    writeFileSync(keyPath, '0123456789abcdef0123456789abcdef');
+    process.env.MCP_HOSTED = '1';
+    process.env.GOOGLE_GRANTS_ENFORCE = enforce;
+    process.env.MCP_JWT_SIGNING_KEY_FILE = keyPath;
+    try {
+      await run();
+    } finally {
+      if (prevHosted === undefined) delete process.env.MCP_HOSTED;
+      else process.env.MCP_HOSTED = prevHosted;
+      if (prevEnforce === undefined) delete process.env.GOOGLE_GRANTS_ENFORCE;
+      else process.env.GOOGLE_GRANTS_ENFORCE = prevEnforce;
+      if (prevKeyFile === undefined) delete process.env.MCP_JWT_SIGNING_KEY_FILE;
+      else process.env.MCP_JWT_SIGNING_KEY_FILE = prevKeyFile;
+    }
+  }
+
+  function postAuthorize(fields: { password?: string; grant_code?: string; gname?: string; code_challenge?: string }) {
+    const form: Record<string, string> = {
+      client_id: 'grok',
+      redirect_uri: 'https://grok.com/connectors-oauth-exchange-code/',
+      response_type: 'code',
+      code_challenge: fields.code_challenge || 'abc',
+      code_challenge_method: 'S256',
+      state: 's1',
+    };
+    if (fields.password !== undefined) form.password = fields.password;
+    if (fields.grant_code !== undefined) form.grant_code = fields.grant_code;
+    if (fields.gname !== undefined) form.gname = fields.gname;
+    return request({
+      method: 'POST',
+      path: '/oauth/authorize',
+      skipAuth: true,
+      token: null,
+      form,
+    });
+  }
+
+  it('hosted bearer only, no grant code, is refused even when enforcement is off', async () => {
+    await hostedAuthorize('false', async () => {
+      const posted = await postAuthorize({ password: TOKEN });
+      expect(posted.status).toBe(400);
+      expect(posted.headers.location).toBeUndefined();
+      expect(posted.text).toContain('Session grant code is required');
+      expect(posted.text).not.toContain('code=');
+    });
+  });
+
+  it('hosted bearer plus grant name is refused even when enforcement is off', async () => {
+    await hostedAuthorize('false', async () => {
+      const posted = await postAuthorize({ password: TOKEN, grant_code: 'Personal Brain Grant 3', gname: 'Personal Brain Grant 3' });
+      expect(posted.status).toBe(400);
+      expect(posted.headers.location).toBeUndefined();
+      expect(posted.text).not.toContain('code=');
+      expect(posted.text).not.toContain('test-code-personal-brain-not-prod');
+    });
+  });
+
+  it('hosted bearer plus a wrong grant code is refused even when enforcement is off', async () => {
+    await hostedAuthorize('false', async () => {
+      const posted = await postAuthorize({ password: TOKEN, grant_code: 'not-the-grant-code' });
+      expect(posted.status).toBe(400);
+      expect(posted.headers.location).toBeUndefined();
+      expect(posted.text).not.toContain('code=');
+      expect(posted.text).not.toContain('Personal Brain Grant 3');
+    });
+  });
+
+  it('hosted correct grant code with no bearer or a wrong bearer is refused', async () => {
+    for (const enforce of ['false', 'true']) {
+      await hostedAuthorize(enforce, async () => {
+        for (const password of [undefined, 'wrong-bearer'] as const) {
+          const posted = await postAuthorize({ password, grant_code: GRANT_CODE });
+          expect(posted.status).toBe(400);
+          expect(posted.headers.location).toBeUndefined();
+          expect(posted.text).toContain('Wrong MCP token.');
+          expect(posted.text).not.toContain('code=');
+          expect(posted.text).not.toContain(GRANT_CODE);
+        }
+      });
+    }
+  });
+
+  it('hosted bearer plus the right grant code binds only that grant', async () => {
+    await hostedAuthorize('false', async () => {
+      const { verifier, challenge } = pkce();
+      const redirect = 'https://grok.com/connectors-oauth-exchange-code/';
+      const right = await postAuthorize({ password: TOKEN, grant_code: GRANT_CODE, code_challenge: challenge });
+      expect(right.status).toBe(302);
+      const code = new URL(String(right.headers.location || '')).searchParams.get('code');
+      expect(code).toBeTruthy();
+      const tok = await request({
+        method: 'POST',
+        path: '/oauth/token',
+        skipAuth: true,
+        token: null,
+        form: {
+          grant_type: 'authorization_code',
+          code: code as string,
+          redirect_uri: redirect,
+          code_verifier: verifier,
+          client_id: 'grok',
+        },
+      });
+      expect(tok.status).toBe(200);
+      const payload = verifyJwt(JSON.parse(tok.text).access_token);
+      expect(payload?.gname).toBe('StrombackBrain2');
+      expect(JSON.stringify(payload)).not.toContain('Personal Brain Grant 3');
+      expect(JSON.stringify(payload)).not.toContain(GRANT_CODE);
+    });
+  });
+
   it('static Bearer still works for CLI (layer 2 without OAuth)', async () => {
     const { status } = await request({
       method: 'POST',
@@ -338,7 +457,7 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     expect(text).not.toContain('test-code-personal-brain-not-prod');
   });
 
-  it('enforced JWT with unknown gname is 403 at the /mcp gate', async () => {
+  it('enforced JWT with unknown gname is 401 at the /mcp gate and serves nothing', async () => {
     clearSessionGrant();
     const jwt = signJwt(
       { typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: 'Not A Real Grant' },
@@ -352,10 +471,9 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
       host: publicMcpHost(),
       body: { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
     });
-    expect(status).toBe(403);
-    const body = JSON.parse(text);
-    expect(body.error).toBe('grant_unknown');
-    expect(body.message).toMatch(/grants\.json|oauth\/authorize/);
+    expect(status).toBe(401);
+    expect(JSON.parse(text).error).toBe('Unauthorized');
+    expect(text).not.toContain('tools');
     expect(text).not.toContain(GRANT_CODE);
   });
 
@@ -378,6 +496,7 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
       });
       expect(listed.status).toBe(200);
       expect(listed.text).toMatch(/hosted_set_grant_refused|does not survive Cloud Run/);
+      expect(listed.text).not.toContain(GRANT_CODE);
       expect(listed.text).toMatch(/oauth\/authorize/);
       expect(listed.text).toMatch(/gname/);
       expect(getSessionGrant()).toBeNull();
@@ -411,5 +530,35 @@ describe('google-multi Grok OAuth (layer 2) + JWT grant (layer 3)', () => {
     expect(status).toBe(401);
     expect(JSON.parse(text).error).toBe('Unauthorized');
     expect(String(headers['www-authenticate'] || '')).toContain('oauth-protected-resource');
+  });
+
+  it('upstream duplicate-refresh grace does not open the house gate', async () => {
+    clearSessionGrant();
+    const anon = await request({
+      method: 'POST',
+      path: '/mcp',
+      token: null,
+      skipAuth: true,
+      host: publicMcpHost(),
+      body: { jsonrpc: '2.0', id: 9, method: 'initialize', params: {} },
+    });
+    expect(anon.status).toBe(401);
+    expect(JSON.parse(anon.text).error).toBe('Unauthorized');
+
+    const jwt = signJwt(
+      { typ: 'access', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: 'Not A Real Grant' },
+      60,
+    );
+    const wrong = await request({
+      method: 'POST',
+      path: '/mcp',
+      token: jwt,
+      host: publicMcpHost(),
+      body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
+    });
+    expect(wrong.status).toBe(401);
+    expect(JSON.parse(wrong.text).error).toBe('Unauthorized');
+    expect(wrong.text).not.toContain('tools');
+    expect(wrong.text).not.toContain(GRANT_CODE);
   });
 });

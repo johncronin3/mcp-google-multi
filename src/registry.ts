@@ -9,14 +9,15 @@ import type { ArgKind, ArgShape } from './arg-normalize.js';
 import type { Metrics } from './usage-metrics.js';
 import { MAX_SUGGESTED_KEYS, suggestKeys } from './arg-strict.js';
 import { classifyScope } from './scope-observability.js';
+import { hints } from './hint-provider.js';
+import { aliasesForHint, aliasesVisibleToSession, grantRefusalForCallArgs, missingGrantResult, usableDefaultAlias } from './session-grant.js';
 
 /** Nothing granted, no profile: asks the BUNDLE CATALOG whether a scope is
  * reachable at all, independently of any account. */
 const EMPTY_SCOPES: ReadonlySet<string> = new Set<string>();
 
-// Client-side result budget advertised for tools that do not declare their own
-// (fat readers do; see trim.ts). ~50k chars stays well inside a default client
-// context limit while leaving room for real list payloads.
+// Client-side result budget for tools that do not declare their own (fat
+// readers do; see trim.ts); stays well inside a default client context limit.
 const DEFAULT_MAX_RESULT_CHARS = 50_000;
 
 export type Cud = 'read' | 'create' | 'update' | 'delete';
@@ -80,6 +81,40 @@ export interface CatalogOperation {
   unreachable?: true;
 }
 
+/** The leading sentence of a (possibly multi-sentence) tool description. */
+export function firstSentence(text: string): string {
+  let openParens = 0;
+  let i = 0;
+  const abbrevs = /^(e\.g|i\.e|etc|vs)\.$/i;
+
+  while (i < text.length) {
+    const char = text[i];
+
+    if (char === '(') {
+      openParens++;
+    } else if (char === ')') {
+      openParens = Math.max(0, openParens - 1);
+    } else if (char === '.' && i + 1 < text.length && text[i + 1] === ' ' && openParens === 0) {
+      // Found a period-space outside parentheses
+      // Check if it's preceded by an abbreviation (e.g., i.e., etc, vs)
+      // Find the word before this period
+      let wordStart = i - 1;
+      while (wordStart > 0 && /[a-zA-Z.]/.test(text[wordStart - 1])) {
+        wordStart--;
+      }
+      const word = text.slice(wordStart, i + 1);
+
+      if (!abbrevs.test(word)) {
+        // Not an abbreviation, so this is a valid sentence boundary
+        return text.slice(0, i + 1);
+      }
+    }
+    i++;
+  }
+
+  return text;
+}
+
 interface ToolConfig {
   description?: string;
   inputSchema?: z.ZodRawShape;
@@ -98,9 +133,10 @@ const CUD_OVERRIDES: Record<string, Cud> = {
   set_grant: 'read',
   // read-only resolver; the name's "resolve" verb would otherwise infer update.
   contacts_resolve: 'read',
-  // Account management is gated by anthropic/requiresUserInteraction (forced
-  // human approval), NOT the Google-data write-control profile — so onboarding
-  // works under any profile. cud=read also keeps them off the fan-out path.
+  // "respond" matches no write verb; it patches the event (a write).
+  calendar_respond_event: 'update',
+  // Gated by anthropic/requiresUserInteraction, not write-control, so
+  // onboarding works under any profile; cud=read also keeps them off fan-out.
   account_add: 'read',
   account_reauth: 'read',
   // Writes a LOCAL MCP-client config, not Google data; gated by
@@ -120,10 +156,12 @@ export function serviceOf(name: string): string {
 // read tools that write local files — same savePath fanned across accounts would clobber
 const FANOUT_EXCLUDE = new Set(['gmail_download_attachment', 'drive_download', 'drive_export']);
 
-/** Account-management tools: the `account` they take is the SUBJECT of the
- * operation, not the identity it runs as, so injecting the configured default
- * would silently retarget them. `account_add` would adopt the default as the
- * new alias, and `account_reauth` would re-authenticate the wrong account. */
+// cud=read for gating/fan-out, yet they write (local files, the account
+// registry, config): advertised as writes so annotation-keyed clients prompt.
+const WRITES_DESPITE_READ = new Set([...FANOUT_EXCLUDE, 'account_add', 'account_reauth', 'account_write_config']);
+
+// Their `account` is the SUBJECT of the operation (e.g. the new alias to add),
+// not the identity to run as, so injecting the configured default would retarget them.
 const DEFAULT_ACCOUNT_EXCLUDE = new Set(['account_add', 'account_reauth']);
 
 /** Unwrap optional/default/nullable to the declared scalar kind (zod 4 defs). */
@@ -150,7 +188,7 @@ function isAccountSelector(field: unknown): boolean {
   type Def = { type?: string; innerType?: { _zod?: { def?: Def } } };
   const def = (field as { _zod?: { def?: Def } } | undefined)?._zod?.def;
   if (!def) return false;
-  // A2 made account enums .optional(); unwrap it or fan-out silently dies.
+  // Account enums are .optional(); unwrap it or fan-out silently dies.
   if (def.type === 'optional') return def.innerType?._zod?.def?.type === 'enum';
   return def.type === 'enum';
 }
@@ -175,8 +213,7 @@ export class ToolRegistry {
   private readonly revealed = new Set<string>();
   private readonly jsonSchemaCache = new Map<string, unknown>();
   private readonly argShapeCache = new Map<string, ArgShape>();
-  /** Memoized isUngrantable verdict per tool: the answer depends on the frozen
-   * bundle catalog only, so it never changes within a process. */
+  // Memoized isUngrantable verdict: depends on the frozen bundle catalog only.
   private readonly ungrantable = new Map<string, boolean>();
   private readonly compactOutput = trimEnabled();
   private registeringMeta = false;
@@ -191,9 +228,8 @@ export class ToolRegistry {
     policy: Policy,
     mode: DiscoveryMode = resolveDiscoveryMode(),
     private readonly metrics: Metrics | null = null,
-    // The registry's OWN account view: fan-out expansion, selector validation
-    // and default-account injection all read through it so a registry built
-    // over a subset never observes (or leaks) the global set.
+    // The registry's OWN account view, so one built over a subset never
+    // observes (or leaks) the global set.
     private readonly accounts: () => AccountSet = getAccountSet,
   ) {
     this.policy = policy;
@@ -201,22 +237,17 @@ export class ToolRegistry {
     this.registerTool = ((name: string, config: ToolConfig, handler: (...a: unknown[]) => unknown) => {
       const service = serviceOf(name);
       const cud = config.cud ?? inferCud(name);
-      // destructiveHint=false claims "additive only" (MCP spec) — updates overwrite, so they stay true.
-      // idempotent: reads trivially, deletes (already-gone = same), updates
-      // (overwrite converges); creates are not (send twice = two emails).
+      // Every write is destructive (a create is no less consequential than an
+      // update); idempotent iff not a create (send twice = two emails).
+      const writes = cud !== 'read' || WRITES_DESPITE_READ.has(name);
       const annotations = {
-        readOnlyHint: cud === 'read',
-        destructiveHint: cud === 'delete' || cud === 'update',
+        readOnlyHint: !writes,
+        destructiveHint: writes,
         idempotentHint: cud !== 'create',
         ...config.annotations,
       };
-      // A12: forced per-call human approval on the irreversible set, even in
-      // bypass mode. Client-enforced via the wire _meta (Claude Code reads
-      // anthropic/* ONLY there); the server verdict stays separate.
-      // Every tool also advertises a result-size budget: fat readers declare
-      // their own, everything else inherits the default, so an uncapped tool
-      // can never blow past a client's context limit. Generated tools align
-      // with the executor's server-side cap.
+      // Irreversible-set approval and the result-size budget are both
+      // client-enforced via the wire _meta (anthropic/*); the server verdict stays separate.
       const clientMeta = {
         'anthropic/maxResultSizeChars': config.cud !== undefined ? MAX_RESPONSE_CHARS : DEFAULT_MAX_RESULT_CHARS,
         ...config._meta,
@@ -265,46 +296,56 @@ export class ToolRegistry {
                     // Concrete by here: default-account injection wraps this.
                     (args[0] as { account?: unknown } | undefined)?.account as string | undefined,
                   );
-      // A2: the ONE default-account injection site — outside the CUD gate and
-      // the fan-out parse so both observe a concrete alias; NOT meta-skipped
-      // (that is what covers google_api_call with zero bespoke code). Explicit
-      // aliases, "*" and CSV pass through untouched.
+      // Out-of-grant aliases never reach a handler, so getClient is not called.
+      // Fan-out's "*" is resolved later against allowedAccounts().
+      const gate = (...args: unknown[]) => {
+        const blocked = grantRefusalForCallArgs(args[0]);
+        if (blocked) return blocked;
+        return guarded(...args);
+      };
+      const noDefaultResult = () => {
+        const accountSet = this.accounts();
+        const listed = aliasesForHint(accountSet.aliases);
+        if (listed === 'missing_grant') return missingGrantResult();
+        const accounts = listed.map((alias) => ({ alias, email: accountSet.configs[alias]?.email ?? '' }));
+        const rendered = hints()?.render({ kind: 'no_default_account', accounts });
+        const pairs = accounts.map((a) => `${a.alias}=${a.email}`).join(', ');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                error: 'E_NO_DEFAULT_ACCOUNT',
+                message: 'No "account" given and no default account is configured.',
+                hint: rendered?.hint ?? `Pass account explicitly (valid: ${pairs}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
+                retriable: false,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      };
+      // The ONE default-account injection site, outside the CUD gate and the
+      // fan-out parse (not meta-skipped, which is what covers google_api_call).
       const withDefault = !hasAccountField
-        ? guarded
+        ? gate
         : (...args: unknown[]) => {
             const first = args[0] as { account?: unknown } | undefined;
             const value = first?.account;
-            if (value != null && value !== '') return guarded(...args);
-            // Refresh here or the unset->configured default transition never
-            // heals for a client that always omits account (this branch never
-            // reaches getClient's probe). One stat, only on omission.
+            if (value != null && value !== '') return gate(...args);
+            // Refresh here, or a client that always omits account never heals
+            // the unset->configured default transition (getClient's probe is unreached).
             refreshAccountSetIfStale();
-            const def = this.accounts().defaultAccount;
-            if (!def) {
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: JSON.stringify({
-                      error: 'E_NO_DEFAULT_ACCOUNT',
-                      message: 'No "account" given and no default account is configured.',
-                      hint: `Pass account explicitly (valid: ${this.accounts().aliases.join(', ')}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
-                      retriable: false,
-                    }),
-                  },
-                ],
-                isError: true,
-              };
-            }
-            return guarded({ ...(first ?? {}), account: def }, ...args.slice(1));
+            const def = usableDefaultAlias(this.accounts().defaultAccount);
+            if (def === 'missing_grant') return missingGrantResult();
+            if (!def) return noDefaultResult();
+            return gate({ ...(first ?? {}), account: def }, ...args.slice(1));
           };
       const finalHandler = this.compactOutput
         ? async (...args: unknown[]) => compactResult(await (withDefault(...args) as Promise<Parameters<typeof compactResult>[0]>))
         : withDefault;
-      // Usage metrics wrap OUTERMOST and only when enabled: off means no
-      // wrapper exists and the chain is byte-identical to the pre-metrics
-      // chain. Fan-out width is derived here (bucketed in the module) so the
-      // metrics module never imports fanout.
+      // Usage metrics wrap outermost, only when enabled (off = byte-identical
+      // to the pre-metrics chain); fan-out width is derived here so the metrics module never imports fanout.
       const instrumented = this.metrics
         ? this.metrics.wrap(
             { name, service, meta: this.registeringMeta, generated: config.cud !== undefined },
@@ -378,10 +419,8 @@ export class ToolRegistry {
     const declared = new Set(Object.keys(self.inputShape));
     const byKey = new Map<string, { tools: string[]; curated: boolean }>();
     for (const t of this.tools) {
-      // Only tools the agent can actually see in tools/list. A hint naming a
-      // registered-but-unadvertised generated tool turns a recoverable error
-      // into a dead end: in curated mode 353 tools are registered and 181 are
-      // advertised, and the hint used to reach for any of them.
+      // Only tools visible in tools/list: a hint naming a hidden generated
+      // tool would turn a recoverable error into a dead end.
       if (t.service !== self.service || t.name === tool || !this.isVisible(t)) continue;
       for (const key of Object.keys(t.inputShape)) {
         if (declared.has(key)) continue;
@@ -392,9 +431,8 @@ export class ToolRegistry {
       }
     }
     const candidates = [...byKey.entries()].filter(([, e]) => e.tools.length >= 2 || e.curated);
-    // Reuse the tiered matcher rather than a substring test: the motivating
-    // case (parentId against parentFolderId) fails containment and edit
-    // distance alike, which is the whole reason that matcher exists.
+    // The tiered matcher, not a substring test: parentId vs parentFolderId
+    // fails both containment and edit distance.
     const keys = candidates.map(([key]) => key);
     const hits = new Set(unknownKeys.slice(0, MAX_SUGGESTED_KEYS).flatMap((k) => suggestKeys(k, keys)));
     return candidates
@@ -404,17 +442,32 @@ export class ToolRegistry {
   }
 
   catalog(service: string, query?: string): CatalogOperation[] {
+    const candidates = this.tools.filter((t) => !t.meta && t.service === service);
+    const toOp = (t: ToolEntry, summary: string = t.description): CatalogOperation => ({
+      tool: t.name,
+      summary,
+      args: Object.keys(t.inputShape),
+      cud: t.cud,
+      ...(this.isUngrantable(t) ? { unreachable: true as const } : {}),
+    });
+
     const q = query?.trim().toLowerCase();
-    return this.tools
-      .filter((t) => !t.meta && t.service === service)
-      .filter((t) => !q || t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q))
-      .map((t) => ({
-        tool: t.name,
-        summary: t.description,
-        args: Object.keys(t.inputShape),
-        cud: t.cud,
-        ...(this.isUngrantable(t) ? { unreachable: true as const } : {}),
-      }));
+    if (!q) return candidates.map((t) => toOp(t));
+
+    // Tokenized OR-match (a strict superset of a plain substring test: a full-string
+    // hit implies every one of its tokens also hits) ranked by how many tokens matched.
+    const ranked = candidates
+      .map((t) => {
+        const hay = `${t.name} ${t.description}`.toLowerCase();
+        return { t, matched: q.split(/\s+/).filter(Boolean).filter((tok) => hay.includes(tok)).length };
+      })
+      .filter((r) => r.matched > 0)
+      .sort((a, b) => b.matched - a.matched);
+    if (ranked.length > 0) return ranked.map((r) => toOp(r.t));
+
+    // Nothing matched: list the whole service so the agent can still browse,
+    // one-line summaries only so a wide miss doesn't blow the response budget.
+    return candidates.map((t) => toOp(t, firstSentence(t.description)));
   }
 
   /** The metrics recorder, for hook sites (escape hatch); null when off. */
@@ -496,7 +549,7 @@ export class ToolRegistry {
   }
 
   /** discover_reset: back to the lean meta-only surface. Clears reveals too.
-   * BV-8: if a client mishandles a SHRINKING tools/list, this degrades to a
+   * If a client mishandles a SHRINKING tools/list, this degrades to a
    * no-op for that session — tools stay callable regardless (graceful
    * dispatch), zero correctness impact. */
   collapse(): boolean {
@@ -524,11 +577,8 @@ export class ToolRegistry {
     if (!tool.requiredScopes || tool.requiredScopes.length === 0) return false;
     const cached = this.ungrantable.get(tool.name);
     if (cached !== undefined) return cached;
-    // EVERY alternative must be ungrantable. `classifyMethodScopes` cannot
-    // answer this: `add_bundle` and `unknown_scope` share the
-    // `not_requestable` rank, so its first-best match hides a grantable
-    // alternative that appears later in the list. Discovery scope lists are
-    // ANY-OF, so one grantable alternative makes the method reachable.
+    // EVERY alternative must be ungrantable (scope lists are ANY-OF); a
+    // first-best classifyScope match would hide a grantable one later in the list.
     const verdict = tool.requiredScopes.every((scope) => {
       const c = classifyScope(scope, EMPTY_SCOPES, EMPTY_SCOPES);
       return c.state === 'not_requestable' && c.reason === 'unknown_scope';
@@ -540,10 +590,8 @@ export class ToolRegistry {
 
   isVisible(tool: ToolEntry): boolean {
     const mode = this.effectiveMode();
-    // Advertising a tool that can never succeed spends context budget to hand
-    // the agent a dead end. It stays registered and callable, so calling it by
-    // name still produces the real scope error plus its remediation, and
-    // {service}_discover still lists it, marked.
+    // Hidden, not unregistered: calling an ungrantable tool by name still
+    // produces the real scope error, and {service}_discover still lists it, marked.
     if (!tool.meta && this.isUngrantable(tool)) return false;
     return (
       tool.meta ||
@@ -566,10 +614,7 @@ export class ToolRegistry {
       throw new Error('installListHandler() requires at least one registered tool');
     }
     this.server.server.setRequestHandler('tools/list', async () => ({
-      // The wire Tool is hand-built because the SDK's own types drop the
-      // anthropic/* _meta keys honoring clients read. z.toJSONSchema emits a
-      // valid draft-7 object schema by construction, which the SDK's recursive
-      // JSON-Schema type cannot infer from our cached `unknown`.
+      // Hand-built: the SDK's own Tool type drops the anthropic/* _meta keys honoring clients read.
       tools: this.tools.filter((t) => this.isVisible(t)).map((t) => this.toToolJson(t)) as ListToolsResult['tools'],
     }));
   }
@@ -589,27 +634,43 @@ export class ToolRegistry {
     };
   }
 
-  /** Advertise the CURRENT alias enum on every tools/list: account validation
-   * is (or is becoming) live, so a cached boot-time enum would go stale the
-   * moment account_add lands mid-session. The structural schema stays cached;
-   * only the account property's values are refreshed per call. Skipped for
-   * the subject-taking account tools (their `account` is the OPERAND, e.g. a
-   * brand-new alias name, not an identity to enumerate). */
+  // Refreshes the account enum's values per call (structural schema stays
+  // cached), so a cached boot-time list doesn't go stale once account_add runs mid-session.
   private withLiveAccountEnum(tool: ToolEntry, schema: unknown): unknown {
     if (DEFAULT_ACCOUNT_EXCLUDE.has(tool.name)) return schema;
     const s = schema as { properties?: Record<string, unknown> };
     const account = s?.properties?.account as { anyOf?: unknown[]; enum?: unknown[] } | undefined;
     if (!account) return schema;
-    const aliases = this.accounts().aliases;
-    if (aliases.length === 0) return schema;
+    const configured = this.accounts().aliases;
+    if (configured.length === 0) return schema;
+    // A session grant must not learn the other aliases by reading tools/list.
+    // The CSV example in the description is baked at registration from the full set.
+    const aliases = aliasesVisibleToSession(configured);
+    const description = sessionAccountDescription(
+      (account as { description?: unknown }).description,
+      aliases,
+    );
     if (Array.isArray(account.anyOf)) {
       // fan-out union: advertise '*' + the live aliases on the selector branch
       // (the one without the CSV pattern), keep the CSV branch as is
       const isSelector = (b: unknown) => (b as { pattern?: unknown }).pattern === undefined;
       if (!account.anyOf.some(isSelector)) return schema;
       const anyOf = account.anyOf.map((b) => (isSelector(b) ? { ...(b as object), enum: ['*', ...aliases] } : b));
-      return { ...s, properties: { ...s.properties, account: { ...account, anyOf } } };
+      return { ...s, properties: { ...s.properties, account: { ...account, description, anyOf } } };
     }
-    return { ...s, properties: { ...s.properties, account: { ...account, enum: [...aliases] } } };
+    return { ...s, properties: { ...s.properties, account: { ...account, description, enum: [...aliases] } } };
   }
+}
+
+/** Registration bakes a CSV example from the full alias list. Listings name
+ * only the aliases this session may use. */
+function sessionAccountDescription(description: unknown, aliases: readonly string[]): unknown {
+  if (typeof description !== 'string') return description;
+  const stripped = description.replace(/; or a CSV subset like "[^"]*"/, '');
+  if (aliases.length < 2 || !stripped.includes('; "*" = all accounts')) return stripped;
+  const example = aliases.slice(0, 2).join(',');
+  return stripped.replace(
+    '; "*" = all accounts',
+    `; "*" = all accounts; or a CSV subset like "${example}"`,
+  );
 }

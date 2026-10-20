@@ -10,8 +10,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `node -p "require('./package.json').version"` (or the release tag).
-      placeholder: "4.2.0"
+      description: The first line of `mcp-google-multi doctor` (or the npm version / release tag you installed).
+      placeholder: "6.x.y"
     validations:
       required: true
   - type: dropdown
@@ -28,11 +28,15 @@ body:
         - Search Console
         - Tasks
         - Meet
+        - Slides (optional bundle)
         - Forms (optional bundle)
         - Chat (optional bundle)
-        - Admin (admin bundle)
-        - Alert Center (optional bundle)
+        - Analytics (optional bundle)
+        - Admin (per-account admin opt-in)
+        - Another generated service (see COVERAGE.md)
+        - Escape hatch (google_api_search / google_api_call)
         - Auth / setup
+        - HTTP transport / OAuth server
         - Other
     validations:
       required: true

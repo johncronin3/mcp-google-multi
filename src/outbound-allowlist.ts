@@ -1,8 +1,7 @@
-// Opt-in outbound recipient allowlist for unattended deployments: a
-// prompt-injection blast-radius control (a hijacked agent cannot mail, invite
-// or share outside the operator's list), a safety feature first and an
-// enterprise checkbox second. FREE-core forever (ee-definition-v0 handoff).
-// Off by default: an unset/empty GOOGLE_OUTBOUND_ALLOWLIST gates nothing.
+// Opt-in outbound recipient allowlist: a prompt-injection blast-radius
+// control (a hijacked agent cannot mail/invite/share outside the operator's list). Off by default.
+
+import { hints } from './hint-provider.js';
 
 export interface OutboundAllowlist {
   entries: string[];
@@ -38,6 +37,7 @@ export function outboundViolations(emails: string[], env: NodeJS.ProcessEnv = pr
 /** The standard error envelope for a blocked outbound target. */
 export function outboundDeniedEnvelope(kind: string, blocked: string[], account: string, env: NodeJS.ProcessEnv = process.env) {
   const list = resolveOutboundAllowlist(env);
+  const rendered = hints()?.render({ kind: 'outbound_denied', what: kind, blocked, entries: list?.entries ?? [] });
   return {
     content: [
       {
@@ -46,8 +46,9 @@ export function outboundDeniedEnvelope(kind: string, blocked: string[], account:
           error: 'recipient_not_allowed',
           message: `${kind} blocked by the outbound allowlist: ${blocked.join(', ')}.`,
           hint:
-            `GOOGLE_OUTBOUND_ALLOWLIST is active (${(list?.entries ?? []).join(', ')}). ` +
-            'The operator must add the address (or its @domain) to the list, or unset the variable, to allow this target.',
+            rendered?.hint ??
+            (`GOOGLE_OUTBOUND_ALLOWLIST is active (${(list?.entries ?? []).join(', ')}). ` +
+              'The operator must add the address (or its @domain) to the list, or unset the variable, to allow this target.'),
           retriable: false,
           account,
         }),
@@ -63,10 +64,8 @@ export function checkOutbound(kind: string, emails: string[], account: string, e
   return blocked.length > 0 ? outboundDeniedEnvelope(kind, blocked, account, env) : null;
 }
 
-// Escape-hatch / generated-tool enforcement. Structured bodies are inspected
-// for the known recipient fields; RAW compose methods cannot be inspected
-// (base64 RFC 822), so with the allowlist active they are refused outright in
-// favor of the curated tools that enforce it.
+// RAW compose methods can't be inspected (base64 RFC 822), so with the
+// allowlist active they're refused outright in favor of the curated tools that enforce it.
 const RAW_SEND_METHODS = new Set(['gmail.users.messages.send', 'gmail.users.drafts.send', 'gmail.users.drafts.create', 'gmail.users.messages.insert', 'gmail.users.messages.import']);
 
 export function collectBodyRecipients(body: unknown): string[] {

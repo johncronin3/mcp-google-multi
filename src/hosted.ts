@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 /**
  * Hosted MCP (Cloud Run / public HTTPS) vs desk-local provider minting.
@@ -51,6 +52,22 @@ export function isHostedHttp(env: NodeJS.ProcessEnv = process.env): boolean {
   if (flag === '1' || flag === 'true' || flag === 'yes' || flag === 'on') return true;
   if (flag === '0' || flag === 'false' || flag === 'off' || flag === 'no') return false;
   return Boolean((env.K_SERVICE || '').trim());
+}
+
+/** House Cloud Run marker independent of MCP_TRANSPORT: K_SERVICE, or the grants mount. */
+export function grantsMountPresent(exists: (p: string) => boolean = existsSync): boolean {
+  try {
+    return exists('/mnt/grants') || exists('/mnt/grants/grants.json');
+  } catch {
+    return false;
+  }
+}
+
+export function isHostedConfigSurface(
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = existsSync,
+): boolean {
+  return isHostedHttp(env) || grantsMountPresent(exists);
 }
 
 export function deskMintMessage(alias: string, email?: string): string {

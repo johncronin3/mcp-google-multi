@@ -56,7 +56,7 @@ describe('token-store crypto', () => {
     expect(() => decryptToken(JSON.stringify(o), KEY)).toThrow();
   });
 
-  describe('tenant-keyed v2 files (S1.6, HKDF)', () => {
+  describe('tenant-keyed v2 files (HKDF)', () => {
     it('tenantId omitted writes v1 byte-compatible files (single-owner default unchanged)', () => {
       const o = JSON.parse(encryptToken(sample, KEY));
       expect(o.v).toBe(1);
@@ -89,7 +89,7 @@ describe('token-store crypto', () => {
     });
   });
 
-  describe('tenant paths (S1.6, OQ-B every-level 0700)', () => {
+  describe('tenant paths (every-level 0700)', () => {
     afterEach(() => fs.rmSync(tenantsDir(), { recursive: true, force: true }));
 
     it('helpers produce configDir()/tenants/<id>/{config.json,tokens}', () => {
@@ -202,6 +202,50 @@ describe('token-store crypto', () => {
     expect(fs.readFileSync(lock, 'utf8')).toBe('12345');
   });
 
+  it.each(['EACCES', 'EPERM'])('locks without a hard link when link() fails with %s', (code) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-store-'));
+    cleanupDirs.push(dir);
+    ACCOUNT_CONFIG.test.encPath = path.join(dir, 'test.enc');
+    process.env.MASTER_KEY = KEY;
+    const link = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      const err = new Error(`${code}: operation not permitted, link`) as NodeJS.ErrnoException;
+      err.code = code;
+      throw err;
+    });
+
+    writeToken('test', sample);
+    updateToken('test', { access_token: 'b' });
+
+    expect(link).toHaveBeenCalled();
+    expect(readToken('test')).toEqual({ ...sample, access_token: 'b' });
+    expect(fs.readdirSync(dir)).toEqual(['test.enc']);
+  });
+
+  it('waits on a lock still being written without a hard link, then recovers it once stale', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-store-'));
+    cleanupDirs.push(dir);
+    ACCOUNT_CONFIG.test.encPath = path.join(dir, 'test.enc');
+    process.env.MASTER_KEY = KEY;
+    const lock = path.join(dir, '.test.enc.lock');
+    fs.writeFileSync(lock, '', { mode: 0o600 });
+    const createdAt = Date.now();
+    fs.utimesSync(lock, createdAt / 1000, createdAt / 1000);
+
+    let now = createdAt;
+    vi.spyOn(Date, 'now').mockImplementation(() => (now += 100));
+    let brokenAt: number | undefined;
+    const rm = fs.rmSync;
+    vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+      if (target === lock && brokenAt === undefined) brokenAt = now;
+      return rm(target, options);
+    });
+
+    writeToken('test', sample);
+
+    expect(brokenAt).toBeGreaterThanOrEqual(createdAt + 2_000);
+    expect(readToken('test')).toEqual(sample);
+  });
+
   it('retries the token rename through transient sharing violations', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-store-'));
     cleanupDirs.push(dir);
@@ -308,5 +352,23 @@ describe('token-store crypto', () => {
     restoreEncFile('test', prior!);
     expect(snapshotEncFile('test')?.equals(prior!)).toBe(true);
     expect(readToken('test')).toEqual(sample);
+  });
+
+  it('updateToken never recreates a token file that was never written, or one removed out from under it', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-store-'));
+    cleanupDirs.push(dir);
+    ACCOUNT_CONFIG.test.encPath = path.join(dir, 'test.enc');
+    process.env.MASTER_KEY = KEY;
+
+    // First write: no token stored yet, a refresh-style update must not create one.
+    expect(() => updateToken('test', { access_token: 'new' })).not.toThrow();
+    expect(fs.existsSync(ACCOUNT_CONFIG.test.encPath)).toBe(false);
+
+    // A stored token removed (e.g. a revoked linked account) while a refresh
+    // is in flight must stay removed, not get resurrected by the merge.
+    writeToken('test', sample);
+    fs.rmSync(ACCOUNT_CONFIG.test.encPath);
+    expect(() => updateToken('test', { access_token: 'new2' })).not.toThrow();
+    expect(fs.existsSync(ACCOUNT_CONFIG.test.encPath)).toBe(false);
   });
 });

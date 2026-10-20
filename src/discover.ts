@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import type { ToolRegistry } from './registry.js';
+import { allowedAccounts, isGrantEnforced, missingGrantResult } from './session-grant.js';
 import { describePolicy, type Policy } from './write-control.js';
+import { hints } from './hint-provider.js';
 
-// The description budget is the whole point of lazy mode: a full op list per
-// service put lazy tools/list at ~11.5k tokens (RQ2), so descriptions carry a
-// CAPPED vocabulary and the complete catalog stays in this tool's RESULT.
+// The description budget is the whole point of lazy mode: descriptions carry
+// a CAPPED vocabulary, and the complete catalog stays in this tool's RESULT.
 const CURATED_OPS_CAP = 10;
 const GENERATED_GROUPS_CAP = 6;
 
@@ -17,8 +18,7 @@ function opVocabulary(registry: ToolRegistry, service: string): string {
     parts.push(`${shown.join(', ')}${more > 0 ? ` +${more} more` : ''}`);
   }
   if (generated.length > 0) {
-    // The generated long tail compresses to its resource groups: denser and
-    // more selective than any truncated name list.
+    // Compresses to resource groups: denser than any truncated name list.
     const counts = new Map<string, number>();
     for (const op of generated) {
       const group = op.split('_')[0];
@@ -32,9 +32,19 @@ function opVocabulary(registry: ToolRegistry, service: string): string {
   return parts.join('; ');
 }
 
-// SDK ToolAnnotations is a closed type; anthropic/* client hints ride through
-// our custom tools/list handler, so widen the register signature locally
-// (same idiom as generated/_shared.ts).
+/** Enforced and no grant is grant_required. aliasesVisibleToSession swallows that throw. */
+function refuseIfGrantless(): ReturnType<typeof missingGrantResult> | null {
+  if (!isGrantEnforced()) return null;
+  try {
+    allowedAccounts();
+    return null;
+  } catch {
+    return missingGrantResult();
+  }
+}
+
+// SDK ToolAnnotations is a closed type, so widen the register signature
+// locally (same idiom as generated/_shared.ts).
 type WideRegister = (
   name: string,
   config: { description: string; inputSchema: z.ZodRawShape; _meta?: Record<string, unknown> },
@@ -43,10 +53,7 @@ type WideRegister = (
 
 export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): void {
   const registerMeta = registry.registerMeta as unknown as WideRegister;
-  // Agent-controllable runtime expansion (D3 refinement): reveal the whole
-  // curated quality layer for heavy Google work, collapse to reclaim the
-  // name/schema context budget after. stdio-only semantics — over stateless
-  // HTTP the mode is forced curated and these are no-ops.
+  // stdio-only semantics: over stateless HTTP the mode is forced curated and these are no-ops.
   registerMeta(
     'discover_all',
     {
@@ -57,6 +64,8 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
       _meta: { 'anthropic/alwaysLoad': true },
     },
     async () => {
+      const refused = refuseIfGrantless();
+      if (refused) return refused;
       const changed = registry.expand();
       const counts = registry.visibleCount();
       return {
@@ -86,6 +95,8 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
       _meta: { 'anthropic/alwaysLoad': true },
     },
     async () => {
+      const refused = refuseIfGrantless();
+      if (refused) return refused;
       const changed = registry.collapse();
       const counts = registry.visibleCount();
       return {
@@ -118,8 +129,11 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
         _meta: { 'anthropic/alwaysLoad': true },
       },
       async ({ query }) => {
+        const refused = refuseIfGrantless();
+        if (refused) return refused;
         const operations = registry.catalog(service, query as string | undefined);
         registry.reveal(service);
+        const rendered = hints()?.render({ kind: 'policy_summary', policy });
         return {
           content: [
             {
@@ -127,11 +141,9 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
               text: JSON.stringify({
                 service,
                 operations,
-                writeControl: describePolicy(policy),
-                next:
-                  operations.length > 0
-                    ? 'Call the chosen tool by name; it is now listed and callable.'
-                    : `No ${service} operation matches "${query}". Call again without query for the full catalog.`,
+                writeControl: rendered?.hint ?? describePolicy(policy),
+                // catalog() falls back to a full one-line listing when nothing matches, so this is never empty.
+                next: 'Call the chosen tool by its exact name. A client that loads tools on demand may need its own tool-search or load step before the call succeeds.',
               }),
             },
           ],

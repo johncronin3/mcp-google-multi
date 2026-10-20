@@ -7,6 +7,7 @@ import {
   grantStatusSummary,
   hostedSetGrantRefusal,
   isGrantEnforced,
+  missingGrantResult,
   setSessionGrant,
 } from '../session-grant.js';
 
@@ -52,7 +53,7 @@ export function registerGrantTools(registry: ToolRegistry): void {
           label: state.label ?? null,
           accounts: state.accounts,
           source: st.source,
-          code_prefix: st.code_prefix,
+          code_sha8: st.code_sha8,
           hint: 'Google tools may only use these account aliases until clear_grant. On hosted Grok, a grant bound into the access token survives across Cloud Run replicas; in-process set_grant does not.',
         });
       } catch (e) {
@@ -90,7 +91,7 @@ export function registerGrantTools(registry: ToolRegistry): void {
     {
       description:
         'Show whether this session has a Google grant, which accounts it may use, and enforcement state. ' +
-        'Does not print the full secret (prefix only).',
+        'Does not print the secret. code_sha8 is 8 hex chars of SHA-256, never a prefix of the code.',
       inputSchema: {},
     },
     async () => {
@@ -104,12 +105,7 @@ export function registerGrantTools(registry: ToolRegistry): void {
         });
       }
       if (!st.authenticated) {
-        return jsonResult({
-          ...st,
-          message: isHostedHttp()
-            ? 'Not authenticated. Re-authorize at /oauth/authorize with the session grant code (bound into the access JWT as gname). In-process set_grant is refused on hosted.'
-            : 'Not authenticated. Call set_grant(grant_code=...) with the grant for this brain/session.',
-        });
+        return missingGrantResult();
       }
       return jsonResult({
         ...st,

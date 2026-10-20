@@ -1,8 +1,5 @@
 import type { Cud } from '../src/registry.js';
 
-// Coverage generator configuration: which discovery documents produce
-// generated tools, under which registry service name.
-
 export interface GenApi {
   file: string;
   service: string;
@@ -112,6 +109,7 @@ export const CURATED_METHOD_IDS: string[] = [
   'forms.forms.setPublishSettings',
   'forms.forms.watches.list',
   'gmail.users.drafts.create',
+  'gmail.users.drafts.delete',
   'gmail.users.drafts.get',
   'gmail.users.drafts.list',
   'gmail.users.drafts.send',
@@ -187,14 +185,11 @@ export const CURATED_METHOD_IDS: string[] = [
   'webmasters.sites.list',
 ];
 
-// Per-method escape valves for the typed-body heuristic (gen-tools): 'opaque'
-// keeps the single coerceJson body arg even when the schema is flat; 'typed'
-// lifts the property-count cap (flatness stays mandatory — the generator
-// throws if a forced method has nested/$ref props).
+// 'opaque' forces the single coerceJson body even when flat; 'typed' lifts the
+// prop-count cap, but the generator still throws if the method has nested/$ref props.
 export const BODY_OVERRIDES: Record<string, 'typed' | 'opaque'> = {
-  // 63 flat props each: typed params would cost more context than they save,
-  // so the cap already routes both to opaque. Recorded here so the choice is
-  // explicit intent, not an emergent property of MAX_TYPED_BODY_PROPS.
+  // Already routed to opaque by the cap (63 flat props); recorded explicitly so
+  // it reads as intent, not an accident of MAX_TYPED_BODY_PROPS.
   'groupsSettings.groups.patch': 'opaque',
   'groupsSettings.groups.update': 'opaque',
 };
@@ -203,16 +198,14 @@ export const BODY_OVERRIDES: Record<string, 'typed' | 'opaque'> = {
 export const CUD_OVERRIDES: Record<string, Cud> = {
   // One-time consent flag on the property: a state write, not a creation.
   'analyticsadmin.properties.acknowledgeUserDataCollection': 'update',
-  // The effect is an ARGUMENT, not the method name, so no verb rule can reach
-  // these. All three can deprovision or remotely wipe a device, which is the
-  // most destructive thing in the admin surface.
+  // The effect is an ARGUMENT, not the method name, so verb inference can't
+  // reach these; all three can deprovision or wipe a device remotely.
   'directory.chromeosdevices.action': 'delete',
   'directory.mobiledevices.action': 'delete',
   'admin.directory.v1.customer.devices.chromeos.issueCommand': 'delete',
   'admin.directory.v1.customer.devices.chromeos.batchChangeStatus': 'delete',
-  // A POST purely because the request carries a body; it runs a test and
-  // returns a report, changing nothing. `run` cannot go in the read verb list
-  // because `script.scripts.run` executes arbitrary Apps Script.
+  // POST only because of the body; this tests and reports without changing
+  // state. `run` isn't a blanket read verb; script.scripts.run executes code.
   'searchconsole.urlTestingTools.mobileFriendlyTest.run': 'read',
 };
 

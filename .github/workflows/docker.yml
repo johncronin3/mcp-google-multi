@@ -1,7 +1,7 @@
 name: docker
 
-# Builds and smoke-checks the distroless image (B16). Scoped to Docker changes
-# so it does not run on every slice. Non-required check (only `ci` gates merges).
+# Scoped to Docker changes only (not every push); non-required check; only
+# `ci` gates merges.
 on:
   push:
     branches: [main, staging, dev]

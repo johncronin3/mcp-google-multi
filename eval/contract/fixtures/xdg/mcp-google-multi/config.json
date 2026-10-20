@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "accounts": {
+    "example": { "email": "user@example.com", "scopeProfile": "all" }
+  },
+  "scopeProfiles": {
+    "all": {
+      "bundles": [
+        "slides",
+        "forms",
+        "chat",
+        "gmail_settings",
+        "gmail_settings_sharing",
+        "classroom",
+        "cloudidentity",
+        "cloudsearch",
+        "vault",
+        "keep",
+        "driveactivity",
+        "drivelabels",
+        "script",
+        "postmaster",
+        "analytics",
+        "analytics_write",
+        "groupssettings",
+        "groupsmigration",
+        "licensing",
+        "reseller",
+        "appsmarket"
+      ]
+    }
+  },
+  "defaultAccount": "example"
+}

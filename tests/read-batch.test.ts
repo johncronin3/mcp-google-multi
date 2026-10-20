@@ -34,7 +34,7 @@ function fakeGmail(byId: Record<string, { data?: any; throw?: any }>) {
   };
 }
 
-describe('readBatch (A9 gmail_read_batch core)', () => {
+describe('readBatch (gmail_read_batch core)', () => {
   it('reads N ids in order, appends a counts summary', async () => {
     const g = fakeGmail({
       a: { data: plainMsg('a', 'SA', 'body a') },
