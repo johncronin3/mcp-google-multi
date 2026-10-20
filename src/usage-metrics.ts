@@ -46,7 +46,7 @@ export const KNOWN_ERROR_SLUGS: ReadonlySet<string> = new Set([
   'api_not_enabled', 'auth_required', 'bad_request', 'binary', 'binary_unsupported',
   'confirmation_declined', 'diagnose_failed', 'discovery_unavailable', 'dispatch_timeout',
   'elicitation_unsupported', 'fanout_failed', 'forbidden',
-  'grant_required', 'grant_unknown', 'hosted_set_grant_refused',
+  'account_outside_grant', 'grant_required', 'grant_unknown', 'hosted_set_grant_refused',
   'insufficient_scope', 'internal', 'invalid_client', 'invalid_client_metadata',
   'invalid_grant', 'invalid_params', 'invalid_query', 'invalid_request',
   'invalid_scope', 'mcp_http_unconfigured', 'network_error', 'not_found', 'rate_limited',
