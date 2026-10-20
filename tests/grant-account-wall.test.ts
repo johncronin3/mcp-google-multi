@@ -10,7 +10,19 @@ import { registerAccountWizardTools, setWizardHttpConsent } from '../src/tools/a
 import { runWithGrant, type SessionGrantState } from '../src/session-grant.js';
 import type { Policy } from '../src/write-control.js';
 
-const OUTSIDERS = ['personal', 'opcenter', 'buildcoin', 'usa-house', 'olga'];
+const OUTSIDERS = ['personal', 'opcenter', 'buildcoin', 'usa-house', 'olga'] as const;
+const EVERY_ALIAS = ['stromback', ...OUTSIDERS] as const;
+
+function callsFor(alias: string): Array<[string, Record<string, unknown>]> {
+  return [
+    ['google_api_call', { account: alias, api: 'drive', methodId: 'drive.files.get', pathParams: { fileId: 'f1' } }],
+    ['drive_download', { account: alias, fileId: 'f1' }],
+    ['drive_export', { account: alias, fileId: 'f1', mimeType: 'application/pdf' }],
+    ['gmail_download_attachment', { account: alias, messageId: 'm1', attachmentId: 'a1', filename: 'a.bin' }],
+    ['gmail_search', { account: alias, query: 'in:inbox' }],
+    ['account_reauth', { account: alias }],
+  ];
+}
 
 type ToolResult = { content: { type?: string; text: string }[]; isError?: boolean };
 type Handler = (args: Record<string, unknown>, extra?: unknown) => Promise<ToolResult>;
@@ -109,25 +121,20 @@ describe('SB2 wall: paths that skip fan-out', () => {
     return { call, getClient, request, minted, grant };
   }
 
-  it('refuses personal before getClient on the escape hatch, downloads, and a meta tool', async () => {
+  it('a grant that includes stromback cannot name any other alias', async () => {
     const { call, getClient, request, minted, grant } = build();
     await runWithGrant(grant, async () => {
-      const calls: Array<[string, Record<string, unknown>]> = [
-        ['google_api_call', { account: 'personal', api: 'drive', methodId: 'drive.files.get', pathParams: { fileId: 'f1' } }],
-        ['drive_download', { account: 'personal', fileId: 'f1' }],
-        ['drive_export', { account: 'personal', fileId: 'f1', mimeType: 'application/pdf' }],
-        ['gmail_download_attachment', { account: 'personal', messageId: 'm1', attachmentId: 'a1', filename: 'a.bin' }],
-        ['account_reauth', { account: 'personal' }],
-      ];
-      for (const [name, args] of calls) {
-        const res = await call(name, args);
-        const body = JSON.parse(res.content[0].text) as { error?: string; account?: string };
-        expect(res.isError, name).toBe(true);
-        expect(body.error, name).toBe('account_outside_grant');
-        expect(body.account, name).toBe('personal');
-        for (const other of OUTSIDERS) {
-          if (other === 'personal') continue;
-          expect(res.content[0].text, `${name} ${other}`).not.toContain(other);
+      for (const alias of OUTSIDERS) {
+        for (const [name, args] of callsFor(alias)) {
+          const res = await call(name, args);
+          const body = JSON.parse(res.content[0].text) as { error?: string; account?: string };
+          expect(res.isError, `${name} ${alias}`).toBe(true);
+          expect(body.error, `${name} ${alias}`).toBe('account_outside_grant');
+          expect(body.account, `${name} ${alias}`).toBe(alias);
+          for (const other of OUTSIDERS) {
+            if (other === alias) continue;
+            expect(res.content[0].text, `${name} ${alias} leaked ${other}`).not.toContain(other);
+          }
         }
       }
 
@@ -152,6 +159,31 @@ describe('SB2 wall: paths that skip fan-out', () => {
         expect(hint.hint, other).not.toContain(other);
         expect(hint.message, other).not.toContain(other);
       }
+    });
+    expect(getClient).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(minted).toEqual([]);
+  });
+
+  it('a grantless session with enforcement on is refused for every alias', async () => {
+    const { call, getClient, request, minted } = build();
+    await runWithGrant(null, async () => {
+      for (const alias of EVERY_ALIAS) {
+        for (const [name, args] of callsFor(alias)) {
+          const res = await call(name, args);
+          const body = JSON.parse(res.content[0].text) as { error?: string; account?: string; message?: string };
+          expect(res.isError, `${name} ${alias}`).toBe(true);
+          expect(body.error, `${name} ${alias}`).toBe('grant_required');
+          expect(body.account, `${name} ${alias}`).toBe(alias);
+          expect(body.message ?? '', `${name} ${alias}`).not.toContain('@');
+        }
+      }
+      const listed = JSON.parse((await call('account_list')).content[0].text) as { error?: string; accounts?: unknown };
+      expect(listed.error).toBe('grant_required');
+      expect(listed.accounts).toBeUndefined();
+      expect(JSON.stringify(listed)).not.toContain('@');
+      const hint = JSON.parse((await call('gmail_search', { query: 'in:inbox' })).content[0].text) as { error?: string };
+      expect(hint.error).toBe('grant_required');
     });
     expect(getClient).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
