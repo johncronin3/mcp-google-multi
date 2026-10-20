@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { ToolRegistry } from './registry.js';
+import { allowedAccounts, isGrantEnforced, missingGrantResult } from './session-grant.js';
 import { describePolicy, type Policy } from './write-control.js';
 import { hints } from './hint-provider.js';
 
@@ -31,6 +32,17 @@ function opVocabulary(registry: ToolRegistry, service: string): string {
   return parts.join('; ');
 }
 
+/** Enforced and no grant is grant_required. aliasesVisibleToSession swallows that throw. */
+function refuseIfGrantless(): ReturnType<typeof missingGrantResult> | null {
+  if (!isGrantEnforced()) return null;
+  try {
+    allowedAccounts();
+    return null;
+  } catch {
+    return missingGrantResult();
+  }
+}
+
 // SDK ToolAnnotations is a closed type, so widen the register signature
 // locally (same idiom as generated/_shared.ts).
 type WideRegister = (
@@ -52,6 +64,8 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
       _meta: { 'anthropic/alwaysLoad': true },
     },
     async () => {
+      const refused = refuseIfGrantless();
+      if (refused) return refused;
       const changed = registry.expand();
       const counts = registry.visibleCount();
       return {
@@ -81,6 +95,8 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
       _meta: { 'anthropic/alwaysLoad': true },
     },
     async () => {
+      const refused = refuseIfGrantless();
+      if (refused) return refused;
       const changed = registry.collapse();
       const counts = registry.visibleCount();
       return {
@@ -113,6 +129,8 @@ export function registerDiscoverTools(registry: ToolRegistry, policy: Policy): v
         _meta: { 'anthropic/alwaysLoad': true },
       },
       async ({ query }) => {
+        const refused = refuseIfGrantless();
+        if (refused) return refused;
         const operations = registry.catalog(service, query as string | undefined);
         registry.reveal(service);
         const rendered = hints()?.render({ kind: 'policy_summary', policy });

@@ -66,6 +66,12 @@ describe('Cloud Run entrypoint', () => {
   it('sets MCP_TRANSPORT=http so a hosted process is not treated as stdio', () => {
     expect(read('docker/entrypoint.sh')).toMatch(/^export MCP_TRANSPORT=http$/m);
   });
+
+  it('enforces session grants and does not bind a static-bearer grant name', () => {
+    const script = read('docker/entrypoint.sh');
+    expect(script).toMatch(/^export GOOGLE_GRANTS_ENFORCE=1$/m);
+    expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+  });
 });
 
 describe('Railway config', () => {

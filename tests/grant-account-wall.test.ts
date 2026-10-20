@@ -258,6 +258,33 @@ describe('SB2 wall: paths that skip fan-out', () => {
     expect(listed.tokenReads).toEqual([]);
   });
 
+  it('grantless diagnose, discover, and grant_status return grant_required', async () => {
+    const { call, getClient, tokenReads } = buildListed();
+    const names = [
+      'diagnose',
+      'discover_all',
+      'discover_reset',
+      'gmail_discover',
+      'drive_discover',
+      'grant_status',
+    ];
+    await runWithGrant(null, async () => {
+      for (const name of names) {
+        const res = await call(name);
+        const body = parseResult(res);
+        expect(res.isError, name).toBe(true);
+        expect(body.error, name).toBe('grant_required');
+        const blob = JSON.stringify(body);
+        for (const alias of EVERY_ALIAS) {
+          expect(blob, `${name} ${alias}`).not.toContain(alias);
+        }
+        expect(blob, name).not.toContain('@');
+      }
+    });
+    expect(getClient).not.toHaveBeenCalled();
+    expect(tokenReads).toEqual([]);
+  });
+
   it('an SB2 session sees nothing outside stromback from discover, diagnose, and grant_status', async () => {
     const { call, getClient, tokenReads, grant, listTools, metaNames } = buildListed();
     const outsiders = [

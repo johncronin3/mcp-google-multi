@@ -7,6 +7,7 @@ import {
   grantStatusSummary,
   hostedSetGrantRefusal,
   isGrantEnforced,
+  missingGrantResult,
   setSessionGrant,
 } from '../session-grant.js';
 
@@ -104,12 +105,7 @@ export function registerGrantTools(registry: ToolRegistry): void {
         });
       }
       if (!st.authenticated) {
-        return jsonResult({
-          ...st,
-          message: isHostedHttp()
-            ? 'Not authenticated. Re-authorize at /oauth/authorize with the session grant code (bound into the access JWT as gname). In-process set_grant is refused on hosted.'
-            : 'Not authenticated. Call set_grant(grant_code=...) with the grant for this brain/session.',
-        });
+        return missingGrantResult();
       }
       return jsonResult({
         ...st,
