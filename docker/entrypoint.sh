@@ -12,4 +12,6 @@ if [ -z "${GOOGLE_GRANTS_PATH:-}" ] && [ -f /mnt/grants/grants.json ]; then
 fi
 # House Cloud Run does not set this. Without it, account_write_config treats the process as stdio.
 export MCP_TRANSPORT=http
+# Fail closed even if the grants mount is empty. The static-bearer grant name stays unset.
+export GOOGLE_GRANTS_ENFORCE=1
 exec node dist/http.js
