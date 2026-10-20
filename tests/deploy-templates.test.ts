@@ -72,6 +72,16 @@ describe('Cloud Run entrypoint', () => {
     expect(script).toMatch(/^export GOOGLE_GRANTS_ENFORCE=1$/m);
     expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
   });
+
+  it('mounts the JWT signing key by name and points the env var at that file', () => {
+    const script = read('docker/entrypoint.sh');
+    expect(script).toMatch(/google-mcp-jwt-signing-key/);
+    expect(script).toMatch(
+      /^export MCP_JWT_SIGNING_KEY_FILE=\/mnt\/jwt-signing-key\/google-mcp-jwt-signing-key$/m,
+    );
+    expect(script).not.toMatch(/^export MCP_JWT_SIGNING_KEY=/m);
+    expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+  });
 });
 
 describe('Railway config', () => {

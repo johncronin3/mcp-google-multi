@@ -39,8 +39,14 @@ Public origin = `https://$MCP_PUBLIC_HOST` (never `localhost:8787` in hosted mod
 | POST | `/oauth/token` | authorization_code + PKCE S256, or refresh_token |
 | POST | `/mcp` | Bearer: static MCP token **or** HMAC access JWT |
 
-Access tokens are HMAC-SHA256 JWTs signed with `MCP_HTTP_TOKEN` so replicas share no store.
+Access tokens are HMAC-SHA256 JWTs. Hosted signs them with the Secret Manager file
+`google-mcp-jwt-signing-key` (`MCP_JWT_SIGNING_KEY_FILE`). Desk may set `MCP_JWT_SIGNING_KEY`.
+The static bearer (`MCP_HTTP_TOKEN` / `MCP_API_KEY`) is not the signing key. Access lifetime
+is 1 hour. Refresh defaults to 30 days (`MCP_OAUTH_REFRESH_TTL`, seconds) and keeps `gname`.
 Claim `gname` is the session grant **name** (layer 3). Never put grant codes or Google tokens in the JWT.
+A missing, short, or unreadable hosted key fails closed: `/oauth/authorize`, `/oauth/token`, and
+JWT verification refuse, and they do not fall back to the bearer. Mounting a new key invalidates
+every existing Grok JWT; the connector re-authorizes at `/oauth/authorize` with a grant code.
 
 On each `/mcp` request, if the Bearer is a JWT, restore the grant with `resolveGrantByName(gname)`
 into `AsyncLocalStorage`. When grants are enforced, a JWT missing or unknown `gname` is rejected
@@ -112,7 +118,8 @@ On grok.com this MCP is **not** a catalog tile. **New Connector** → **Custom**
 
 ```
 PORT=8080
-MCP_HTTP_TOKEN=  # layer 2 — Secret Manager, never commit
+MCP_HTTP_TOKEN=  # layer 2 — Secret Manager, never commit. Not the JWT signing key.
+MCP_JWT_SIGNING_KEY_FILE=/mnt/jwt-signing-key/google-mcp-jwt-signing-key
 MCP_PUBLIC_HOST=google-multi-mcp-tdhsljvruq-uc.a.run.app
 GOOGLE_ACCOUNTS=alias:email,...
 MASTER_KEY=

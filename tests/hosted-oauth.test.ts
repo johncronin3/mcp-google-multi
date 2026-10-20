@@ -36,6 +36,8 @@ writeFileSync(
 );
 
 process.env.MCP_HTTP_TOKEN = TOKEN;
+process.env.MCP_JWT_SIGNING_KEY = '0123456789abcdef0123456789abcdef';
+delete process.env.MCP_JWT_SIGNING_KEY_FILE;
 process.env.MCP_PUBLIC_HOST = PUBLIC_HOST;
 process.env.GOOGLE_GRANTS_PATH = grantsPath;
 process.env.GOOGLE_GRANTS_ENFORCE = 'true';
