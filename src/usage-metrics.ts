@@ -44,7 +44,7 @@ export const KNOWN_ERROR_SLUGS: ReadonlySet<string> = new Set([
   'account_outside_grant', 'grant_required', 'grant_unknown', 'hosted_set_grant_refused',
   'insufficient_scope', 'internal', 'invalid_client', 'invalid_client_metadata',
   'invalid_grant', 'invalid_params', 'invalid_query', 'invalid_request',
-  'invalid_scope', 'mcp_http_unconfigured', 'network_error', 'not_found', 'rate_limited',
+  'invalid_scope', 'jwt_signing_key_unavailable', 'mcp_http_unconfigured', 'network_error', 'not_found', 'rate_limited',
   'reauth_required', 'recipient_not_allowed', 'temporarily_unavailable', 'tenant_not_found', 'too_large', 'toolset_disabled', 'unknown_api',
   'unknown_argument', 'unknown_method', 'unsupported_grant_type', 'unsupported_type',
   'untrusted_host', 'upstream_error', 'validation_error', 'write_disabled',
