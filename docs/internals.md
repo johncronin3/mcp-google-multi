@@ -113,7 +113,7 @@ A blank path segment collapses the path and Google routes the resulting trailing
 
 ### Why hosted `set_grant` is refused (`hostedSetGrantRefusal`)
 
-`setSessionGrant` writes process memory. Cloud Run has no sticky sessions, so a successful `set_grant` on replica A is invisible on replica B. Agents treat that `ok` as durable. Hosted (`isHostedHttp`: `MCP_HOSTED` / `K_SERVICE`) refuses the tool and points at `/oauth/authorize`. `set_grant` is CUD-overridden to `read` so the default `read-only` profile does not hide that message behind `write_disabled` (`set` otherwise infers `update`). `docker/entrypoint.sh` already exports `GOOGLE_GRANTS_PATH` from `/mnt/grants/grants.json` when unset — no second bake. It also sets `MCP_TRANSPORT=http` and `GOOGLE_GRANTS_ENFORCE=1`, and does not set `MCP_HTTP_TOKEN_GRANT`.
+`setSessionGrant` writes process memory. Cloud Run has no sticky sessions, so a successful `set_grant` on replica A is invisible on replica B. Agents treat that `ok` as durable. Hosted (`isHostedHttp`: `MCP_HOSTED` / `K_SERVICE`) refuses the tool and points at `/oauth/authorize`. `set_grant` is CUD-overridden to `read` so the default `read-only` profile does not hide that message behind `write_disabled` (`set` otherwise infers `update`). `docker/entrypoint.sh` already exports `GOOGLE_GRANTS_PATH` from `/mnt/grants/grants.json` when unset — no second bake. It also sets `MCP_TRANSPORT=http` and `GOOGLE_GRANTS_ENFORCE=1`, exports `MCP_JWT_SIGNING_KEY_FILE` for the `google-mcp-jwt-signing-key` mount, and does not set `MCP_HTTP_TOKEN_GRANT`.
 
 ### Account wizard tools are read-classified (`account-wizard.ts`)
 
