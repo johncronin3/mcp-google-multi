@@ -30,13 +30,20 @@ import {
   publicMcpHost,
 } from './hosted.js';
 import {
-  accessGrantName,
   bearerIsValid,
   handleOAuth,
   isJwtAccessToken,
   isOAuthPath,
+  verifyJwt,
 } from './oauth.js';
-import { jwtAccessGrantGate, resolveGrantByName, runWithGrant } from './session-grant.js';
+import {
+  grantRecordByName,
+  jwtAccessGrantGate,
+  resolveGrantByName,
+  runWithGrant,
+  staticBearerGrant,
+  tokenPredatesGrant,
+} from './session-grant.js';
 
 export { DEFAULT_PUBLIC_MCP_HOST, publicMcpHost };
 
@@ -207,7 +214,18 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
 
   const token = providedBearer(req);
   const jwt = isJwtAccessToken(token);
-  const grantName = jwt ? accessGrantName(token) : undefined;
+  const verified = jwt ? verifyJwt(token) : null;
+  const grantName =
+    verified && typeof verified.gname === 'string' && verified.gname.trim() ? verified.gname.trim() : undefined;
+  if (jwt && grantName) {
+    const rec = grantRecordByName(grantName);
+    const iat = Number(verified?.iat);
+    // Removed gname, or iat before that grant's notBefore: nothing is served.
+    if (!rec || tokenPredatesGrant(iat, rec)) {
+      unauthorized(res);
+      return;
+    }
+  }
   const tokenGrant = grantName ? resolveGrantByName(grantName) : null;
   // Fail at the HTTP gate when enforced JWT lacks a resolvable gname — see docs/internals.md (session grants).
   const gate = jwt ? jwtAccessGrantGate(grantName, tokenGrant) : null;
@@ -217,10 +235,13 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
   }
 
   try {
+    // JWT restores gname. A static bearer restores only MCP_HTTP_TOKEN_GRANT
+    // (unset → null). Neither path inherits in-process set_grant or GOOGLE_GRANT_CODE.
+    // OAuth/consent (handleOAuth) is not this branch.
     if (jwt) {
       await runWithGrant(tokenGrant, () => handleMcp(req, res));
     } else {
-      await handleMcp(req, res);
+      await runWithGrant(staticBearerGrant(), () => handleMcp(req, res));
     }
   } catch (err) {
     console.error('google-multi-mcp http error:', err);

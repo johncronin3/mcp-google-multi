@@ -1,36 +1,79 @@
 /**
  * Grok Bot connector OAuth (layer 2) — wraps MCP_HTTP_TOKEN only.
  *
+ * JWTs are signed with MCP_JWT_SIGNING_KEY_FILE (hosted) or MCP_JWT_SIGNING_KEY
+ * (desk), never with the static bearer.
  * This is NOT Google (layer 1) login and NOT a mega-OAuth across aliases.
  * Each Google alias is still minted on a desk with `auth --account` and stored
  * encrypted. Grok.com always asks Custom connectors for OAuth (authorization_code
  * + S256 PKCE) against https://grok.com/connectors-oauth-exchange-code/.
  *
- * Optional session grant code on the authorize page is layer 3 (which aliases
- * this brain may use). It is bound into the HMAC access token as grant *name*
+ * Session grant code on the authorize page is layer 3 (which aliases this
+ * brain may use). Hosted always requires that secret code. Desk requires it
+ * when enforcement is on. It is bound into the access token as grant *name*
  * so Cloud Run replicas need no sticky sessions. Codes never go in the JWT.
  */
 import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parse as parseForm } from 'node:querystring';
 import {
   DEFAULT_OAUTH_CLIENT_ID,
   GROK_REDIRECT,
+  isHostedHttp,
   issuer,
   resourceUrl,
 } from './hosted.js';
-import { isGrantEnforced, loadGrantsFile, resolveGrantByCode } from './session-grant.js';
+import { grantRecordByName, isGrantEnforced, resolveGrantByCode, tokenPredatesGrant } from './session-grant.js';
 
 const SCOPES = ['mcp:tools', 'openid', 'offline_access'] as const;
 const CODE_TTL = 300;
-const ACCESS_TTL = 60 * 60 * 24 * 30;
-const REFRESH_TTL = 60 * 60 * 24 * 90;
+const ACCESS_TTL = 60 * 60;
+const REFRESH_TTL_DEFAULT = 60 * 60 * 24 * 30;
+const JWT_KEY_MIN_BYTES = 32;
 
 export type JwtPayload = Record<string, unknown>;
 
-function hmacSecret(): Buffer {
-  const raw = process.env.MCP_HTTP_TOKEN || process.env.MCP_API_KEY || '';
-  return Buffer.from(raw, 'utf8');
+function bearerSecret(): string {
+  return process.env.MCP_HTTP_TOKEN || process.env.MCP_API_KEY || '';
+}
+
+function stripTrailingNewline(raw: Buffer): Buffer {
+  if (raw.length >= 2 && raw[raw.length - 2] === 0x0d && raw[raw.length - 1] === 0x0a) {
+    return raw.subarray(0, raw.length - 2);
+  }
+  if (raw.length >= 1 && raw[raw.length - 1] === 0x0a) return raw.subarray(0, raw.length - 1);
+  return raw;
+}
+
+/**
+ * House Grok JWT key. Hosted reads only MCP_JWT_SIGNING_KEY_FILE.
+ * Desk may use MCP_JWT_SIGNING_KEY. Never MCP_HTTP_TOKEN / MCP_API_KEY.
+ * A set file that is missing, short, or unreadable does not fall through.
+ */
+function jwtSigningKey(): Buffer | null {
+  const file = (process.env.MCP_JWT_SIGNING_KEY_FILE || '').trim();
+  if (file) {
+    try {
+      const key = stripTrailingNewline(readFileSync(file));
+      if (key.length < JWT_KEY_MIN_BYTES) return null;
+      return key;
+    } catch {
+      return null;
+    }
+  }
+  if (isHostedHttp()) return null;
+  const key = Buffer.from(process.env.MCP_JWT_SIGNING_KEY || '', 'utf8');
+  if (key.length < JWT_KEY_MIN_BYTES) return null;
+  return key;
+}
+
+function refreshTtl(): number {
+  const raw = (process.env.MCP_OAUTH_REFRESH_TTL || '').trim();
+  if (!raw) return REFRESH_TTL_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return REFRESH_TTL_DEFAULT;
+  return Math.floor(n);
 }
 
 function b64url(raw: Buffer | string): string {
@@ -43,6 +86,8 @@ function b64urlJson(obj: unknown): string {
 }
 
 export function signJwt(payload: JwtPayload, ttl: number): string {
+  const secret = jwtSigningKey();
+  if (!secret) throw new Error('jwt_signing_key_unavailable');
   const now = Math.floor(Date.now() / 1000);
   const body = {
     iss: issuer(),
@@ -53,14 +98,14 @@ export function signJwt(payload: JwtPayload, ttl: number): string {
   };
   const header = b64urlJson({ alg: 'HS256', typ: 'JWT' });
   const claims = b64urlJson(body);
-  const sig = b64url(createHmac('sha256', hmacSecret()).update(`${header}.${claims}`).digest());
+  const sig = b64url(createHmac('sha256', secret).update(`${header}.${claims}`).digest());
   return `${header}.${claims}.${sig}`;
 }
 
 export function verifyJwt(token: string): JwtPayload | null {
   const parts = token.split('.');
-  const secret = hmacSecret();
-  if (parts.length !== 3 || secret.length === 0) return null;
+  const secret = jwtSigningKey();
+  if (parts.length !== 3 || !secret) return null;
   const [header, claims, sig] = parts;
   const expected = b64url(createHmac('sha256', secret).update(`${header}.${claims}`).digest());
   const a = Buffer.from(sig);
@@ -120,7 +165,7 @@ function callbackUrl(base: string, params: Record<string, string>): string {
 }
 
 function tokenOk(provided: string): boolean {
-  const expected = hmacSecret().toString('utf8');
+  const expected = bearerSecret();
   if (!expected || !provided) return false;
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
@@ -150,11 +195,6 @@ export function protectedResourceMetadata(): Record<string, unknown> {
     bearer_methods_supported: ['header'],
     scopes_supported: [...SCOPES],
   };
-}
-
-function grantNames(): string[] {
-  const file = loadGrantsFile();
-  return file?.grants.map((g) => g.name) ?? [];
 }
 
 function escapeHtml(text: string): string {
@@ -203,11 +243,7 @@ function authorizeForm(params: Record<string, string>, res: ServerResponse, erro
     .join('');
   const err = error ? `<p class="err">${escapeHtml(error)}</p>` : '';
   const dest = params.redirect_uri || '';
-  const names = grantNames();
-  const namesLine = names.length
-    ? `Configured grant names (not codes): ${names.map((n) => `<code>${escapeHtml(n)}</code>`).join(', ')}.`
-    : 'No grants.json loaded — leave grant code blank only if enforcement is off.';
-  const required = isGrantEnforced() ? 'required' : '';
+  const required = isHostedHttp() || isGrantEnforced() ? 'required' : '';
   const body = `
 <h1>google-multi MCP</h1>
 <p class="muted">This page is <strong>Grok connector OAuth</strong> (layer 2). It is <strong>not</strong> Google login.
@@ -223,9 +259,8 @@ ${hidden}
 <p class="muted">Secret Manager / <code>MCP_HTTP_TOKEN</code>. Grok CLI can skip this page and send the same value as <code>Authorization: Bearer</code>.</p>
 <label for="grant_code">Session grant code</label>
 <input id="grant_code" name="grant_code" type="password" autocomplete="off" ${required}>
-<p class="muted">Layer 3 — slices which already-minted aliases this brain may use
-(e.g. Personal Brain Grant 3, StrombackBrain2). ${namesLine}
-Codes stay host-local. Bound into the access token as the grant <em>name</em> so every Cloud Run replica sees the same slice.</p>
+<p class="muted">Enter the grant code you were given. Codes stay host-local.
+The access token carries the grant name so every Cloud Run replica sees the same slice.</p>
 <button type="submit">Authorize Grok</button>
 </form>
 `;
@@ -269,11 +304,24 @@ async function formOrJson(req: IncomingMessage): Promise<Record<string, string>>
   );
 }
 
+/**
+ * Refresh and authorization-code exchange share this. A named grant that is
+ * gone, or a token issued before notBefore, must not mint a new iat.
+ * An empty gname is left to the caller, matching the previous refresh path.
+ */
+function liveGrantAdmits(payload: JwtPayload): boolean {
+  const gname = typeof payload.gname === 'string' ? payload.gname.trim() : '';
+  if (!gname) return true;
+  const rec = grantRecordByName(gname);
+  if (!rec || tokenPredatesGrant(Number(payload.iat), rec)) return false;
+  return true;
+}
+
 function issueTokens(clientId: string, scope: string, grantName: string | undefined): Record<string, unknown> {
   const extra: JwtPayload = { cid: clientId, sc: scope, sub: 'google-multi' };
   if (grantName) extra.gname = grantName;
   const access = signJwt({ typ: 'access', ...extra }, ACCESS_TTL);
-  const refresh = signJwt({ typ: 'refresh', ...extra }, REFRESH_TTL);
+  const refresh = signJwt({ typ: 'refresh', ...extra }, refreshTtl());
   return {
     access_token: access,
     refresh_token: refresh,
@@ -348,7 +396,10 @@ async function authorizePost(req: IncomingMessage, res: ServerResponse): Promise
 
   let grantName: string | undefined;
   const grantCode = (data.grant_code || '').trim();
-  if (isGrantEnforced() && !grantCode) {
+  // Hosted always demands the grant's own secret code. A bearer, a grant name,
+  // or an empty code never binds a grant. Desk still follows the enforce flag.
+  const codeRequired = isHostedHttp() || isGrantEnforced();
+  if (codeRequired && !grantCode) {
     authorizeForm(data, res, 'Session grant code is required (layer 3). This is not a Google password.');
     return;
   }
@@ -384,6 +435,10 @@ async function tokenPost(req: IncomingMessage, res: ServerResponse): Promise<voi
       json(res, 400, { error: 'invalid_grant' }, headers);
       return;
     }
+    if (!liveGrantAdmits(payload)) {
+      json(res, 400, { error: 'invalid_grant' }, headers);
+      return;
+    }
     json(
       res,
       200,
@@ -412,6 +467,10 @@ async function tokenPost(req: IncomingMessage, res: ServerResponse): Promise<voi
   }
   const verifier = data.code_verifier || '';
   if (!verifier || pkceS256(verifier) !== payload.ch) {
+    json(res, 400, { error: 'invalid_grant' }, headers);
+    return;
+  }
+  if (!liveGrantAdmits(payload)) {
     json(res, 400, { error: 'invalid_grant' }, headers);
     return;
   }
@@ -486,6 +545,24 @@ export function isJwtAccessToken(token: string): boolean {
   return Boolean(payload && payload.typ === 'access');
 }
 
+function refuseWithoutSigningKey(res: ServerResponse, html: boolean): boolean {
+  if (jwtSigningKey()) return false;
+  if (html) {
+    htmlPage(
+      'Authorize google-multi MCP',
+      `<h1>JWT signing key unavailable</h1><p class="err">jwt_signing_key_unavailable</p>`,
+      503,
+      res,
+    );
+    return true;
+  }
+  json(res, 503, {
+    error: 'jwt_signing_key_unavailable',
+    message: 'JWT signing key is missing, short, or unreadable.',
+  });
+  return true;
+}
+
 export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = (req.method || 'GET').toUpperCase();
@@ -518,6 +595,7 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
   }
 
   if (path === '/oauth/authorize') {
+    if (refuseWithoutSigningKey(res, true)) return;
     if (method === 'GET') {
       authorizeGet(url, res);
       return;
@@ -529,6 +607,7 @@ export async function handleOAuth(req: IncomingMessage, res: ServerResponse, url
   }
 
   if (path === '/oauth/token' && method === 'POST') {
+    if (refuseWithoutSigningKey(res, false)) return;
     await tokenPost(req, res);
     return;
   }

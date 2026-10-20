@@ -9,6 +9,7 @@ import type { ArgKind, ArgShape } from './arg-normalize.js';
 import type { Metrics } from './usage-metrics.js';
 import { MAX_SUGGESTED_KEYS, suggestKeys } from './arg-strict.js';
 import { classifyScope } from './scope-observability.js';
+import { aliasesForHint, aliasesVisibleToSession, grantRefusalForCallArgs, missingGrantResult, usableDefaultAlias } from './session-grant.js';
 
 /** Nothing granted, no profile: asks the BUNDLE CATALOG whether a scope is
  * reachable at all, independently of any account. */
@@ -269,34 +270,44 @@ export class ToolRegistry {
       // the fan-out parse so both observe a concrete alias; NOT meta-skipped
       // (that is what covers google_api_call with zero bespoke code). Explicit
       // aliases, "*" and CSV pass through untouched.
+      // Out-of-grant aliases never reach a handler, so getClient is not called.
+      const gate = (...args: unknown[]) => {
+        const blocked = grantRefusalForCallArgs(args[0]);
+        if (blocked) return blocked;
+        return guarded(...args);
+      };
+      const noDefaultResult = () => {
+        const listed = aliasesForHint(this.accounts().aliases);
+        if (listed === 'missing_grant') return missingGrantResult();
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                error: 'E_NO_DEFAULT_ACCOUNT',
+                message: 'No "account" given and no default account is configured.',
+                hint: `Pass account explicitly (valid: ${listed.join(', ')}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
+                retriable: false,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      };
       const withDefault = !hasAccountField
-        ? guarded
+        ? gate
         : (...args: unknown[]) => {
             const first = args[0] as { account?: unknown } | undefined;
             const value = first?.account;
-            if (value != null && value !== '') return guarded(...args);
+            if (value != null && value !== '') return gate(...args);
             // Refresh here or the unset->configured default transition never
             // heals for a client that always omits account (this branch never
             // reaches getClient's probe). One stat, only on omission.
             refreshAccountSetIfStale();
-            const def = this.accounts().defaultAccount;
-            if (!def) {
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: JSON.stringify({
-                      error: 'E_NO_DEFAULT_ACCOUNT',
-                      message: 'No "account" given and no default account is configured.',
-                      hint: `Pass account explicitly (valid: ${this.accounts().aliases.join(', ')}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
-                      retriable: false,
-                    }),
-                  },
-                ],
-                isError: true,
-              };
-            }
-            return guarded({ ...(first ?? {}), account: def }, ...args.slice(1));
+            const def = usableDefaultAlias(this.accounts().defaultAccount);
+            if (def === 'missing_grant') return missingGrantResult();
+            if (!def) return noDefaultResult();
+            return gate({ ...(first ?? {}), account: def }, ...args.slice(1));
           };
       const finalHandler = this.compactOutput
         ? async (...args: unknown[]) => compactResult(await (withDefault(...args) as Promise<Parameters<typeof compactResult>[0]>))
@@ -600,16 +611,36 @@ export class ToolRegistry {
     const s = schema as { properties?: Record<string, unknown> };
     const account = s?.properties?.account as { anyOf?: unknown[]; enum?: unknown[] } | undefined;
     if (!account) return schema;
-    const aliases = this.accounts().aliases;
-    if (aliases.length === 0) return schema;
+    const configured = this.accounts().aliases;
+    if (configured.length === 0) return schema;
+    // A session grant must not learn the other aliases by reading tools/list.
+    // The CSV example in the description is baked at registration from the full set.
+    const aliases = aliasesVisibleToSession(configured);
+    const description = sessionAccountDescription(
+      (account as { description?: unknown }).description,
+      aliases,
+    );
     if (Array.isArray(account.anyOf)) {
       // fan-out union: advertise '*' + the live aliases on the selector branch
       // (the one without the CSV pattern), keep the CSV branch as is
       const isSelector = (b: unknown) => (b as { pattern?: unknown }).pattern === undefined;
       if (!account.anyOf.some(isSelector)) return schema;
       const anyOf = account.anyOf.map((b) => (isSelector(b) ? { ...(b as object), enum: ['*', ...aliases] } : b));
-      return { ...s, properties: { ...s.properties, account: { ...account, anyOf } } };
+      return { ...s, properties: { ...s.properties, account: { ...account, description, anyOf } } };
     }
-    return { ...s, properties: { ...s.properties, account: { ...account, enum: [...aliases] } } };
+    return { ...s, properties: { ...s.properties, account: { ...account, description, enum: [...aliases] } } };
   }
+}
+
+/** Registration bakes a CSV example from the full alias list. Listings name
+ * only the aliases this session may use. */
+function sessionAccountDescription(description: unknown, aliases: readonly string[]): unknown {
+  if (typeof description !== 'string') return description;
+  const stripped = description.replace(/; or a CSV subset like "[^"]*"/, '');
+  if (aliases.length < 2 || !stripped.includes('; "*" = all accounts')) return stripped;
+  const example = aliases.slice(0, 2).join(',');
+  return stripped.replace(
+    '; "*" = all accounts',
+    `; "*" = all accounts; or a CSV subset like "${example}"`,
+  );
 }

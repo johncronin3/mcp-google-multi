@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +60,53 @@ describe('Render blueprint (B17) — security invariants', () => {
     const owner = env.get('MCP_OWNER_EMAILS');
     expect(owner?.sync).toBe(false);
     expect(owner?.value).toBeUndefined(); // an empty/blank default must fail startup, not open the server
+  });
+});
+
+describe('Cloud Run entrypoint', () => {
+  it('sets MCP_TRANSPORT=http so a hosted process is not treated as stdio', () => {
+    expect(read('docker/entrypoint.sh')).toMatch(/^export MCP_TRANSPORT=http$/m);
+  });
+
+  it('enforces session grants and does not bind a static-bearer grant name', () => {
+    const script = read('docker/entrypoint.sh');
+    expect(script).toMatch(/^export GOOGLE_GRANTS_ENFORCE=1$/m);
+    expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+  });
+
+  it('mounts the JWT signing key by name and points the env var at that file', () => {
+    const script = read('docker/entrypoint.sh');
+    expect(script).toMatch(/google-mcp-jwt-signing-key/);
+    expect(script).toMatch(
+      /^export MCP_JWT_SIGNING_KEY_FILE=\/mnt\/jwt-signing-key\/google-mcp-jwt-signing-key$/m,
+    );
+    expect(script).not.toMatch(/^export MCP_JWT_SIGNING_KEY=/m);
+    expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+  });
+});
+
+describe('Cloud Run deploy template', () => {
+  const script = read('deploy/google-mcp.sh');
+
+  it('exits 2 before gcloud and mounts the JWT signing key', () => {
+    const exitAt = script.search(/^\s*exit 2\s*$/m);
+    const gcloudAt = script.search(/^\s*gcloud run deploy /m);
+    expect(exitAt).toBeGreaterThan(0);
+    expect(gcloudAt).toBeGreaterThan(exitAt);
+    expect(script).toMatch(/--project=myflow-260730/);
+    expect(script).toMatch(/--account=REPLACE_WITH_GCLOUD_ACCOUNT/);
+    expect(script).toMatch(
+      /--set-secrets=\/mnt\/jwt-signing-key\/google-mcp-jwt-signing-key=google-mcp-jwt-signing-key:latest/,
+    );
+    expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+    const run = spawnSync('sh', [path.join(root, 'deploy/google-mcp.sh')], { encoding: 'utf8' });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toMatch(/exit 2/);
+    expect(run.stdout).not.toMatch(/gcloud/);
+  });
+
+  it('TRAIL.md points at deploy/google-mcp.sh', () => {
+    expect(read('TRAIL.md')).toContain('deploy/google-mcp.sh');
   });
 });
 
