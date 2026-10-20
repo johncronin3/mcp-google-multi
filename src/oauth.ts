@@ -8,8 +8,9 @@
  * encrypted. Grok.com always asks Custom connectors for OAuth (authorization_code
  * + S256 PKCE) against https://grok.com/connectors-oauth-exchange-code/.
  *
- * Optional session grant code on the authorize page is layer 3 (which aliases
- * this brain may use). It is bound into the HMAC access token as grant *name*
+ * Session grant code on the authorize page is layer 3 (which aliases this
+ * brain may use). Hosted always requires that secret code. Desk requires it
+ * when enforcement is on. It is bound into the access token as grant *name*
  * so Cloud Run replicas need no sticky sessions. Codes never go in the JWT.
  */
 import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
@@ -23,7 +24,7 @@ import {
   issuer,
   resourceUrl,
 } from './hosted.js';
-import { isGrantEnforced, loadGrantsFile, resolveGrantByCode } from './session-grant.js';
+import { grantRecordByName, isGrantEnforced, resolveGrantByCode, tokenPredatesGrant } from './session-grant.js';
 
 const SCOPES = ['mcp:tools', 'openid', 'offline_access'] as const;
 const CODE_TTL = 300;
@@ -196,11 +197,6 @@ export function protectedResourceMetadata(): Record<string, unknown> {
   };
 }
 
-function grantNames(): string[] {
-  const file = loadGrantsFile();
-  return file?.grants.map((g) => g.name) ?? [];
-}
-
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -247,11 +243,7 @@ function authorizeForm(params: Record<string, string>, res: ServerResponse, erro
     .join('');
   const err = error ? `<p class="err">${escapeHtml(error)}</p>` : '';
   const dest = params.redirect_uri || '';
-  const names = grantNames();
-  const namesLine = names.length
-    ? `Configured grant names (not codes): ${names.map((n) => `<code>${escapeHtml(n)}</code>`).join(', ')}.`
-    : 'No grants.json loaded — leave grant code blank only if enforcement is off.';
-  const required = isGrantEnforced() ? 'required' : '';
+  const required = isHostedHttp() || isGrantEnforced() ? 'required' : '';
   const body = `
 <h1>google-multi MCP</h1>
 <p class="muted">This page is <strong>Grok connector OAuth</strong> (layer 2). It is <strong>not</strong> Google login.
@@ -267,9 +259,8 @@ ${hidden}
 <p class="muted">Secret Manager / <code>MCP_HTTP_TOKEN</code>. Grok CLI can skip this page and send the same value as <code>Authorization: Bearer</code>.</p>
 <label for="grant_code">Session grant code</label>
 <input id="grant_code" name="grant_code" type="password" autocomplete="off" ${required}>
-<p class="muted">Layer 3 — slices which already-minted aliases this brain may use
-(e.g. Personal Brain Grant 3, StrombackBrain2). ${namesLine}
-Codes stay host-local. Bound into the access token as the grant <em>name</em> so every Cloud Run replica sees the same slice.</p>
+<p class="muted">Enter the grant code you were given. Codes stay host-local.
+The access token carries the grant name so every Cloud Run replica sees the same slice.</p>
 <button type="submit">Authorize Grok</button>
 </form>
 `;
@@ -392,7 +383,10 @@ async function authorizePost(req: IncomingMessage, res: ServerResponse): Promise
 
   let grantName: string | undefined;
   const grantCode = (data.grant_code || '').trim();
-  if (isGrantEnforced() && !grantCode) {
+  // Hosted always demands the grant's own secret code. A bearer, a grant name,
+  // or an empty code never binds a grant. Desk still follows the enforce flag.
+  const codeRequired = isHostedHttp() || isGrantEnforced();
+  if (codeRequired && !grantCode) {
     authorizeForm(data, res, 'Session grant code is required (layer 3). This is not a Google password.');
     return;
   }
@@ -427,6 +421,15 @@ async function tokenPost(req: IncomingMessage, res: ServerResponse): Promise<voi
     if (!payload || payload.typ !== 'refresh') {
       json(res, 400, { error: 'invalid_grant' }, headers);
       return;
+    }
+    const gname = typeof payload.gname === 'string' ? payload.gname.trim() : '';
+    if (gname) {
+      const rec = grantRecordByName(gname);
+      const iat = Number(payload.iat);
+      if (!rec || tokenPredatesGrant(iat, rec)) {
+        json(res, 400, { error: 'invalid_grant' }, headers);
+        return;
+      }
     }
     json(
       res,

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -81,6 +82,27 @@ describe('Cloud Run entrypoint', () => {
     );
     expect(script).not.toMatch(/^export MCP_JWT_SIGNING_KEY=/m);
     expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+  });
+});
+
+describe('Cloud Run deploy template', () => {
+  const script = read('deploy/google-mcp.sh');
+
+  it('exits 2 before gcloud and mounts the JWT signing key', () => {
+    const exitAt = script.search(/^\s*exit 2\s*$/m);
+    const gcloudAt = script.search(/^\s*gcloud run deploy /m);
+    expect(exitAt).toBeGreaterThan(0);
+    expect(gcloudAt).toBeGreaterThan(exitAt);
+    expect(script).toMatch(/--project=myflow-260730/);
+    expect(script).toMatch(/--account=REPLACE_WITH_GCLOUD_ACCOUNT/);
+    expect(script).toMatch(
+      /--set-secrets=\/mnt\/jwt-signing-key\/google-mcp-jwt-signing-key=google-mcp-jwt-signing-key:latest/,
+    );
+    expect(script).not.toMatch(/MCP_HTTP_TOKEN_GRANT/);
+    const run = spawnSync('sh', [path.join(root, 'deploy/google-mcp.sh')], { encoding: 'utf8' });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toMatch(/exit 2/);
+    expect(run.stdout).not.toMatch(/gcloud/);
   });
 });
 

@@ -4,7 +4,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -23,7 +23,7 @@ writeFileSync(
   grantsPath,
   JSON.stringify({
     version: 1,
-    grants: [{ name: PBG3, code: 'test-code-pbg3-not-prod', accounts: ALL }],
+    grants: [{ name: PBG3, code: 'test-code-pbg3-not-prod-ok', accounts: ALL }],
   }),
   'utf8',
 );
@@ -43,7 +43,7 @@ delete process.env.GOOGLE_GRANT_CODE;
 delete process.env.MCP_OAUTH_REFRESH_TTL;
 
 const { createHttpRequestListener, publicMcpHost } = await import('../src/http.js');
-const { resetGrantsFileCache } = await import('../src/session-grant.js');
+const { grantRecordByName, resetGrantsFileCache } = await import('../src/session-grant.js');
 const { invalidateAccountSet } = await import('../src/accounts.js');
 const { signJwt, verifyJwt } = await import('../src/oauth.js');
 
@@ -193,7 +193,7 @@ async function expectSigningRefused(previouslyValid: string): Promise<void> {
       response_type: 'code',
       code_challenge: 'abc',
       password: TOKEN,
-      grant_code: 'test-code-pbg3-not-prod',
+      grant_code: 'test-code-pbg3-not-prod-ok',
     },
   });
   expect(posted.status).toBe(503);
@@ -339,5 +339,111 @@ describe('house Grok JWT signing key', () => {
     const refreshed = verifyJwt(JSON.parse(tok.text).refresh_token);
     expect(Number(refreshed?.exp) - Number(refreshed?.iat)).toBe(60 * 60 * 24 * 30);
     delete process.env.MCP_OAUTH_REFRESH_TTL;
+  });
+
+  it('refuses an expired refresh token', async () => {
+    const refresh = signJwt(
+      { typ: 'refresh', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: PBG3 },
+      -30,
+    );
+    expect(verifyJwt(refresh)).toBeNull();
+    const tok = await request({
+      method: 'POST',
+      path: '/oauth/token',
+      form: { grant_type: 'refresh_token', refresh_token: refresh },
+    });
+    expect(tok.status).toBe(400);
+    expect(JSON.parse(tok.text).error).toBe('invalid_grant');
+  });
+
+  it('refresh for a removed gname is refused after the grants cache has loaded', async () => {
+    const access = signJwt(accessClaims, 3600);
+    const refresh = signJwt(
+      { typ: 'refresh', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: PBG3 },
+      3600,
+    );
+    expect(grantRecordByName(PBG3)?.name).toBe(PBG3);
+    const original = readFileSync(grantsPath, 'utf8');
+    try {
+      writeFileSync(grantsPath, JSON.stringify({ version: 1, grants: [] }), 'utf8');
+      const removedRefresh = await request({
+        method: 'POST',
+        path: '/oauth/token',
+        form: { grant_type: 'refresh_token', refresh_token: refresh },
+      });
+      expect(removedRefresh.status).toBe(400);
+      expect(JSON.parse(removedRefresh.text).error).toBe('invalid_grant');
+      const removedMcp = await request({
+        method: 'POST',
+        path: '/mcp',
+        token: access,
+        body: { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
+      });
+      expect(removedMcp.status).toBe(401);
+      expect(JSON.parse(removedMcp.text).error).toBe('Unauthorized');
+    } finally {
+      writeFileSync(grantsPath, original, 'utf8');
+      resetGrantsFileCache();
+    }
+  });
+
+  it('a token older than notBefore is refused on refresh and on /mcp', async () => {
+    const access = signJwt(accessClaims, 3600);
+    const refresh = signJwt(
+      { typ: 'refresh', cid: 'grok', sc: 'mcp:tools', sub: 'google-multi', gname: PBG3 },
+      3600,
+    );
+    expect(grantRecordByName(PBG3)?.name).toBe(PBG3);
+    const original = readFileSync(grantsPath, 'utf8');
+    const write = (notBefore: string) => {
+      writeFileSync(
+        grantsPath,
+        JSON.stringify({
+          version: 1,
+          grants: [{ name: PBG3, code: 'test-code-pbg3-not-prod-ok', accounts: ALL, notBefore }],
+        }),
+        'utf8',
+      );
+    };
+    try {
+      write(new Date(Date.now() + 60 * 60 * 1000).toISOString());
+      const oldRefresh = await request({
+        method: 'POST',
+        path: '/oauth/token',
+        form: { grant_type: 'refresh_token', refresh_token: refresh },
+      });
+      expect(oldRefresh.status).toBe(400);
+      expect(JSON.parse(oldRefresh.text).error).toBe('invalid_grant');
+      const oldMcp = await request({
+        method: 'POST',
+        path: '/mcp',
+        token: access,
+        body: { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
+      });
+      expect(oldMcp.status).toBe(401);
+      expect(JSON.parse(oldMcp.text).error).toBe('Unauthorized');
+
+      write(new Date(Date.now() - 60 * 60 * 1000).toISOString());
+      const fresh = await request({
+        method: 'POST',
+        path: '/oauth/token',
+        form: { grant_type: 'refresh_token', refresh_token: refresh },
+      });
+      expect(fresh.status).toBe(200);
+      expect(verifyJwt(JSON.parse(fresh.text).access_token)?.gname).toBe(PBG3);
+      const ok = await request({
+        method: 'POST',
+        path: '/mcp',
+        token: access,
+        body: { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'account_list', arguments: {} } },
+      });
+      expect(ok.status).toBe(200);
+      const listed = JSON.parse(mcpText(ok.text));
+      expect(listed.error).toBeUndefined();
+      expect(listed.accounts.map((row: { alias: string }) => row.alias).sort()).toEqual([...ALL].sort());
+    } finally {
+      writeFileSync(grantsPath, original, 'utf8');
+      resetGrantsFileCache();
+    }
   });
 });

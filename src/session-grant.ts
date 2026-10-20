@@ -14,6 +14,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -27,6 +28,11 @@ export interface GrantRecord {
   code: string;
   /** Account aliases from GOOGLE_ACCOUNTS this grant may use. */
   accounts: string[];
+  /**
+   * Optional ISO-8601 cutoff. Tokens whose iat is earlier are refused.
+   * Revokes one grant without rotating the JWT signing key.
+   */
+  notBefore?: string;
 }
 
 export interface GrantsFile {
@@ -78,6 +84,7 @@ export function loadGrantsFile(force = false): GrantsFile | null {
     if (!g?.name || !g?.code || !Array.isArray(g.accounts)) {
       throw new Error(`Invalid grant entry in ${filePath}: need name, code, accounts[]`);
     }
+    assertGrantSecret(g);
   }
   cachedFile = data;
   return data;
@@ -95,6 +102,8 @@ export function resetGrantsFileCache(): void {
  */
 export function isGrantEnforced(): boolean {
   const flag = (process.env.GOOGLE_GRANTS_ENFORCE || '').trim().toLowerCase();
+  // Hosted still loads, so a refused file cannot open every alias when enforce is off.
+  if (isHostedHttp()) loadGrantsFile();
   if (flag === 'false' || flag === '0' || flag === 'off' || flag === 'no') return false;
   if (flag === 'true' || flag === '1' || flag === 'on' || flag === 'yes') return true;
   const file = loadGrantsFile();
@@ -126,22 +135,68 @@ function accountsForRecord(rec: GrantRecord): string[] {
   return rec.accounts.map((a) => a.trim()).filter((a) => a && known.has(a));
 }
 
+/**
+ * A code shorter than 24 characters, or equal to the grant name ignoring case,
+ * is refused. The message names the grant only.
+ */
+function assertGrantSecret(g: GrantRecord): void {
+  const name = String(g.name).trim();
+  const code = String(g.code).trim();
+  if (code.length < 24 || code.toLowerCase() === name.toLowerCase()) {
+    throw new Error(
+      `Grant "${name}" is refused. Its code must be at least 24 characters and must not equal the grant name.`,
+    );
+  }
+}
+
+/** SHA-256 then timingSafeEqual so unequal lengths still compare in constant time. */
+function secretEquals(provided: string, expected: string): boolean {
+  const a = createHash('sha256').update(provided, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
 /** Lookup by secret code. Does not activate. Used by OAuth authorize (layer 3). */
 export function resolveGrantByCode(code: string): GrantRecord | null {
   const file = loadGrantsFile(true);
   if (!file) return null;
   const c = code.trim();
   if (!c) return null;
-  return file.grants.find((g) => g.code === c) ?? null;
+  let found: GrantRecord | null = null;
+  for (const g of file.grants) {
+    if (secretEquals(c, g.code) && !found) found = g;
+  }
+  return found;
+}
+
+/** Name lookup. Re-reads grants.json so a removal applies without a restart. */
+export function grantRecordByName(name: string): GrantRecord | null {
+  const file = loadGrantsFile(true);
+  if (!file) return null;
+  const n = name.trim();
+  if (!n) return null;
+  return file.grants.find((g) => g.name === n) ?? null;
+}
+
+/**
+ * True when notBefore cuts this token off. Unparseable notBefore fails closed.
+ * iat equal to notBefore is still valid.
+ */
+export function tokenPredatesGrant(iatSec: number, rec: GrantRecord): boolean {
+  if (rec.notBefore == null || rec.notBefore === '') return false;
+  if (typeof rec.notBefore !== 'string' || !Number.isFinite(iatSec)) return true;
+  const ms = Date.parse(rec.notBefore);
+  if (!Number.isFinite(ms)) return true;
+  return iatSec * 1000 < ms;
 }
 
 /**
  * Restore a slice from an access-token grant *name* (never the code).
- * Re-resolves aliases from grants.json so replica state stays current.
+ * Re-reads grants.json so a removal applies without a restart.
  * Fail closed (null) if the name is unknown or has no matching aliases.
  */
 export function resolveGrantByName(name: string): SessionGrantState | null {
-  const file = loadGrantsFile();
+  const file = loadGrantsFile(true);
   if (!file) return null;
   const n = name.trim();
   if (!n) return null;
@@ -257,8 +312,9 @@ export function setSessionGrant(code: string, label?: string): SessionGrantState
   });
 }
 
-/** Env fallback GOOGLE_GRANT_CODE (legacy process-wide); session wins. */
+/** Desk/stdio GOOGLE_GRANT_CODE. Hosted ignores it and stays grantless. */
 export function grantFromEnvFallback(): SessionGrantState | null {
+  if (isHostedHttp()) return null;
   const code = (process.env.GOOGLE_GRANT_CODE || '').trim();
   if (!code) return null;
   try {
@@ -266,7 +322,10 @@ export function grantFromEnvFallback(): SessionGrantState | null {
     // For status / allow checks we resolve ephemerally.
     const file = loadGrantsFile();
     if (!file) return null;
-    const rec = file.grants.find((g) => g.code === code);
+    let rec: GrantRecord | null = null;
+    for (const g of file.grants) {
+      if (secretEquals(code, g.code) && !rec) rec = g;
+    }
     if (!rec) return null;
     const known = new Set(configuredAliases());
     const accounts = rec.accounts.map((a) => a.trim()).filter((a) => known.has(a));
@@ -411,13 +470,18 @@ export function missingGrantResult() {
   return grantBlockResult(message);
 }
 
+/** First 8 hex chars of SHA-256. Not a prefix of the code, at any length. */
+export function codeSha8(code: string): string {
+  return createHash('sha256').update(code, 'utf8').digest('hex').slice(0, 8);
+}
+
 export function grantStatusSummary(): {
   enforced: boolean;
   authenticated: boolean;
   source: 'session' | 'env' | 'token' | null;
   name: string | null;
   label: string | null;
-  code_prefix: string | null;
+  code_sha8: string | null;
   accounts: string[];
   grants_path: string;
   grants_configured: number;
@@ -434,7 +498,7 @@ export function grantStatusSummary(): {
     source,
     name: g?.name ?? null,
     label: g?.label ?? null,
-    code_prefix: code ? (code.length > 12 ? `${code.slice(0, 12)}…` : code) : null,
+    code_sha8: code ? codeSha8(code) : null,
     accounts: g?.accounts ?? [],
     grants_path: getGrantsPath(),
     grants_configured: file?.grants.length ?? 0,
