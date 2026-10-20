@@ -366,6 +366,18 @@ export function aliasesForHint(aliases: readonly string[]): string[] | 'missing_
   }
 }
 
+/** Aliases a session-facing listing may name. Unenforced: the configured list.
+ * Enforced with a grant: the intersection. Enforced with no grant: none. */
+export function aliasesVisibleToSession(configured: readonly string[]): string[] {
+  if (!isGrantEnforced()) return [...configured];
+  try {
+    const allowed = new Set(allowedAccounts());
+    return configured.filter((alias) => allowed.has(alias));
+  } catch {
+    return [];
+  }
+}
+
 export function missingGrantResult() {
   let message = 'No session grant. Fail-closed: without a grant, no accounts are visible.';
   try {

@@ -7,6 +7,9 @@ import { registerGmailTools } from '../src/tools/gmail.js';
 import { registerEscapeTools } from '../src/tools/google-api.js';
 import { registerAccountTools } from '../src/tools/accounts-tool.js';
 import { registerAccountWizardTools, setWizardHttpConsent } from '../src/tools/account-wizard.js';
+import { registerDiscoverTools } from '../src/discover.js';
+import { registerGrantTools } from '../src/tools/grant-tools.js';
+import { registerDiagnoseTool } from '../src/doctor.js';
 import { runWithGrant, type SessionGrantState } from '../src/session-grant.js';
 import type { Policy } from '../src/write-control.js';
 
@@ -188,5 +191,142 @@ describe('SB2 wall: paths that skip fan-out', () => {
     expect(getClient).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
     expect(minted).toEqual([]);
+  });
+
+  function buildListed() {
+    process.env.GOOGLE_GRANTS_ENFORCE = 'true';
+    const accounts = accountSet(
+      {
+        personal: 'personal@example.com',
+        stromback: 'stromback@example.com',
+        opcenter: 'opcenter@example.com',
+        buildcoin: 'buildcoin@example.com',
+        'usa-house': 'usa-house@example.com',
+        olga: 'olga@example.com',
+      },
+      'personal',
+    );
+    const request = vi.fn(async () => ({ data: { id: 'should-not-run' } }));
+    const getClient = vi.fn(async (_alias: string) => ({ request }));
+    const tokenReads: string[] = [];
+    const liveToken = () => ({
+      refresh_token: 'refresh-token',
+      scope: 'https://www.googleapis.com/auth/gmail.readonly',
+      expiry_date: Date.now() + 60_000,
+    });
+    const policy: Policy = { profile: 'read-only', readOnly: false, allow: [], deny: [] };
+    const handlers: Record<string, Handler> = {};
+    const schemas: Record<string, z.ZodRawShape> = {};
+    let listHandler: (() => Promise<{ tools: unknown[] }>) | undefined;
+    const server = {
+      registerTool: (name: string, config: { inputSchema?: z.ZodRawShape }, handler: Handler) => {
+        handlers[name] = handler;
+        schemas[name] = config.inputSchema ?? {};
+        return 'ok';
+      },
+      sendToolListChanged: vi.fn(),
+      server: {
+        setRequestHandler: (method: string, fn: () => Promise<{ tools: unknown[] }>) => {
+          if (method === 'tools/list') listHandler = fn;
+        },
+        getClientCapabilities: () => undefined,
+      },
+    };
+    const registry = new ToolRegistry(server as never, policy, 'lazy', null, () => accounts);
+    registerDriveTools(registry, { getClientFn: getClient as never, localFiles: true });
+    registerGmailTools(registry, { getClientFn: getClient as never, localFiles: true });
+    registerEscapeTools(registry, policy, { getClientFn: getClient as never });
+    registerDiscoverTools(registry, policy);
+    registerAccountTools(registry, {
+      hasToken: () => false,
+      readToken: () => null,
+      fileExists: () => false,
+      now: () => 0,
+    });
+    registerGrantTools(registry);
+    registerDiagnoseTool(registry, {
+      subject: 'wall',
+      accounts,
+      getClient: getClient as never,
+      tokenStore: {
+        hasToken: (alias: string) => {
+          tokenReads.push(alias);
+          return true;
+        },
+        readToken: (alias: string) => {
+          tokenReads.push(alias);
+          return liveToken();
+        },
+        writeToken: () => undefined,
+        updateToken: () => undefined,
+      },
+    } as never);
+    registry.installListHandler();
+
+    async function call(name: string, args: Record<string, unknown> = {}): Promise<ToolResult> {
+      const handler = handlers[name];
+      if (!handler) throw new Error(`tool not registered: ${name}`);
+      return handler(z.object(schemas[name]).parse(args) as Record<string, unknown>, {});
+    }
+
+    const grant: SessionGrantState = {
+      code: '',
+      name: 'StrombackBrain2',
+      accounts: ['stromback'],
+      label: 'sb2',
+      source: 'token',
+    };
+    return {
+      call,
+      getClient,
+      tokenReads,
+      grant,
+      metaNames: Object.keys(handlers).filter(
+        (name) =>
+          name === 'discover_all' ||
+          name === 'discover_reset' ||
+          name === 'diagnose' ||
+          name === 'grant_status' ||
+          name.endsWith('_discover'),
+      ),
+      listTools: async () => {
+        if (!listHandler) throw new Error('tools/list was not installed');
+        return listHandler();
+      },
+    };
+  }
+
+  it('an SB2 session sees nothing outside stromback from discover, diagnose, and grant_status', async () => {
+    const { call, getClient, tokenReads, grant, listTools, metaNames } = buildListed();
+    const outsiders = [
+      ...OUTSIDERS,
+      ...OUTSIDERS.map((alias) => `${alias}@example.com`),
+    ];
+    expect(metaNames).toEqual(expect.arrayContaining(['discover_all', 'gmail_discover', 'drive_discover', 'diagnose', 'grant_status']));
+    await runWithGrant(grant, async () => {
+      for (const name of metaNames) {
+        const res = await call(name);
+        const text = res.content[0].text;
+        for (const needle of outsiders) {
+          expect(text, `${name} leaked ${needle}`).not.toContain(needle);
+        }
+      }
+      const diagnosed = JSON.parse((await call('diagnose')).content[0].text) as unknown;
+      const blob = JSON.stringify(diagnosed);
+      expect(blob).toContain('stromback');
+      expect(blob).toContain('stromback@example.com');
+      const status = JSON.parse((await call('grant_status')).content[0].text) as { accounts: string[] };
+      expect(status.accounts).toEqual(['stromback']);
+
+      const listed = await listTools();
+      const listedText = JSON.stringify(listed);
+      for (const needle of outsiders) {
+        expect(listedText, `tools/list leaked ${needle}`).not.toContain(needle);
+      }
+      expect(listedText).toContain('stromback');
+    });
+    const probed = getClient.mock.calls.map((args) => args[0]);
+    expect(probed.filter((alias) => alias !== 'stromback')).toEqual([]);
+    expect(tokenReads.filter((alias) => alias !== 'stromback')).toEqual([]);
   });
 });
