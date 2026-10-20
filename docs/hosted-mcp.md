@@ -35,7 +35,7 @@ Public origin = `https://$MCP_PUBLIC_HOST` (never `localhost:8787` in hosted mod
 | GET | `/.well-known/oauth-authorization-server` | none |
 | GET | `/.well-known/oauth-protected-resource` | none |
 | POST | `/oauth/register` | none (DCR; return `client_id: grok`) |
-| GET/POST | `/oauth/authorize` | HTML form: MCP token + optional session grant code |
+| GET/POST | `/oauth/authorize` | HTML form: MCP token + the grant's secret code (required on hosted) |
 | POST | `/oauth/token` | authorization_code + PKCE S256, or refresh_token |
 | POST | `/mcp` | Bearer: static MCP token **or** HMAC access JWT |
 
@@ -44,6 +44,7 @@ Access tokens are HMAC-SHA256 JWTs. Hosted signs them with the Secret Manager fi
 The static bearer (`MCP_HTTP_TOKEN` / `MCP_API_KEY`) is not the signing key. Access lifetime
 is 1 hour. Refresh defaults to 30 days (`MCP_OAUTH_REFRESH_TTL`, seconds) and keeps `gname`.
 Claim `gname` is the session grant **name** (layer 3). Never put grant codes or Google tokens in the JWT.
+Refresh refuses a `gname` that is not in the current `grants.json`, and both refresh and `/mcp` refuse a token whose `iat` is earlier than that grant's optional `notBefore`. Name lookup re-reads the file, so a removal applies without a restart. `/mcp` answers 401 for a removed `gname` and serves no tools. The authorize page does not list grant names. On hosted, that form always requires the grant's secret code, compared in constant time, whether or not `GOOGLE_GRANTS_ENFORCE` is set. A bearer holder who does not know the code gets no token. Desk/stdio still requires the code only when enforcement is on.
 A missing, short, or unreadable hosted key fails closed: `/oauth/authorize`, `/oauth/token`, and
 JWT verification refuse, and they do not fall back to the bearer. Mounting a new key invalidates
 every existing Grok JWT; the connector re-authorizes at `/oauth/authorize` with a grant code.
@@ -54,7 +55,7 @@ at the `/mcp` gate (HTTP 403) — do not wait for a tool to fail. A static beare
 `runWithGrant(staticBearerGrant())`: `MCP_HTTP_TOKEN_GRANT` is an optional grant name, resolved
 on every request; unset or unknown is null and fails closed. It does not use in-process
 `set_grant` or `GOOGLE_GRANT_CODE`. On hosted (`MCP_HOSTED` / `K_SERVICE`) `activeGrant()` is
-only that request grant or null, and `set_grant` refuses. Stdio/CLI still calls `set_grant`.
+only that request grant or null, `GOOGLE_GRANT_CODE` is ignored, and `set_grant` refuses. A grant code shorter than 24 characters, or equal to its name ignoring case, is rejected on load. The error names the grant only, and hosted fails closed even when enforcement is off. Stdio/CLI still calls `set_grant` and may use `GOOGLE_GRANT_CODE`.
 Codes never go in the JWT.
 
 ## Hosted must not

@@ -30,13 +30,20 @@ import {
   publicMcpHost,
 } from './hosted.js';
 import {
-  accessGrantName,
   bearerIsValid,
   handleOAuth,
   isJwtAccessToken,
   isOAuthPath,
+  verifyJwt,
 } from './oauth.js';
-import { jwtAccessGrantGate, resolveGrantByName, runWithGrant, staticBearerGrant } from './session-grant.js';
+import {
+  grantRecordByName,
+  jwtAccessGrantGate,
+  resolveGrantByName,
+  runWithGrant,
+  staticBearerGrant,
+  tokenPredatesGrant,
+} from './session-grant.js';
 
 export { DEFAULT_PUBLIC_MCP_HOST, publicMcpHost };
 
@@ -207,7 +214,18 @@ async function dispatchHttp(req: IncomingMessage, res: ServerResponse): Promise<
 
   const token = providedBearer(req);
   const jwt = isJwtAccessToken(token);
-  const grantName = jwt ? accessGrantName(token) : undefined;
+  const verified = jwt ? verifyJwt(token) : null;
+  const grantName =
+    verified && typeof verified.gname === 'string' && verified.gname.trim() ? verified.gname.trim() : undefined;
+  if (jwt && grantName) {
+    const rec = grantRecordByName(grantName);
+    const iat = Number(verified?.iat);
+    // Removed gname, or iat before that grant's notBefore: nothing is served.
+    if (!rec || tokenPredatesGrant(iat, rec)) {
+      unauthorized(res);
+      return;
+    }
+  }
   const tokenGrant = grantName ? resolveGrantByName(grantName) : null;
   // Fail at the HTTP gate when enforced JWT lacks a resolvable gname — see docs/internals.md (session grants).
   const gate = jwt ? jwtAccessGrantGate(grantName, tokenGrant) : null;

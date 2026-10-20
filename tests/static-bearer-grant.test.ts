@@ -10,7 +10,7 @@ import path from 'node:path';
 
 const TOKEN = 'mcp-test-token-not-secret';
 const PUBLIC_HOST = 'google-multi-mcp-test.a.run.app';
-const PBG3_CODE = 'test-code-pbg3-not-prod';
+const PBG3_CODE = 'test-code-pbg3-not-prod-ok';
 const OUTSIDERS = ['personal', 'opcenter', 'buildcoin', 'usa-house', 'olga'];
 const ALL = ['personal', 'stromback', 'opcenter', 'buildcoin', 'usa-house', 'olga'];
 
