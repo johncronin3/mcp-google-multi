@@ -191,6 +191,19 @@ describe('SB2 wall: paths that skip fan-out', () => {
     expect(getClient).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
     expect(minted).toEqual([]);
+
+    const diagnosed = buildListed();
+    await runWithGrant(null, async () => {
+      const report = JSON.parse((await diagnosed.call('diagnose')).content[0].text) as { error?: string };
+      expect(report.error).toBe('grant_required');
+      const blob = JSON.stringify(report);
+      for (const alias of EVERY_ALIAS) {
+        expect(blob, alias).not.toContain(alias);
+      }
+      expect(blob).not.toContain('@');
+    });
+    expect(diagnosed.getClient).not.toHaveBeenCalled();
+    expect(diagnosed.tokenReads).toEqual([]);
   });
 
   function buildListed() {

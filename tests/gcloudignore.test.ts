@@ -14,7 +14,40 @@ import { describe, expect, it } from 'vitest';
 
 const ROOT = process.cwd();
 const ROOT_ALLOW = ['Dockerfile', 'package.json', 'package-lock.json', 'tsconfig.json', 'docker/entrypoint.sh'];
-const PROBES = ['bin/loose.mjs', 'scripts/measure-tools.mjs', 'loose.mjs', 'src/loose.mjs'];
+const PROBES = [
+  'bin/loose.mjs',
+  'scripts/measure-tools.mjs',
+  'loose.mjs',
+  'src/loose.mjs',
+  'src/.env',
+  'src/.env.local',
+  'src/nested/.env.production',
+  'src/stromback.enc',
+  'src/tokens/olga.enc',
+  'src/master.key',
+  'src/keys/id_rsa',
+  'src/keys/id_rsa.pub',
+  'src/keys/client.pem',
+  'src/keys/client.key',
+  'src/keys/client.p12',
+  'src/keys/client.pfx',
+  'src/keys/refresh.token',
+  'src/credentials.json',
+  'src/gcp-credentials.json',
+  'src/mcp-tokens.enc',
+];
+
+/** Patterns re-excluded after !/src/**. Must not match source named *token* or master-key.ts. */
+function excludedSrcSecret(rel: string): boolean {
+  if (!rel.startsWith('src/')) return false;
+  const name = rel.slice(rel.lastIndexOf('/') + 1);
+  if (name.startsWith('.env')) return true;
+  if (/\.(enc|pem|key|p12|pfx|token)$/.test(name)) return true;
+  if (name === 'master.key' || name === 'id_rsa' || name.startsWith('id_rsa.')) return true;
+  if (name === 'credentials.json' || name === 'mcp-tokens.enc') return true;
+  if (name.includes('credentials') && name.endsWith('.json')) return true;
+  return false;
+}
 
 function walk(dir: string, base = dir): string[] {
   const out: string[] = [];
@@ -82,9 +115,12 @@ describe('.gcloudignore upload set', () => {
     const { uploaded, excluded } = uploadSet(files);
     const expected = [
       ...ROOT_ALLOW,
-      ...files.filter((rel) => rel.startsWith('src/') && !rel.endsWith('.mjs')),
+      ...files.filter((rel) => rel.startsWith('src/') && !rel.endsWith('.mjs') && !excludedSrcSecret(rel)),
     ].sort();
     expect(uploaded.sort()).toEqual(expected);
+    for (const rel of ['src/token-store.ts', 'src/mcp-token.ts', 'src/master-key.ts', 'src/http.ts']) {
+      expect(uploaded, rel).toContain(rel);
+    }
     expect(uploaded.some((rel) => rel === 'bin' || rel.startsWith('bin/'))).toBe(false);
     expect(uploaded.some((rel) => rel.endsWith('.mjs'))).toBe(false);
     for (const rel of [...PROBES, 'docs/hosted-mcp.md', 'grants.example.json', 'node_modules']) {

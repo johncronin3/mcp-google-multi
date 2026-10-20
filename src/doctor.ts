@@ -15,7 +15,7 @@ import { apiProbeDepsFor, probeApiEnablement } from './api-probe.js';
 import { safeMessage, stringifyEnvelope } from './tools/_errors.js';
 import { resolveHttpConfig, HttpConfigError, type HttpConfig } from './http-config.js';
 import { parseOwnerEmails } from './http-transport.js';
-import { aliasesVisibleToSession, isGrantEnforced } from './session-grant.js';
+import { aliasesVisibleToSession, allowedAccounts, isGrantEnforced, missingGrantResult } from './session-grant.js';
 
 // B9: one engine (runDiagnostics), two skins — `doctor` (CLI glyph) and
 // `diagnose` (agent tool, structured). Sections 1-6 here; section 7 (HTTP:
@@ -534,6 +534,15 @@ export function registerDiagnoseTool(registry: ToolRegistry, ctx?: DiagnoseConte
     },
     async () => {
       try {
+        // Empty intersection with a real grant is an empty report. No grant
+        // is grant_required — same envelope as account_list.
+        if (isGrantEnforced()) {
+          try {
+            allowedAccounts();
+          } catch {
+            return missingGrantResult();
+          }
+        }
         const scoped: DiagnosticsDeps = {
           ...deps,
           accountSet: () => grantScopedAccountSet(deps.accountSet()),

@@ -23,7 +23,7 @@ Grok.com Custom connectors **always** ask for OAuth client/endpoints. They do no
 Bearer. Without `/.well-known/oauth-authorization-server`, DCR `/oauth/register`, `/oauth/authorize`,
 and `/oauth/token`, Grok storms `POST /mcp` → Cloud Run **429 no available instance**.
 
-CLI / Hermes still send `Authorization: Bearer <MCP_HTTP_TOKEN>` (layer 2, no OAuth).
+CLI / Hermes still send `Authorization: Bearer <MCP_HTTP_TOKEN>` (layer 2, no OAuth). With grants enforced, that static bearer is grantless unless `MCP_HTTP_TOKEN_GRANT` names a grant. The variable is off by default and is not set in deploy config.
 
 ## Endpoints to implement
 
@@ -44,9 +44,12 @@ Claim `gname` is the session grant **name** (layer 3). Never put grant codes or 
 
 On each `/mcp` request, if the Bearer is a JWT, restore the grant with `resolveGrantByName(gname)`
 into `AsyncLocalStorage`. When grants are enforced, a JWT missing or unknown `gname` is rejected
-at the `/mcp` gate (HTTP 403) — do not wait for a tool to fail. In-process `set_grant` is for
-stdio/CLI only; on hosted (`MCP_HOSTED` / `K_SERVICE`) the tool refuses and tells you to bind
-the grant on `/oauth/authorize`. Codes never go in the JWT.
+at the `/mcp` gate (HTTP 403) — do not wait for a tool to fail. A static bearer is wrapped in
+`runWithGrant(staticBearerGrant())`: `MCP_HTTP_TOKEN_GRANT` is an optional grant name, resolved
+on every request; unset or unknown is null and fails closed. It does not use in-process
+`set_grant` or `GOOGLE_GRANT_CODE`. On hosted (`MCP_HOSTED` / `K_SERVICE`) `activeGrant()` is
+only that request grant or null, and `set_grant` refuses. Stdio/CLI still calls `set_grant`.
+Codes never go in the JWT.
 
 ## Hosted must not
 
