@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import type { ToolRegistry } from '../registry.js';
 import { getAccountSet, invalidateAccountSet, refreshAccountSetIfStale } from '../accounts.js';
 import { allowedAccounts, isGrantEnforced } from '../session-grant.js';
+import { isHostedConfigSurface } from '../hosted.js';
 import { ALIAS_RE, mutateConfigFile } from '../config-file.js';
 import { writeToken } from '../token-store.js';
 import { resolveScopesForAccount } from '../auth.js';
@@ -551,10 +552,14 @@ export function registerAccountWizardTools(
           const instr = renderInstruction(client, name, entry);
           if (client.managed === 'cli') {
             blocks.push(`${client.label}: run\n  ${instr.text}`);
-          } else if (a.write && mode === 'http') {
-            // Over HTTP this runs on the daemon, not the caller's machine: write:true
-            // would edit the operator's own client configs (a tenancy hazard), so snippet only.
-            blocks.push(`${client.label}: write:true is ignored over HTTP — this tool runs on the server, not your machine. Add to ${instr.path}\n${instr.text}`);
+          } else if (a.write && (mode === 'http' || isHostedConfigSurface())) {
+            // Over HTTP, or on Cloud Run (K_SERVICE / the grants mount) even when
+            // MCP_TRANSPORT is unset: write:true would edit the server's own
+            // client configs, so snippet only.
+            const why = mode === 'http'
+              ? 'write:true is ignored over HTTP — this tool runs on the server, not your machine.'
+              : 'write:true is ignored on a hosted server — this tool runs on the server, not your machine.';
+            blocks.push(`${client.label}: ${why} Add to ${instr.path}\n${instr.text}`);
           } else if (a.write) {
             const res = applyFileEntry(client, name, entry);
             blocks.push(

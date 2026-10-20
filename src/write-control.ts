@@ -131,17 +131,17 @@ export function privilegeOf(tool: ToolRef): PrivilegeKind | undefined {
 }
 
 /**
- * Moves to Trash. Named, not matched by a "trash" suffix, so `drive_empty_trash`
- * and `drive_transfer`'s synthetic move ref never qualify. No profile permits
- * these: upstream #299 opened them under safe-writes, and this house build
- * keeps the pre-merge denial under every profile. Opt in per tool with an
- * allow glob that matches `service:op` (`gmail:trash`), not the delete class.
- * See docs/internals.md.
+ * Moves to Trash, plus emptying it. Named, not matched by a "trash" suffix, so
+ * `drive_transfer`'s synthetic move ref never qualifies. No profile permits
+ * these. Opt in per tool with an allow glob that matches `service:op`
+ * (`gmail:trash`, `drive:empty_trash`). A `*trash` glob matches a move to
+ * Trash and does not match emptying it. See docs/internals.md.
  */
 const TRASH_MOVE_TOOLS = new Set([
   'gmail_trash',
   'drive_trash',
   'gmail_users_threads_trash',
+  'drive_empty_trash',
 ]);
 
 export function isTrashMove(tool: { name: string }): boolean {
@@ -151,7 +151,12 @@ export function isTrashMove(tool: { name: string }): boolean {
 /** True only when an allow glob matches this tool's own operation, not `service:delete`. */
 function trashExplicitlyAllowed(tool: ToolRef, policy: Policy): boolean {
   const op = `${tool.service}:${opOf(tool)}`;
-  return policy.allow.some((g) => globToRegExp(g).test(op));
+  return policy.allow.some((g) => {
+    if (!globToRegExp(g).test(op)) return false;
+    // `*trash` matches `drive:empty_trash` only because the op ends in "trash".
+    if (op.endsWith(':empty_trash') && !g.includes('empty_trash')) return false;
+    return true;
+  });
 }
 
 function profileAllows(profile: Profile, tool: ToolRef): boolean {

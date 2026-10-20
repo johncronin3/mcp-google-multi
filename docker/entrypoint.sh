@@ -10,4 +10,6 @@ export TOKEN_STORE_PATH=/tmp/google-tokens
 if [ -z "${GOOGLE_GRANTS_PATH:-}" ] && [ -f /mnt/grants/grants.json ]; then
   export GOOGLE_GRANTS_PATH=/mnt/grants/grants.json
 fi
+# House Cloud Run does not set this. Without it, account_write_config treats the process as stdio.
+export MCP_TRANSPORT=http
 exec node dist/http.js

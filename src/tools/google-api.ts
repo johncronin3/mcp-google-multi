@@ -18,6 +18,7 @@ import {
   MAX_SEARCH_QUERY,
 } from '../discovery-client.js';
 import { hints } from '../hint-provider.js';
+import { refusedAccountResult } from '../session-grant.js';
 
 
 // Policy/toolset namespace for each API alias must match the NAMED tools' service
@@ -196,6 +197,8 @@ export function registerEscapeTools(registry: ToolRegistry, policy: Policy, deps
       _meta: { 'anthropic/maxResultSizeChars': 100_000 },
     },
     async ({ account, api, methodId, pathParams, queryParams, body }) => {
+      const refused = refusedAccountResult(account);
+      if (refused) return refused;
       const resolved = resolveApiAliases(api as string);
       if (!resolved) {
         return jsonResult({ error: 'unknown_api', message: `Unknown api "${api}".`, hint: `Known APIs: ${apiList}`, retriable: false, account }, true);

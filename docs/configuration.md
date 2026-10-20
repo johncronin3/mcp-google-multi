@@ -178,7 +178,7 @@ The rule is derived from each method's declared scopes and name, not from a hand
 
 ### Trash stays denied under every profile
 
-`gmail_trash`, `drive_trash`, and `gmail_users_threads_trash` move an item to Trash. Upstream safe-writes treats that as an ordinary write. This hosted build does not: no profile (`read-only`, `safe-writes`, or `full-writes`) permits them. Opt in to one tool with an allow glob that matches its operation, for example `GOOGLE_WRITE_ALLOW="gmail:trash"`. A delete-class pattern such as `gmail:delete` does not open Trash. `GOOGLE_WRITE_DENY` still wins over that allow. Untrash (`drive_untrash` and the generated Gmail untrash twins) is an update, so `safe-writes` still allows it. Emptying Trash, a permanent delete, and `drive_transfer`'s `move` flag stay refused under `safe-writes`.
+`gmail_trash`, `drive_trash`, `gmail_users_threads_trash`, and `drive_empty_trash` are refused under every profile (`read-only`, `safe-writes`, and `full-writes`). Opt in to one tool with an allow glob that matches its operation, for example `GOOGLE_WRITE_ALLOW="gmail:trash"` or `GOOGLE_WRITE_ALLOW="drive:empty_trash"`. A delete-class pattern such as `gmail:delete` does not open Trash. A `*trash` pattern opens a move to Trash and does not open `drive_empty_trash`. `GOOGLE_WRITE_DENY` still wins over that allow. Untrash (`drive_untrash` and the generated Gmail untrash twins) is an update, so `safe-writes` still allows it. `drive_transfer`'s `move` flag stays a delete.
 
 ## Services
 

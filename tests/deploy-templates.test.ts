@@ -62,6 +62,12 @@ describe('Render blueprint — security invariants', () => {
   });
 });
 
+describe('Cloud Run entrypoint', () => {
+  it('sets MCP_TRANSPORT=http so a hosted process is not treated as stdio', () => {
+    expect(read('docker/entrypoint.sh')).toMatch(/^export MCP_TRANSPORT=http$/m);
+  });
+});
+
 describe('Railway config', () => {
   const railway = read('railway.toml');
 

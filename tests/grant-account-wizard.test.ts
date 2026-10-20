@@ -16,6 +16,18 @@ import {
 import { registerAccountWizardTools, setWizardHttpConsent } from '../src/tools/account-wizard.js';
 import type { ToolRegistry } from '../src/registry.js';
 
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    existsSync(p: Parameters<typeof actual.existsSync>[0]) {
+      const s = String(p);
+      if (process.env.TEST_GRANTS_MOUNT === '1' && (s === '/mnt/grants' || s === '/mnt/grants/grants.json')) return true;
+      return actual.existsSync(p);
+    },
+  };
+});
+
 vi.mock('../src/client-config.js', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../src/client-config.js')>();
   return {
@@ -59,6 +71,7 @@ const ENV_KEYS = [
   'MCP_PUBLIC_URL',
   'MCP_HOSTED',
   'K_SERVICE',
+  'TEST_GRANTS_MOUNT',
 ] as const;
 
 function grantFile(dir: string): string {
@@ -108,7 +121,7 @@ describe('account wizard grant boundary', () => {
     vi.clearAllMocks();
   });
 
-  function activate(opts: { enforce?: 'unset' | 'false' }): SessionGrantState[] {
+  function activate(opts: { enforce?: 'unset' | 'false'; surface?: 'k_service' | 'desk' }): SessionGrantState[] {
     dir = mkdtempSync(path.join(tmpdir(), 'gmulti-grant-wizard-'));
     for (const key of ENV_KEYS) saved[key] = process.env[key];
     armed = true;
@@ -116,11 +129,15 @@ describe('account wizard grant boundary', () => {
     delete process.env.GOOGLE_GRANT_CODE;
     delete process.env.MCP_TRANSPORT;
     delete process.env.MCP_PUBLIC_URL;
+    delete process.env.MCP_HOSTED;
+    delete process.env.K_SERVICE;
     process.env.GOOGLE_CLIENT_ID = 'wizard-test-id';
     process.env.GOOGLE_CLIENT_SECRET = 'wizard-test-secret';
     process.env.GOOGLE_GRANTS_PATH = grantFile(dir);
-    process.env.MCP_HOSTED = '1';
-    process.env.K_SERVICE = 'google-multi-mcp';
+    if (opts.surface !== 'desk') {
+      process.env.MCP_HOSTED = '1';
+      process.env.K_SERVICE = 'google-multi-mcp';
+    }
     if (opts.enforce === 'false') process.env.GOOGLE_GRANTS_ENFORCE = 'false';
     else delete process.env.GOOGLE_GRANTS_ENFORCE;
     writeFileSync(
@@ -192,13 +209,34 @@ describe('account wizard grant boundary', () => {
       }
       const config = await handlers.account_write_config({ write: true, client: 'claude-desktop' });
       expect(config.isError).toBeUndefined();
-      expect(config.content[0].text).not.toContain('account_outside_grant');
-      expect(applyFileEntry).toHaveBeenCalledTimes(1);
+      expect(config.content[0].text).toContain('ignored on a hosted server');
+      expect(applyFileEntry).not.toHaveBeenCalled();
     });
     expect(minted).toEqual([...PBG3]);
 
     const stored = JSON.parse(readFileSync(configFilePath(), 'utf8')) as { accounts: Record<string, unknown> };
     expect(Object.keys(stored.accounts).sort()).toEqual([...PBG3].sort());
+  });
+
+  it('a full grant on a desk still writes client config', async () => {
+    const [pbg3] = activate({ enforce: 'unset', surface: 'desk' });
+    const handlers = captureHandlers();
+    await runWithGrant(pbg3, async () => {
+      const config = await handlers.account_write_config({ write: true, client: 'claude-desktop' });
+      expect(config.isError).toBeUndefined();
+      expect(applyFileEntry).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('the grants mount alone refuses account_write_config when K_SERVICE is unset', async () => {
+    const [pbg3] = activate({ enforce: 'unset', surface: 'desk' });
+    process.env.TEST_GRANTS_MOUNT = '1';
+    const handlers = captureHandlers();
+    await runWithGrant(pbg3, async () => {
+      const config = await handlers.account_write_config({ write: true, client: 'claude-desktop' });
+      expect(config.content[0].text).toContain('ignored on a hosted server');
+      expect(applyFileEntry).not.toHaveBeenCalled();
+    });
   });
 
   it('GOOGLE_GRANTS_ENFORCE=false is the off switch, including on a hosted process', async () => {

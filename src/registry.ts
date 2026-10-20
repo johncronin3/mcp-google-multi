@@ -10,6 +10,7 @@ import type { Metrics } from './usage-metrics.js';
 import { MAX_SUGGESTED_KEYS, suggestKeys } from './arg-strict.js';
 import { classifyScope } from './scope-observability.js';
 import { hints } from './hint-provider.js';
+import { aliasesForHint, grantRefusalForCallArgs, missingGrantResult, usableDefaultAlias } from './session-grant.js';
 
 /** Nothing granted, no profile: asks the BUNDLE CATALOG whether a scope is
  * reachable at all, independently of any account. */
@@ -295,39 +296,50 @@ export class ToolRegistry {
                     // Concrete by here: default-account injection wraps this.
                     (args[0] as { account?: unknown } | undefined)?.account as string | undefined,
                   );
+      // Out-of-grant aliases never reach a handler, so getClient is not called.
+      // Fan-out's "*" is resolved later against allowedAccounts().
+      const gate = (...args: unknown[]) => {
+        const blocked = grantRefusalForCallArgs(args[0]);
+        if (blocked) return blocked;
+        return guarded(...args);
+      };
+      const noDefaultResult = () => {
+        const accountSet = this.accounts();
+        const listed = aliasesForHint(accountSet.aliases);
+        if (listed === 'missing_grant') return missingGrantResult();
+        const accounts = listed.map((alias) => ({ alias, email: accountSet.configs[alias]?.email ?? '' }));
+        const rendered = hints()?.render({ kind: 'no_default_account', accounts });
+        const pairs = accounts.map((a) => `${a.alias}=${a.email}`).join(', ');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                error: 'E_NO_DEFAULT_ACCOUNT',
+                message: 'No "account" given and no default account is configured.',
+                hint: rendered?.hint ?? `Pass account explicitly (valid: ${pairs}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
+                retriable: false,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      };
       // The ONE default-account injection site, outside the CUD gate and the
       // fan-out parse (not meta-skipped, which is what covers google_api_call).
       const withDefault = !hasAccountField
-        ? guarded
+        ? gate
         : (...args: unknown[]) => {
             const first = args[0] as { account?: unknown } | undefined;
             const value = first?.account;
-            if (value != null && value !== '') return guarded(...args);
+            if (value != null && value !== '') return gate(...args);
             // Refresh here, or a client that always omits account never heals
             // the unset->configured default transition (getClient's probe is unreached).
             refreshAccountSetIfStale();
-            const def = this.accounts().defaultAccount;
-            if (!def) {
-              const accountSet = this.accounts();
-              const accounts = accountSet.aliases.map((alias) => ({ alias, email: accountSet.configs[alias]?.email ?? '' }));
-              const rendered = hints()?.render({ kind: 'no_default_account', accounts });
-              const pairs = accounts.map((a) => `${a.alias}=${a.email}`).join(', ');
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: JSON.stringify({
-                      error: 'E_NO_DEFAULT_ACCOUNT',
-                      message: 'No "account" given and no default account is configured.',
-                      hint: rendered?.hint ?? `Pass account explicitly (valid: ${pairs}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
-                      retriable: false,
-                    }),
-                  },
-                ],
-                isError: true,
-              };
-            }
-            return guarded({ ...(first ?? {}), account: def }, ...args.slice(1));
+            const def = usableDefaultAlias(this.accounts().defaultAccount);
+            if (def === 'missing_grant') return missingGrantResult();
+            if (!def) return noDefaultResult();
+            return gate({ ...(first ?? {}), account: def }, ...args.slice(1));
           };
       const finalHandler = this.compactOutput
         ? async (...args: unknown[]) => compactResult(await (withDefault(...args) as Promise<Parameters<typeof compactResult>[0]>))
