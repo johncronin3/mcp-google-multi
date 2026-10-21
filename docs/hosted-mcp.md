@@ -124,7 +124,7 @@ Grant **codes** stay in host-local `grants.json`. Names `Personal Brain Grant 3`
 
 ## Per-call audit log
 
-On the hosted server (`MCP_HOSTED` / `K_SERVICE`), every `tools/call` writes one JSON line to stderr. Fields, and only these: `grant` (the grant **name**), `accounts` (alias list from `account` / `fromAccount` / `toAccount`), `tool`, `outcome` (`allowed`, `denied:<slug>`, or `error:<class>`), `timestamp`. Arguments, message bodies, subjects, recipients, file names, ids, tokens, and grant codes are not written.
+On the hosted server (`MCP_HOSTED` / `K_SERVICE`), every `tools/call` writes one JSON line to stderr. Fields, and only these: `grant` (the grant **name**), `accounts` (configured aliases from `account` / `fromAccount` / `toAccount`, plus `*`; any other alias-shaped token is the first 8 hex chars of its SHA-256), `tool`, `outcome` (`allowed`, `denied:<known slug>`, `error:<known class>`, or `error:unclassified`), `timestamp`. Arguments, message bodies, subjects, recipients, file names, ids, tokens, and grant codes are not written. A failed log write is reported as `audit log write failed` and does not change the tool result.
 
 ## Copy to the next server
 

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { McpServer } from '@modelcontextprotocol/server';
 import { invalidateAccountSet } from '../src/accounts.js';
@@ -160,6 +161,10 @@ describe('hosted tools/call audit log', () => {
   });
 
   it('keeps an allowed call to the same five fields', async () => {
+    for (const key of ENV_KEYS) saved[key] = process.env[key];
+    armed = true;
+    process.env.GOOGLE_ACCOUNTS = 'stromback:stromback@example.com,personal:personal@example.com';
+    invalidateAccountSet();
     const chunks: string[] = [];
     const write = process.stderr.write.bind(process.stderr);
     process.stderr.write = ((chunk: string | Uint8Array) => {
@@ -196,5 +201,73 @@ describe('hosted tools/call audit log', () => {
       isError: true,
       content: [{ type: 'text', text: `not json ${BODY}` }],
     })).toBe('error:unclassified');
+    const unknown = 'pasted_error_class_canary';
+    expect(outcomeOf({
+      isError: true,
+      content: [{ type: 'text', text: JSON.stringify({ error: unknown, message: BODY }) }],
+    })).toBe('error:unclassified');
+    expect(outcomeOf({
+      isError: true,
+      content: [{ type: 'text', text: JSON.stringify({ error: 'auth_required', message: BODY }) }],
+    })).toBe('error:auth_required');
+  });
+
+  it('replaces a pasted code in account fields with sha8', async () => {
+    for (const key of ENV_KEYS) saved[key] = process.env[key];
+    armed = true;
+    process.env.GOOGLE_ACCOUNTS = `stromback:${ACCOUNT_EMAIL}`;
+    invalidateAccountSet();
+    const pasted = 'pasted-grant-code-canary';
+    const digest = createHash('sha256').update(pasted, 'utf8').digest('hex').slice(0, 8);
+    const chunks: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await auditToolCall('drive_transfer', {
+        account: pasted,
+        fromAccount: pasted,
+        toAccount: `stromback,${pasted}`,
+        fileId: FILE_ID,
+      }, () => ({ content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }] }));
+    } finally {
+      process.stderr.write = write;
+    }
+    const flat = chunks.join('');
+    const [row] = parseAudit(flat);
+    expect(row.accounts).toEqual([digest, 'stromback']);
+    expect(flat).not.toContain(pasted);
+    expect(flat).not.toContain(FILE_ID);
+  });
+
+  it('returns the tool result when the audit write fails', async () => {
+    const payload = { ok: true, body: BODY };
+    let runs = 0;
+    const chunks: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    let failed = false;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+      if (!failed) {
+        failed = true;
+        throw new Error(BODY);
+      }
+      chunks.push(text);
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const result = await auditToolCall('gmail_search', { account: 'stromback', q: BODY }, () => {
+        runs += 1;
+        return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
+      });
+      expect(runs).toBe(1);
+      expect(result).toEqual({ content: [{ type: 'text', text: JSON.stringify(payload) }] });
+    } finally {
+      process.stderr.write = write;
+    }
+    expect(chunks).toEqual(['audit log write failed\n']);
+    expect(chunks.join('')).not.toContain(BODY);
   });
 });

@@ -1,4 +1,7 @@
+import { createHash } from 'node:crypto';
+import { getAccountSet } from './accounts.js';
 import { activeGrant } from './session-grant.js';
+import { KNOWN_ERROR_SLUGS } from './usage-metrics.js';
 
 /** Alias shape only. An email, file id, or other argument must not qualify. */
 const ALIAS_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -23,17 +26,32 @@ export interface AuditRecord {
   timestamp: string;
 }
 
-/** Aliases named by the call. Drops anything that is not an alias or `*`. */
+function sha8(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 8);
+}
+
+function configuredAliases(): ReadonlySet<string> {
+  try {
+    return new Set(getAccountSet().aliases);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Configured aliases and `*`. Any other alias-shaped token is sha8, never the raw value. */
 export function auditAccounts(args: unknown): string[] {
   if (!args || typeof args !== 'object') return [];
   const rec = args as Record<string, unknown>;
+  const known = configuredAliases();
   const out: string[] = [];
   for (const key of ACCOUNT_KEYS) {
     const value = rec[key];
     if (typeof value !== 'string') continue;
     for (const part of value.split(',')) {
       const alias = part.trim();
-      if (alias === '*' || ALIAS_RE.test(alias)) out.push(alias);
+      if (!alias) continue;
+      if (alias === '*' || known.has(alias)) out.push(alias);
+      else if (ALIAS_RE.test(alias)) out.push(sha8(alias));
     }
   }
   return [...new Set(out)];
@@ -62,7 +80,7 @@ export function outcomeOf(result: unknown): string {
   const isError = Boolean(result && typeof result === 'object' && (result as { isError?: boolean }).isError === true);
   if (!isError) return 'allowed';
   const slug = slugOf(textOf(result));
-  if (!slug) return 'error:unclassified';
+  if (!slug || !KNOWN_ERROR_SLUGS.has(slug)) return 'error:unclassified';
   return DENIED_SLUGS.has(slug) ? `denied:${slug}` : `error:${slug}`;
 }
 
@@ -89,14 +107,27 @@ function emit(record: AuditRecord): void {
   process.stderr.write(`${JSON.stringify(record)}\n`);
 }
 
-/** One stderr line per hosted tools/call. Re-throws after logging a thrown error. */
+/** The tool result is already decided. A log failure must not carry args or the record. */
+function writeAudit(record: AuditRecord): void {
+  try {
+    emit(record);
+  } catch {
+    try {
+      process.stderr.write('audit log write failed\n');
+    } catch {
+      // Deliver the tool result either way.
+    }
+  }
+}
+
+/** One stderr line per hosted tools/call. Re-throws after logging a thrown tool error. */
 export async function auditToolCall(tool: string, args: unknown, run: () => unknown): Promise<unknown> {
   try {
     const result = await run();
-    emit(auditRecord(tool, args, outcomeOf(result)));
+    writeAudit(auditRecord(tool, args, outcomeOf(result)));
     return result;
   } catch (err) {
-    emit(auditRecord(tool, args, `error:${errorClass(err)}`));
+    writeAudit(auditRecord(tool, args, `error:${errorClass(err)}`));
     throw err;
   }
 }
