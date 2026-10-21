@@ -101,6 +101,10 @@ The seam also owns one **outbound** job (`withValidationEnvelope`). The SDK vali
 
 ## HTTP transport
 
+### Dispatch is per-request and stateless, so a mid-call server request cannot be delivered (`elicitConfirmation`, `src/registry.ts`)
+
+Every house `/mcp` POST builds a fresh server and transport (`sessionIdGenerator` unset). Nothing about the transport survives between requests, so there is no channel for the server to push an `elicitation/create` mid-call and later read the client's reply. `ToolRegistry.elicitConfirmation` therefore refuses outright whenever `policy.transport === 'http'`, before ever calling `elicitInput`. stdio keeps one connection open for the whole call and still attempts a real elicitation. This is not a grant bypass: the session grant is checked before the ask.
+
 ### House connect-time curated list (`connectTimeDiscoveryMode`, `src/registry.ts`)
 
 House Streamable HTTP (`src/http.ts`) builds a fresh `McpServer` per `/mcp` request (`sessionIdGenerator` unset). `notifications/tools/list_changed` has no session to land on, and Grok Bot binds `tools/list` once at connect. With the stdio default (`lazy`), `gmail_send` and `drive_upload` stay registered and show up inside `discover_all` / `drive_discover` results, but they are absent from the snapshot Grok will call. `buildGoogleMcpServer` therefore passes `connectTimeDiscoveryMode()`: unset, `lazy`, and `curated` all advertise non-generated tools on that first list; `eager` still advertises the generated long tail. Stdio keeps `resolveDiscoveryMode()`. Bakissation `MCP_TRANSPORT=http` already forced `curated` for the same stateless reason. Listing is not a grant or a write-control bypass.
