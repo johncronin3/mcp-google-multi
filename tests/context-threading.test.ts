@@ -361,6 +361,27 @@ describe('the owner context keeps the single-owner surface', () => {
   });
 });
 
+describe('GOOGLE_LOCAL_FILES=off removes the host-file surface even from the owner', () => {
+  const prior = process.env.GOOGLE_LOCAL_FILES;
+  afterEach(() => {
+    if (prior === undefined) delete process.env.GOOGLE_LOCAL_FILES;
+    else process.env.GOOGLE_LOCAL_FILES = prior;
+  });
+
+  it('drops every host-file tool and the localPath/attachments params', () => {
+    process.env.GOOGLE_LOCAL_FILES = 'off';
+    const ctx = buildIdentityContext({} as NodeJS.ProcessEnv);
+    expect(isOwnerContext(ctx)).toBe(true);
+    const { server, handlers, schemas } = fakeServer();
+    buildRegistry(server as never, ctx, 'eager');
+    for (const name of HOST_FILE_TOOLS) expect(handlers[name], name).toBeUndefined();
+    expect(schemas.drive_update).not.toHaveProperty('localPath');
+    // House drive_upload has no inline-bytes source, so the whole tool is a
+    // host-file tool and is unregistered when GOOGLE_LOCAL_FILES=off.
+    expect(schemas.drive_upload).toBeUndefined();
+  });
+});
+
 describe('requestHooksFor binds the per-request hooks to one registry', () => {
   it('names the context default account and screens against its registry', () => {
     const { server } = fakeServer();

@@ -9,19 +9,20 @@ export interface Policy {
   allow: string[];
   deny: string[];
   /**
-   * B14 reserved seam (cc-write-control "HTTP posture", LOCKED to OQ-5
-   * "annotations only"): the dispatch transport is threaded into the resolved
-   * policy for the EE/future seam, but in v6 alpha it does NOT stiffen the
-   * profile or alter any `isAllowed` verdict. "Stricter on HTTP" is achieved
-   * entirely by the `anthropic/requiresUserInteraction` annotation on the
-   * irreversible set (A12), emitted identically on both transports.
+   * The dispatch transport, threaded into the resolved policy. Never
+   * alters `isAllowed`'s verdict or the profile itself: a curated tool's
+   * allow/deny/profile gate is identical on both transports. It DOES
+   * alter the escape hatch's ask step (`ToolRegistry.elicitConfirmation`,
+   * `src/registry.ts`): over HTTP, a write that would otherwise ask a
+   * human is refused instead, since the stateless HTTP transport cannot
+   * deliver the mid-call confirmation request (see docs/internals.md).
    * Optional so existing Policy literals (codegen/tests) need no change;
    * resolvePolicy always populates it.
    */
   transport?: Transport;
 }
 
-interface ToolRef {
+export interface ToolRef {
   name: string;
   service: string;
   cud: Cud;
@@ -114,8 +115,11 @@ const PRIVILEGED_SCOPE_RE =
   /\/auth\/(admin\.directory|admin\.datatransfer|cloud-identity|apps\.licensing|apps\.order|apps\.groups\.settings|apps\.groups\.migration|ediscovery|script\.projects|script\.deployments)/;
 
 /** Registering a push channel hands this account's activity to an external URL.
- * It is shaped like a create and behaves like an export, so the verb hides it. */
-const PUSH_REGISTRATION_RE = /(_watch|_subscriptions_create|_subscriptions_reactivate)$/;
+ * It is shaped like a create and behaves like an export, so the verb hides it.
+ * forms.forms.watches.create/renew generate as _watches_create/_watches_renew
+ * (plural "watches", unlike every other API's singular *.watch), so they
+ * need their own branch alongside the common _watch suffix. */
+const PUSH_REGISTRATION_RE = /(_watch|_watches_create|_watches_renew|_subscriptions_create|_subscriptions_reactivate)$/;
 
 export type PrivilegeKind = 'push_registration' | 'privileged_scope';
 
@@ -167,6 +171,43 @@ export function isAllowed(tool: ToolRef, policy: Policy): boolean {
   if (isTrashMove(tool)) return trashExplicitlyAllowed(tool, policy);
   if (matchesAny(tool, policy.allow)) return true;
   return profileAllows(policy.profile, tool);
+}
+
+export type EscapeHatchDecision = 'allow' | 'deny' | 'ask';
+
+export interface EscapeHatchVerdict {
+  decision: EscapeHatchDecision;
+  /** The ref that explains the verdict: the specific name a deny glob
+   * matched, or `primaryName` for every other case. */
+  ref: ToolRef;
+}
+
+/**
+ * The escape hatch (google_api_call and every generated per-method tool)
+ * has no allow-list or privileged-write special case of its own anymore:
+ * an explicit deny on any name the operation is known by still wins
+ * (narrows what gets through, never widens it, so listing every curated
+ * tool sharing a raw method here is always safe); full-writes with the
+ * outbound allowlist off is the only automatic allow; everything else
+ * (the default profile, safe-writes, any allow list set, or full-writes
+ * with the allowlist on) asks a human via elicitation instead of
+ * resolving the question itself.
+ */
+export function escapeHatchVerdict(
+  denyNames: readonly string[],
+  base: { service: string; cud: Cud; scopes?: readonly string[] },
+  primaryName: string,
+  policy: Policy,
+  outboundAllowlistActive: boolean,
+): EscapeHatchVerdict {
+  const primaryRef: ToolRef = { name: primaryName, service: base.service, cud: base.cud, scopes: base.scopes };
+  if (base.cud === 'read') return { decision: 'allow', ref: primaryRef };
+  if (policy.readOnly) return { decision: 'deny', ref: primaryRef };
+  const denyRefs = denyNames.map((name): ToolRef => ({ name, service: base.service, cud: base.cud, scopes: base.scopes }));
+  const deniedRef = denyRefs.find((ref) => matchesAny(ref, policy.deny));
+  if (deniedRef) return { decision: 'deny', ref: deniedRef };
+  if (policy.profile === 'full-writes' && !outboundAllowlistActive) return { decision: 'allow', ref: primaryRef };
+  return { decision: 'ask', ref: primaryRef };
 }
 
 /** Which profiles would permit this tool at all. */

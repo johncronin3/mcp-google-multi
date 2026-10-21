@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -7,8 +7,9 @@ import path from 'node:path';
 process.env.GOOGLE_ACCOUNTS ||= 'test:test@example.com';
 // Sandbox EVERY module-load filesystem side effect away from the real home:
 // the first-run shim materializes config.json into XDG_CONFIG_HOME, and the
-// env loader reads an .env tier from there.
-process.env.XDG_CONFIG_HOME = mkdtempSync(path.join(tmpdir(), 'mcp-gm-test-xdg-'));
+// env loader reads an .env tier from there. realpath so GOOGLE_LOCAL_FILES_DIR
+// (pinned to tmpdir below) and this XDG dir compare equal after symlink resolution.
+process.env.XDG_CONFIG_HOME = mkdtempSync(path.join(realpathSync.native(tmpdir()), 'mcp-gm-test-xdg-'));
 process.env.TOKEN_STORE_PATH = path.join(process.env.XDG_CONFIG_HOME, 'tokens');
 
 // The OS keyring is real state on a developer machine: stub it process-wide so
@@ -28,3 +29,9 @@ process.env.GOOGLE_GRANTS_ENFORCE ||= 'false';
 // ToolRegistry also reads GOOGLE_DISCOVERY at construction — pin to the lazy
 // default so an ambient mode in a dev shell can't redden visibility tests.
 process.env.GOOGLE_DISCOVERY = '';
+// GOOGLE_LOCAL_FILES_DIR confines every host-file read/write to a root.
+// Existing tests build their fixture files under os.tmpdir() (the universal
+// convention across this suite); pin the root to tmpdir itself so those
+// paths stay inside it without every test needing to know about the root.
+// Tests of the root/default itself override this locally.
+process.env.GOOGLE_LOCAL_FILES_DIR = realpathSync.native(tmpdir());

@@ -23,6 +23,7 @@ import { resolveScopesForAccount } from './auth.js';
 import type { CuratedToolDeps } from './client.js';
 import type { ExecuteDeps } from './executor.js';
 import type { Metrics } from './usage-metrics.js';
+import { localFilesDisabledByEnv, logLocalFilesRootAtStartup } from './tools/_local-files.js';
 
 export function buildRegistry(server: McpServer, ctx: IdentityContext, mode?: DiscoveryMode, metrics: Metrics | null = null): ToolRegistry {
   const policy = ctx.policy;
@@ -34,7 +35,17 @@ export function buildRegistry(server: McpServer, ctx: IdentityContext, mode?: Di
   // this context; ctx.accounts is read per call, never snapshotted here, so
   // the owner's live getter stays live.
   const owner = isOwnerContext(ctx);
-  const clientDeps: CuratedToolDeps = { getClientFn: ctx.getClient, localFiles: owner };
+  // GOOGLE_LOCAL_FILES=off removes every host-file tool/param for every
+  // context, including the owner, regardless of the transport.
+  const localFilesEnabled = owner && !localFilesDisabledByEnv();
+  // Log (never create) the effective GOOGLE_LOCAL_FILES_DIR root so an
+  // operator sees where uploads/downloads/attachments will be confined
+  // without triggering a tool call first; the root itself is created
+  // lazily, on first actual use, so a read-only or missing HOME (hardened
+  // systemd, an isolated service user) cannot fail server startup over a
+  // feature this run might never use. `config check` hits this same path.
+  if (localFilesEnabled) logLocalFilesRootAtStartup();
+  const clientDeps: CuratedToolDeps = { getClientFn: ctx.getClient, localFiles: localFilesEnabled };
   const execDeps: ExecuteDeps = {
     getClientFn: ctx.getClient,
     scopeDeps: {
