@@ -1,6 +1,6 @@
 # Keep secrets in a vault
 
-A plaintext `.env` is fine to try things out, but for a daily driver, **don't leave `GOOGLE_CLIENT_SECRET` + `MASTER_KEY` on disk** — inject them at launch from a secrets manager. The server just reads `process.env` (it has no idea where the values come from), so wrap it. Back to the [README](../README.md).
+A plaintext `.env` is fine to try things out, but for a daily driver, **don't leave `GOOGLE_CLIENT_SECRET` + `MASTER_KEY` on disk** — inject them at launch from a secrets manager. The server just reads `process.env` (it has no idea where the values come from), so wrap it. Since v6 `MASTER_KEY` auto-provisions when absent (OS keychain, else a 0600 `master.key` file, else generated on first run) — that protects tokens **at rest**, not against same-user malware, exactly like an `.env` did. Back to the [README](../README.md).
 
 Example with [Infisical](https://infisical.com):
 
@@ -19,3 +19,5 @@ claude mcp add google-multi -s user -- ~/.local/bin/mcp-google-multi-run
 ```
 
 Now the only thing on disk is the **encrypted** token store. Pass the token via the `INFISICAL_TOKEN` env var (as above), **not** a `--token` flag, so it never shows up in `ps`. Any secrets manager works — Doppler, Vault, 1Password CLI, etc. — the pattern is the same.
+
+Hosted Cloud Run mounts per-alias encrypted `*.enc` files from Secret Manager (`google-mcp-token-<alias>`). Desk remint with `--upload-sm` is the fail-closed Connect writer. Hosted Google refresh rotation uses the same SM secret (in-memory overlay; not `/mnt/tok-*`). See [Hosted MCP](./hosted-mcp.md).

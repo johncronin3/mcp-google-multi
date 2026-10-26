@@ -38,9 +38,21 @@ describe('optional scope bundles', () => {
     expect(resolveScopesForAccount('test')).not.toContain(PRESENTATIONS_SCOPE);
   });
 
-  it('parses CSV with whitespace and drops unknown bundle names', () => {
-    process.env.GOOGLE_OPTIONAL_SCOPES = ' slides , forms ,bogus';
+  it('parses CSV with whitespace; an unknown bundle now fails loudly (BR3, was a silent drop in v5)', () => {
+    process.env.GOOGLE_OPTIONAL_SCOPES = ' slides , forms ';
     expect(getOptionalBundles()).toEqual(['slides', 'forms']);
+    process.env.GOOGLE_OPTIONAL_SCOPES = ' slides , forms ,bogus';
+    expect(() => getOptionalBundles()).toThrow(/E_UNKNOWN_BUNDLE.*"bogus"/);
+  });
+
+  it('an Object.prototype member name in GOOGLE_OPTIONAL_SCOPES is an unknown bundle, not a crash', () => {
+    process.env.GOOGLE_OPTIONAL_SCOPES = 'constructor';
+    expect(() => getOptionalBundles()).toThrow(/E_UNKNOWN_BUNDLE.*"constructor"/);
+  });
+
+  it('E_UNKNOWN_BUNDLE suggests the closest catalog key', () => {
+    process.env.GOOGLE_OPTIONAL_SCOPES = 'slide';
+    expect(() => getOptionalBundles()).toThrow(/did you mean "slides"/);
   });
 
   it('gmail_settings grants settings.basic only; sharing needs its own bundle', () => {

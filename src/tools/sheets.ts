@@ -2,14 +2,18 @@ import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
 import { coerceArray, coerceBoolean, coerceJson } from './_coerce.js';
 import { sheets as sheetsClient } from '@googleapis/sheets';
-import { ACCOUNTS } from '../accounts.js';
+import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
-import { handleGoogleApiError } from './_errors.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
+import { handleGoogleApiError, invalidParams } from './_errors.js';
 
-const accountEnum = z.enum(ACCOUNTS);
 
-export function registerSheetsTools(server: ToolRegistry): void {
+export function registerSheetsTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
     'sheets_create',
     {
@@ -23,7 +27,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, title, sheetTitles }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
 
         const requestBody: any = {
@@ -57,12 +61,12 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Get spreadsheet metadata (title, sheets/tabs, named ranges)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
       },
     },
     async ({ account, spreadsheetId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.get({
           spreadsheetId,
@@ -94,7 +98,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Read cell values from a spreadsheet range (A1 notation, e.g. "Sheet1!A1:D10")',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: z.string().describe('A1 notation range, e.g. "Sheet1!A1:D10" or "A1:B5"'),
         valueRenderOption: z.enum(['FORMATTED_VALUE', 'UNFORMATTED_VALUE', 'FORMULA'])
           .default('FORMATTED_VALUE').optional()
@@ -103,7 +107,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, valueRenderOption }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.get({
           spreadsheetId,
@@ -128,7 +132,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Write values to a spreadsheet range',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: z.string().describe('A1 notation target range, e.g. "Sheet1!A1:C3"'),
         values: coerceJson(z.array(z.array(z.any()))).describe('2D array of values (rows x columns)'),
         valueInputOption: z.enum(['RAW', 'USER_ENTERED']).default('USER_ENTERED').optional()
@@ -137,7 +141,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, values, valueInputOption }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.update({
           spreadsheetId,
@@ -165,7 +169,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Append rows after the last row of existing data in a spreadsheet',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: z.string().describe('A1 notation range to search for the table (e.g. "Sheet1")'),
         values: coerceJson(z.array(z.array(z.any()))).describe('2D array of rows to append'),
         valueInputOption: z.enum(['RAW', 'USER_ENTERED']).default('USER_ENTERED').optional()
@@ -174,7 +178,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, values, valueInputOption }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.append({
           spreadsheetId,
@@ -203,13 +207,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Clear values from a range (keeps formatting intact)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: z.string().describe('A1 notation range to clear, e.g. "Sheet1!A1:D10"'),
       },
     },
     async ({ account, spreadsheetId, range }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.clear({
           spreadsheetId,
@@ -233,7 +237,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Read multiple ranges from a spreadsheet in one request',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         ranges: coerceArray(z.string()).describe('Array of A1 notation ranges'),
         valueRenderOption: z.enum(['FORMATTED_VALUE', 'UNFORMATTED_VALUE', 'FORMULA'])
           .default('FORMATTED_VALUE').optional()
@@ -242,7 +246,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, ranges, valueRenderOption }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.batchGet({
           spreadsheetId,
@@ -268,7 +272,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Write to multiple ranges in a spreadsheet in one request',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         data: coerceJson(z.array(z.object({
           range: z.string().describe('A1 notation range'),
           values: coerceJson(z.array(z.array(z.any()))).describe('2D array of values'),
@@ -279,7 +283,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, data, valueInputOption }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId,
@@ -310,7 +314,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Add a new tab/sheet to an existing spreadsheet',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         title: z.string().describe('Name for the new sheet/tab'),
         rowCount: z.number().min(1).default(1000).optional()
           .describe('Number of rows (default: 1000)'),
@@ -320,7 +324,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, title, rowCount, columnCount }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -359,13 +363,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Delete a tab/sheet from a spreadsheet by sheetId',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sheetId: z.number().describe('Sheet ID (integer, from sheets_get)'),
       },
     },
     async ({ account, spreadsheetId, sheetId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -386,7 +390,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Duplicate a tab within the same spreadsheet',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sourceSheetId: z.number().describe('Source sheet ID'),
         newSheetName: z.string().optional().describe('Name for the duplicate (default: "Copy of <source>")'),
         insertSheetIndex: z.number().optional().describe('Where to insert the duplicate (0-based)'),
@@ -394,7 +398,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, sourceSheetId, newSheetName, insertSheetIndex }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -424,7 +428,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Rename a tab, change tab color, freeze rows/columns, hide/show, or change grid dimensions',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sheetId: z.number().describe('Sheet ID'),
         title: z.string().optional().describe('New tab title'),
         index: z.number().optional().describe('New position among tabs'),
@@ -438,7 +442,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, sheetId, title, index, hidden, tabColor, frozenRowCount, frozenColumnCount, rowCount, columnCount }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const properties: any = { sheetId };
         const fields: string[] = [];
@@ -460,10 +464,11 @@ export function registerSheetsTools(server: ToolRegistry): void {
           for (const f of gridFields) fields.push(`gridProperties.${f}`);
         }
         if (fields.length === 0) {
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: 'No properties supplied' }, null, 2) }],
-            isError: true,
-          };
+          return invalidParams(
+            account as Account,
+            'No properties to update: every optional property was omitted, so the request would have been a no-op.',
+            'Pass at least one of: title, index, hidden, tabColor, frozenRowCount, frozenColumnCount, rowCount, columnCount.',
+          );
         }
 
         await sheets.spreadsheets.batchUpdate({
@@ -494,7 +499,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Apply uniform formatting (colors, fonts, alignment, number format) to every cell in a range. Uses RepeatCell with a computed fields mask. For borders use sheets_update_borders.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema.describe('Target range (GridRange, half-open indexes)'),
         backgroundColor: rgbColorSchema.optional().describe('Cell background (RGB 0..1)'),
         textFormat: z.object({
@@ -517,14 +522,15 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, ...format }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const built = buildCellFormat(format);
         if (built.fields.length === 0) {
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: 'No format properties supplied' }, null, 2) }],
-            isError: true,
-          };
+          return invalidParams(
+            account as Account,
+            'No formatting to apply: every optional format property was omitted.',
+            'Pass at least one of: backgroundColor, textFormat, horizontalAlignment, verticalAlignment, wrapStrategy, numberFormat.',
+          );
         }
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -553,7 +559,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Set borders on a range. Each border specifies style and optional color.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema,
         top: borderSchema.optional(),
         bottom: borderSchema.optional(),
@@ -565,7 +571,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, top, bottom, left, right, innerHorizontal, innerVertical }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const borders: any = { range };
         if (top) borders.top = toBorder(top);
@@ -575,10 +581,11 @@ export function registerSheetsTools(server: ToolRegistry): void {
         if (innerHorizontal) borders.innerHorizontal = toBorder(innerHorizontal);
         if (innerVertical) borders.innerVertical = toBorder(innerVertical);
         if (Object.keys(borders).length === 1) {
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: 'At least one border edge must be supplied' }, null, 2) }],
-            isError: true,
-          };
+          return invalidParams(
+            account as Account,
+            'No border edge was supplied, so there is nothing to draw.',
+            'Pass at least one of: top, bottom, left, right, innerHorizontal, innerVertical.',
+          );
         }
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -599,14 +606,14 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Merge a range of cells. MERGE_ALL collapses the range to one cell; MERGE_COLUMNS merges each column; MERGE_ROWS merges each row.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema,
         mergeType: z.enum(['MERGE_ALL', 'MERGE_COLUMNS', 'MERGE_ROWS']).default('MERGE_ALL').optional(),
       },
     },
     async ({ account, spreadsheetId, range, mergeType }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -629,13 +636,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Unmerge any merged cells overlapping the given range',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema,
       },
     },
     async ({ account, spreadsheetId, range }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -658,7 +665,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Add a conditional format rule. Specify either booleanRule (single trigger condition + format) or gradientRule (min/mid/max color stops).',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         ranges: coerceJson(z.array(gridRangeSchema)).describe('Ranges the rule applies to'),
         index: z.number().min(0).optional().describe('Where in the rule order to insert (0 = highest priority)'),
         booleanRule: z.object({
@@ -685,12 +692,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
     async ({ account, spreadsheetId, ranges, index, booleanRule, gradientRule }) => {
       try {
         if (!booleanRule && !gradientRule) {
-          return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Either booleanRule or gradientRule must be supplied' }, null, 2) }],
-            isError: true,
-          };
+          return invalidParams(
+            account as Account,
+            'A conditional format rule needs a rule body: neither booleanRule nor gradientRule was supplied.',
+            'Pass booleanRule for a condition-based rule, or gradientRule for a color scale.',
+          );
         }
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
 
         const rule: any = { ranges };
@@ -748,14 +756,14 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Sort a range by one or more columns',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema,
         sortSpecs: coerceJson(z.array(sortSpecSchema)).describe('One spec per sort column (in priority order)'),
       },
     },
     async ({ account, spreadsheetId, range, sortSpecs }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -778,7 +786,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Apply a basic filter to a range. Optionally supply sortSpecs to set the default sort, and filterSpecs to hide rows based on per-column criteria.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema,
         sortSpecs: coerceJson(z.array(sortSpecSchema)).optional(),
         filterSpecs: coerceJson(z.array(z.object({
@@ -791,7 +799,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, sortSpecs, filterSpecs }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const filter: any = { range };
         if (sortSpecs) filter.sortSpecs = sortSpecs;
@@ -829,13 +837,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Remove the basic filter from a sheet',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sheetId: z.number().describe('Sheet ID'),
       },
     },
     async ({ account, spreadsheetId, sheetId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -853,10 +861,12 @@ export function registerSheetsTools(server: ToolRegistry): void {
   server.registerTool(
     'sheets_find_replace',
     {
+      // Insert/append-capable or non-convergent: a retry duplicates content.
+      annotations: { idempotentHint: false },
       description: 'Find and replace text across a range, a sheet, or all sheets. Supports case sensitivity, full-cell match, regex, and formula scope.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         find: z.string().describe('Text to find'),
         replacement: z.string().describe('Replacement text'),
         scope: z.enum(['allSheets', 'sheet', 'range']).describe('Search scope'),
@@ -870,7 +880,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, find, replacement, scope, sheetId, range, matchCase, matchEntireCell, searchByRegex, includeFormulas }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const findReplace: any = {
           find,
@@ -883,12 +893,20 @@ export function registerSheetsTools(server: ToolRegistry): void {
         if (scope === 'allSheets') findReplace.allSheets = true;
         else if (scope === 'sheet') {
           if (sheetId === undefined) {
-            return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'sheetId required when scope=sheet' }) }], isError: true };
+            return invalidParams(
+              account as Account,
+              'scope is "sheet" but sheetId was not supplied, so no tab is addressed.',
+              'Pass sheetId, or use scope="allSheets" to search the whole spreadsheet.',
+            );
           }
           findReplace.sheetId = sheetId;
         } else {
           if (!range) {
-            return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'range required when scope=range' }) }], isError: true };
+            return invalidParams(
+              account as Account,
+              'scope is "range" but range was not supplied, so no range is addressed.',
+              'Pass range as a GridRange, or use scope="allSheets" to search the whole spreadsheet.',
+            );
           }
           findReplace.range = range;
         }
@@ -920,7 +938,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Auto-resize rows or columns to fit content',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sheetId: z.number().describe('Sheet ID'),
         dimension: z.enum(['ROWS', 'COLUMNS']).describe('Which dimension to resize'),
         startIndex: z.number().min(0).optional(),
@@ -929,7 +947,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, sheetId, dimension, startIndex, endIndex }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const dimensions: any = { sheetId, dimension };
         if (startIndex !== undefined) dimensions.startIndex = startIndex;
@@ -953,7 +971,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Insert rows or columns at a position. inheritFromBefore=true copies properties from the row/column before the insertion point.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sheetId: z.number().describe('Sheet ID'),
         dimension: z.enum(['ROWS', 'COLUMNS']),
         startIndex: z.number().min(0).describe('0-based, inclusive'),
@@ -963,7 +981,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, sheetId, dimension, startIndex, endIndex, inheritFromBefore }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -991,7 +1009,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Delete rows or columns from a sheet',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         sheetId: z.number().describe('Sheet ID'),
         dimension: z.enum(['ROWS', 'COLUMNS']),
         startIndex: z.number().min(0),
@@ -1000,7 +1018,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, sheetId, dimension, startIndex, endIndex }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -1029,7 +1047,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Apply a data validation rule (dropdown, checkbox, numeric range, etc.) to a range. Pass conditionType=null to clear validation.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         range: gridRangeSchema,
         conditionType: z.string().describe(BOOLEAN_CONDITION_TYPE_DESC),
         conditionValues: coerceArray(z.string()).optional().describe('Values per condition type (list items for ONE_OF_LIST, range A1 for ONE_OF_RANGE, etc.)'),
@@ -1040,7 +1058,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, range, conditionType, conditionValues, inputMessage, strict, showCustomUi }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const rule: any = {
           condition: {
@@ -1075,14 +1093,14 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Define a named range so formulas can reference it by name',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         name: z.string().describe('Named range identifier (no spaces)'),
         range: gridRangeSchema,
       },
     },
     async ({ account, spreadsheetId, name, range }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -1106,13 +1124,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Delete a named range by its ID',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
-        namedRangeId: z.string().describe('Named range ID (from sheets_get response)'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
+        namedRangeId: z.string().min(1).describe('Named range ID (from sheets_get response)'),
       },
     },
     async ({ account, spreadsheetId, namedRangeId }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId,
@@ -1135,13 +1153,13 @@ export function registerSheetsTools(server: ToolRegistry): void {
       description: 'Clear values from multiple ranges in one request',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         ranges: coerceArray(z.string()).describe('Array of A1 notation ranges'),
       },
     },
     async ({ account, spreadsheetId, ranges }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.values.batchClear({
           spreadsheetId,
@@ -1161,10 +1179,12 @@ export function registerSheetsTools(server: ToolRegistry): void {
   server.registerTool(
     'sheets_batch_update',
     {
+      // Insert/append-capable or non-convergent: a retry duplicates content.
+      annotations: { idempotentHint: false },
       description: 'Generic spreadsheets.batchUpdate pass-through. Accepts the full Request union (~70 types). Use this for advanced operations not covered by a dedicated tool. See https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/request',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        spreadsheetId: z.string().describe('Spreadsheet ID'),
+        spreadsheetId: z.string().min(1).describe('Spreadsheet ID'),
         requests: coerceJson(z.array(z.record(z.string(), z.any()))).describe('Array of Request objects. Each object has exactly one key (the request type) like {repeatCell: {...}}, {addChart: {...}}, {updateBanding: {...}}, etc.'),
         includeSpreadsheetInResponse: coerceBoolean.optional(),
         responseRanges: coerceArray(z.string()).optional(),
@@ -1173,7 +1193,7 @@ export function registerSheetsTools(server: ToolRegistry): void {
     },
     async ({ account, spreadsheetId, requests, includeSpreadsheetInResponse, responseRanges, responseIncludeGridData }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const sheets = sheetsClient({ version: 'v4', auth });
         const res = await sheets.spreadsheets.batchUpdate({
           spreadsheetId,

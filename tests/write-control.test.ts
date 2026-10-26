@@ -9,7 +9,7 @@ const tool = (name: string, cud: 'read' | 'create' | 'update' | 'delete') => ({
 
 describe('resolvePolicy', () => {
   it('defaults to read-only, no globs', () => {
-    expect(resolvePolicy({})).toEqual({ profile: 'read-only', readOnly: false, allow: [], deny: [] });
+    expect(resolvePolicy({})).toEqual({ profile: 'read-only', readOnly: false, allow: [], deny: [], transport: 'stdio' });
   });
   it('parses profile, readOnly, and glob lists', () => {
     const p = resolvePolicy({
@@ -23,10 +23,33 @@ describe('resolvePolicy', () => {
       readOnly: true,
       allow: ['calendar:*', 'sheets:update*'],
       deny: ['*:delete*'],
+      transport: 'stdio',
     });
   });
   it('falls back to read-only on an invalid profile', () => {
     expect(resolvePolicy({ GOOGLE_PROFILE: 'bogus' }).profile).toBe('read-only');
+  });
+
+  // B14: transport is a reserved seam threaded into the policy.
+  it('threads the transport (default stdio; http when passed)', () => {
+    expect(resolvePolicy({}).transport).toBe('stdio');
+    expect(resolvePolicy({}, { transport: 'http' }).transport).toBe('http');
+    expect(resolvePolicy({}, { transport: 'stdio' }).transport).toBe('stdio');
+  });
+
+  it('transport does NOT change any write-control verdict (LOCKED annotations-only)', () => {
+    const cases: Array<[string, 'read' | 'create' | 'update' | 'delete', NodeJS.ProcessEnv]> = [
+      ['gmail_search', 'read', {}],
+      ['gmail_send', 'create', { GOOGLE_PROFILE: 'safe-writes' }],
+      ['drive_delete', 'delete', { GOOGLE_PROFILE: 'full-writes' }],
+      ['drive_delete', 'delete', { GOOGLE_PROFILE: 'safe-writes' }],
+      ['sheets_update', 'update', { GOOGLE_WRITE_DENY: 'sheets:*' }],
+    ];
+    for (const [name, cud, env] of cases) {
+      const stdio = isAllowed(tool(name, cud), resolvePolicy(env, { transport: 'stdio' }));
+      const http = isAllowed(tool(name, cud), resolvePolicy(env, { transport: 'http' }));
+      expect(http).toBe(stdio);
+    }
   });
 });
 
@@ -49,6 +72,14 @@ describe('isAllowed', () => {
   });
   it('full-writes allows everything', () => {
     expect(isAllowed(tool('drive_delete', 'delete'), full)).toBe(true);
+  });
+  it('drive_empty_trash is in the trash set, so *trash cannot open it under read-only', () => {
+    const star: Policy = { profile: 'read-only', readOnly: false, allow: ['*trash'], deny: [] };
+    expect(isAllowed(tool('gmail_trash', 'delete'), star)).toBe(true);
+    expect(isAllowed(tool('drive_empty_trash', 'delete'), star)).toBe(false);
+    const named: Policy = { profile: 'read-only', readOnly: false, allow: ['drive:empty_trash'], deny: [] };
+    expect(isAllowed(tool('drive_empty_trash', 'delete'), named)).toBe(true);
+    expect(isAllowed(tool('drive_empty_trash', 'delete'), full)).toBe(false);
   });
   it('GOOGLE_READ_ONLY beats any profile', () => {
     expect(isAllowed(tool('gmail_send', 'create'), { ...full, readOnly: true })).toBe(false);
