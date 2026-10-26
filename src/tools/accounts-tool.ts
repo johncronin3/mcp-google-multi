@@ -183,7 +183,7 @@ export function registerAccountTools(registry: ToolRegistry, deps: AccountHealth
                 defaultAccount,
                 defaultAccountSource: defaultAccount ? (set.defaultAccountSource ?? null) : null,
                 accounts: verbose ? reports : reports.map((r) => summarizeAccountHealth(r, r.alias === defaultAccount)),
-                grant_filtered: isGrantEnforced(),
+                ...(isGrantEnforced() ? { grant_filtered: true } : {}),
               }),
             },
           ],

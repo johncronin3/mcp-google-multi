@@ -364,11 +364,8 @@ async function main() {
 
 /** House Streamable HTTP server (src/http.ts), one per request. Does not bind
  * a transport. Curated tools are on the first tools/list — docs/features.md. */
-export function buildGoogleMcpServer(): McpServer {
-  const server = new McpServer({
-    name: 'mcp-google-multi',
-    version: pkg.version,
-  });
+export function buildGoogleMcpServer() {
+  const server = createMcpServer(pkg.version);
   const registry = buildRegistry(
     server,
     buildIdentityContext(process.env, { transport: 'http' }),

@@ -46,7 +46,7 @@ Create a Gmail draft without sending
 | `replyToMessageId` | string | optional | Message ID to reply to. Sets In-Reply-To/References and, unless overridden, derives to/subject (and cc when replyAll) from the source, so you need not read it first. |
 | `replyAll` | boolean | optional | With replyToMessageId: include the source To+Cc (minus your own addresses) in cc. Default false (reply to sender only). |
 | `replyToThreadId` | string | optional | Thread ID to associate the draft with |
-| `attachments` | array | optional | Files to attach (each { path, filename?, contentType? }); path must be absolute |
+| `attachments` | array | optional | Files to attach. Inline { content, filename } (base64 bytes), desk { path }, or hosted { driveFileId } / { messageId, attachmentId }. A request with attachments errors unless those bytes are in the Gmail MIME. |
 
 ## `gmail_create_label`
 
@@ -98,7 +98,7 @@ Permanently delete a Gmail label and remove it from all messages
 
 Class: read
 
-Download an email attachment to local disk. Use gmail_read first to get the attachmentId.
+Download an email attachment. Desk/stdio: writes to savePath on local disk. Hosted Cloud Run: returns base64 bytes in the MCP result (savePath ignored). Use gmail_read first to get the attachmentId.
 
 | Argument | Type | Required | Description |
 |---|---|---|---|
@@ -106,7 +106,7 @@ Download an email attachment to local disk. Use gmail_read first to get the atta
 | `messageId` | string | required | The Gmail message ID |
 | `attachmentId` | string | required | The attachment ID from gmail_read response |
 | `filename` | string | required | Filename to save as (e.g. report.xlsx) |
-| `savePath` | string | required | Destination folder to save into, on the machine running the server: confined to GOOGLE_LOCAL_FILES_DIR (default <home>/Downloads/mcp-google-multi), created if missing; a relative path resolves inside it, an absolute path must already be inside it. The file name comes from `filename`. |
+| `savePath` | string | optional | Desk/stdio: destination folder on the machine running the server, confined to GOOGLE_LOCAL_FILES_DIR (default <home>/Downloads/mcp-google-multi). A relative path resolves inside it; an absolute path must already be inside it. Required on desk. Ignored on hosted Cloud Run — bytes are returned in the tool result. |
 
 ## `gmail_get_draft`
 
@@ -263,7 +263,7 @@ Send an email from a Gmail account
 | `replyToMessageId` | string | optional | Message ID to reply to. Sets In-Reply-To/References and, unless overridden, derives to/subject (and cc when replyAll) from the source, so you need not read it first. |
 | `replyAll` | boolean | optional | With replyToMessageId: include the source To+Cc (minus your own addresses) in cc. Default false (reply to sender only). |
 | `replyToThreadId` | string | optional | Thread ID to send the message in |
-| `attachments` | array | optional | Files to attach (each { path, filename?, contentType? }); path must be absolute |
+| `attachments` | array | optional | Files to attach. Inline { content, filename } (base64 bytes), desk { path }, or hosted { driveFileId } / { messageId, attachmentId }. A request with attachments errors unless those bytes are in the Gmail MIME. |
 
 ## `gmail_send_draft`
 

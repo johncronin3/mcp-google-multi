@@ -320,9 +320,11 @@ export class ToolRegistry {
         const accountSet = this.accounts();
         const accounts = accountSet.aliases.map((alias) => ({ alias, email: accountSet.configs[alias]?.email ?? '' }));
         const rendered = hints()?.render({ kind: 'no_default_account', accounts });
-        const pairs = Array.isArray(listed)
-          ? listed.join(', ')
-          : accounts.map((a) => `${a.alias}=${a.email}`).join(', ');
+        const visible = new Set(listed);
+        const pairs = accounts
+          .filter((a) => visible.has(a.alias))
+          .map((a) => `${a.alias}=${a.email}`)
+          .join(', ');
         return {
           content: [
             {
