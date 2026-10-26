@@ -9,6 +9,7 @@ import { handleGoogleApiError, invalidParams, safeMessage, stringifyEnvelope } f
 import { hostFilesRefused, openLocalReadStream, prepareLocalDest } from './_local-files.js';
 import { checkOutbound, outboundDeniedEnvelope, resolveOutboundAllowlist } from '../outbound-allowlist.js';
 import { isAllowed, writeDisabledResult } from '../write-control.js';
+import { refusedAccountResult } from '../session-grant.js';
 import { capText, listResult } from '../trim.js';
 import {
   deskSavePathRequiredMessage,
@@ -488,6 +489,8 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
     },
     async ({ account, fileId, savePath, filename }) => {
       try {
+        const refused = refusedAccountResult(account);
+        if (refused) return refused;
         const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 
@@ -540,6 +543,8 @@ export function registerDriveTools(server: ToolRegistry, deps: CuratedToolDeps =
     },
     async ({ account, fileId, mimeType: exportMime, savePath, filename }) => {
       try {
+        const refused = refusedAccountResult(account);
+        if (refused) return refused;
         const auth = await getClientFn(account as Account);
         const drive = driveClient({ version: 'v3', auth });
 

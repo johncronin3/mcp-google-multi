@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import type { ToolRegistry } from './registry.js';
-import { getAccountSet } from './accounts.js';
+import { getAccountSet, type AccountSet } from './accounts.js';
 import { accountHealthDepsFor, deriveAccountHealth, type AccountHealth } from './tools/accounts-tool.js';
 import { isOwnerContext, type IdentityContext } from './identity.js';
 import { peekMasterKeyProvenance, deleteMasterKeyMaterial } from './master-key.js';
@@ -15,6 +15,7 @@ import { apiProbeDepsFor, probeApiEnablement } from './api-probe.js';
 import { safeMessage, stringifyEnvelope } from './tools/_errors.js';
 import { resolveHttpConfig, HttpConfigError, type HttpConfig } from './http-config.js';
 import { parseOwnerEmails } from './http-transport.js';
+import { aliasesVisibleToSession, allowedAccounts, isGrantEnforced, missingGrantResult } from './session-grant.js';
 
 // B9: one engine (runDiagnostics), two skins — `doctor` (CLI glyph) and
 // `diagnose` (agent tool, structured). Sections 1-6 here; section 7 (HTTP:
@@ -506,6 +507,19 @@ function diagnosticsDepsFor(ctx: DiagnoseContext): DiagnosticsDeps {
  * from already-registered services, and this runs after that), so it was
  * advertised only once something else expanded the surface. The README sends
  * people here when they are stuck, so it has to be findable. */
+/** The diagnose tool is session-facing. The CLI doctor keeps the operator's
+ * full registry: it calls runDiagnostics() with no grant in scope. */
+function grantScopedAccountSet(set: AccountSet | null): AccountSet | null {
+  if (!set || !isGrantEnforced()) return set;
+  const aliases = aliasesVisibleToSession(set.aliases);
+  const configs: AccountSet['configs'] = {};
+  for (const alias of aliases) {
+    const row = set.configs[alias];
+    if (row) configs[alias] = row;
+  }
+  return { ...set, aliases, configs };
+}
+
 export function registerDiagnoseTool(registry: ToolRegistry, ctx?: DiagnoseContext): void {
   // A non-owner context gets the tenant-scoped report; only the owner context
   // (or the context-free CLI surface) keeps the full operator report.
@@ -520,7 +534,20 @@ export function registerDiagnoseTool(registry: ToolRegistry, ctx?: DiagnoseConte
     },
     async () => {
       try {
-        const result = await runDiagnostics(deps, { scope });
+        // Empty intersection with a real grant is an empty report. No grant
+        // is grant_required — same envelope as account_list.
+        if (isGrantEnforced()) {
+          try {
+            allowedAccounts();
+          } catch {
+            return missingGrantResult();
+          }
+        }
+        const scoped: DiagnosticsDeps = {
+          ...deps,
+          accountSet: () => grantScopedAccountSet(deps.accountSet()),
+        };
+        const result = await runDiagnostics(scoped, { scope });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
       } catch (e: any) {
         return { content: [{ type: 'text' as const, text: stringifyEnvelope({

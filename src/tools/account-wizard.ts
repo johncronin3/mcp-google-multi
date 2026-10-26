@@ -2,6 +2,8 @@ import { z } from 'zod';
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { ToolRegistry } from '../registry.js';
 import { getAccountSet, invalidateAccountSet, refreshAccountSetIfStale } from '../accounts.js';
+import { allowedAccounts, isGrantEnforced } from '../session-grant.js';
+import { isHostedConfigSurface } from '../hosted.js';
 import { ALIAS_RE, mutateConfigFile } from '../config-file.js';
 import { writeToken } from '../token-store.js';
 import { resolveScopesForAccount } from '../auth.js';
@@ -174,6 +176,43 @@ function errorResult(slug: string, message: string, hint?: string, account?: str
     }) }],
     isError: true as const,
   };
+}
+
+/** When grants are on, an alias outside the session slice must not be linked.
+ * The hint names only the grant's aliases, never the rest of the registry. */
+function sessionAliasRefusal(alias: string) {
+  if (!isGrantEnforced()) return null;
+  let allowed: string[];
+  try {
+    allowed = allowedAccounts();
+  } catch (e: unknown) {
+    return errorResult('grant_required', safeMessage(e), undefined, alias);
+  }
+  if (allowed.includes(alias)) return null;
+  return errorResult(
+    'account_outside_grant',
+    `Account "${alias}" is outside this session grant.`,
+    `This session can only add or re-link: ${allowed.join(', ')}.`,
+    alias,
+  );
+}
+
+/** Client-config writes are process-wide. A grant that is not the whole registry must not perform them. */
+function sessionConfigRefusal() {
+  if (!isGrantEnforced()) return null;
+  let allowed: string[];
+  try {
+    allowed = allowedAccounts();
+  } catch (e: unknown) {
+    return errorResult('grant_required', safeMessage(e));
+  }
+  const outside = getAccountSet().aliases.some((alias) => !allowed.includes(alias));
+  if (!outside) return null;
+  return errorResult(
+    'account_outside_grant',
+    'This session cannot rewrite client config while accounts outside its grant are configured.',
+    `This session's accounts: ${allowed.join(', ')}.`,
+  );
 }
 
 interface ConsentFailure { ok: false; slug: string; message: string; hint?: string }
@@ -385,8 +424,15 @@ export function registerAccountWizardTools(
           }
           input = (form.content ?? {}) as Partial<AddForm>;
         }
+        const requested = (input.alias ?? '').trim();
+        if (requested) {
+          const early = sessionAliasRefusal(requested);
+          if (early) return early;
+        }
         const validated = validateAddForm(input, getAccountSet().aliases);
         if (!validated.ok) return errorResult(validated.slug, validated.message, validated.hint, validated.alias);
+        const blocked = sessionAliasRefusal(validated.alias);
+        if (blocked) return blocked;
 
         // S2: atomic write + make the alias callable without a restart (BR3).
         writeAccountRow(validated.alias, validated.email, validated.bundles, validated.admin);
@@ -437,6 +483,8 @@ export function registerAccountWizardTools(
       try {
         const a = args as { alias?: string; account?: string };
         const alias = a.alias ?? a.account ?? '';
+        const blocked = sessionAliasRefusal(alias);
+        if (blocked) return blocked;
         // No default-account wrapper runs for this tool, so pick up a
         // hand-edited config.json here: that edit is why a re-auth is asked for.
         refreshAccountSetIfStale();
@@ -448,10 +496,13 @@ export function registerAccountWizardTools(
           );
         }
         if (!getAccountSet().aliases.includes(alias)) {
+          const known = isGrantEnforced()
+            ? allowedAccounts().filter((name) => getAccountSet().aliases.includes(name))
+            : getAccountSet().aliases;
           return errorResult(
             'validation_error',
             `Unknown account "${alias}".`,
-            `Pass one of the configured aliases: ${getAccountSet().aliases.join(', ')}. Use account_add to create a new one.`,
+            `Pass one of the configured aliases: ${known.join(', ')}. Use account_add to create a new one.`,
             alias,
           );
         }
@@ -480,6 +531,9 @@ export function registerAccountWizardTools(
     },
     async (args: unknown) => {
       try {
+        refreshAccountSetIfStale();
+        const blocked = sessionConfigRefusal();
+        if (blocked) return blocked;
         const a = (args ?? {}) as { client?: ClientId; name?: string; write?: boolean };
         const name = a.name?.trim() || DEFAULT_SERVER_NAME;
         let mode: Mode = 'stdio';
@@ -508,11 +562,14 @@ export function registerAccountWizardTools(
           const instr = renderInstruction(client, name, entry);
           if (client.managed === 'cli') {
             blocks.push(`${client.label}: run\n  ${instr.text}`);
-          } else if (a.write && mode === 'http') {
-            // Over HTTP this tool runs on the DAEMON, whose homedir is not the
-            // caller's machine: write:true would edit the operator's own client
-            // configs (a cross-tenant hazard under tenancy). Snippet only.
-            blocks.push(`${client.label}: write:true is ignored over HTTP — this tool runs on the server, not your machine. Add to ${instr.path}\n${instr.text}`);
+          } else if (a.write && (mode === 'http' || isHostedConfigSurface())) {
+            // Over HTTP, or on Cloud Run (K_SERVICE / the grants mount) even when
+            // MCP_TRANSPORT is unset: write:true would edit the server's own
+            // client configs. Snippet only.
+            const why = mode === 'http'
+              ? 'write:true is ignored over HTTP — this tool runs on the server, not your machine.'
+              : 'write:true is ignored on a hosted server — this tool runs on the server, not your machine.';
+            blocks.push(`${client.label}: ${why} Add to ${instr.path}\n${instr.text}`);
           } else if (a.write) {
             const res = applyFileEntry(client, name, entry);
             blocks.push(

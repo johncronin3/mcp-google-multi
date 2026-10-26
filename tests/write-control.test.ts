@@ -73,6 +73,14 @@ describe('isAllowed', () => {
   it('full-writes allows everything', () => {
     expect(isAllowed(tool('drive_delete', 'delete'), full)).toBe(true);
   });
+  it('drive_empty_trash is in the trash set, so *trash cannot open it under read-only', () => {
+    const star: Policy = { profile: 'read-only', readOnly: false, allow: ['*trash'], deny: [] };
+    expect(isAllowed(tool('gmail_trash', 'delete'), star)).toBe(true);
+    expect(isAllowed(tool('drive_empty_trash', 'delete'), star)).toBe(false);
+    const named: Policy = { profile: 'read-only', readOnly: false, allow: ['drive:empty_trash'], deny: [] };
+    expect(isAllowed(tool('drive_empty_trash', 'delete'), named)).toBe(true);
+    expect(isAllowed(tool('drive_empty_trash', 'delete'), full)).toBe(false);
+  });
   it('GOOGLE_READ_ONLY beats any profile', () => {
     expect(isAllowed(tool('gmail_send', 'create'), { ...full, readOnly: true })).toBe(false);
   });

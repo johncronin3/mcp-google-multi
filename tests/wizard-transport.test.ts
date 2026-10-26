@@ -34,10 +34,12 @@ function captureHandlers(awaitingRestart?: () => string[]): { handlers: Record<s
 
 const savedEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
-  for (const k of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'MCP_TRANSPORT', 'MCP_PUBLIC_URL', 'GOOGLE_ACCOUNTS']) savedEnv[k] = process.env[k];
+  for (const k of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'MCP_TRANSPORT', 'MCP_PUBLIC_URL', 'GOOGLE_ACCOUNTS', 'K_SERVICE', 'MCP_HOSTED']) savedEnv[k] = process.env[k];
   process.env.GOOGLE_CLIENT_ID = 'wizard-test-id';
   process.env.GOOGLE_CLIENT_SECRET = 'wizard-test-secret';
   delete process.env.GOOGLE_ACCOUNTS;
+  delete process.env.K_SERVICE;
+  delete process.env.MCP_HOSTED;
 });
 afterEach(() => {
   setWizardHttpConsent(null);

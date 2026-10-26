@@ -6,6 +6,7 @@ import { drive as driveClient } from '@googleapis/drive';
 import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
 import { getClient, type CuratedToolDeps } from '../client.js';
+import { refusedAccountResult } from '../session-grant.js';
 import { handleGoogleApiError, invalidParams, mapGoogleError } from './_errors.js';
 import { buildReplyHeaders, composeRaw, mimeOmitsAttachmentBytes, renderMarkdown, htmlToMarkdown, HeaderInjectionError, localPathUnavailableMessage, type ComposeAttachment } from './gmail-mime.js';
 import {
@@ -1027,6 +1028,8 @@ export function registerGmailTools(server: ToolRegistry, deps: CuratedToolDeps =
     },
     async ({ account, messageId, attachmentId, filename, savePath }) => {
       try {
+        const refused = refusedAccountResult(account);
+        if (refused) return refused;
         const auth = await getClientFn(account as Account);
         const gmail = gmailClient({ version: 'v1', auth });
 

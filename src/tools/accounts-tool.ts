@@ -147,14 +147,15 @@ export function registerAccountTools(registry: ToolRegistry, deps: AccountHealth
       try {
         const set = registry.accountSet();
         const aliases = isGrantEnforced() ? allowedAccounts() : [...set.aliases];
+        const defaultAccount = set.defaultAccount && aliases.includes(set.defaultAccount) ? set.defaultAccount : null;
         const health: AccountHealthDeps = { ...deps, accounts: () => set };
         return {
           content: [
             {
               type: 'text' as const,
               text: JSON.stringify({
-                defaultAccount: set.defaultAccount ?? null,
-                defaultAccountSource: set.defaultAccountSource ?? null,
+                defaultAccount,
+                defaultAccountSource: defaultAccount ? (set.defaultAccountSource ?? null) : null,
                 accounts: aliases.map((alias) => deriveAccountHealth(alias, health)),
                 grant_filtered: isGrantEnforced(),
               }),

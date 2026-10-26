@@ -39,10 +39,8 @@ Google Handshake / Slice A (one hosted Connect per alias then forget) **does not
 Checkout this branch, then:
 
 ```bash
-gcloud run deploy google-multi-mcp \
-  --project=myflow-260730 \
-  --region=us-central1 \
-  --source=.
+# Do not run. deploy/google-mcp.sh exits 2 before gcloud.
+# Reviewed command: explicit --project and --account, JWT signing-key mount.
 ```
 
 Region matches public host `google-multi-mcp-tdhsljvruq-uc.a.run.app`. Explicit `--project=` only. This agent did not deploy. No SM `--live`. No remint. Partner OFF.

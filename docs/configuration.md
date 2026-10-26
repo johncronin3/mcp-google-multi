@@ -99,8 +99,12 @@ Each account can point at a named **scope profile** so consent is exactly what t
 | `GOOGLE_ARG_NORMALIZE` | — | `off` (or `0`/`false`/`no`) disables tools/call argument-key normalization (snake_case → declared camelCase when unambiguous; each rename logs one line to stderr) |
 | `GOOGLE_GRANTS_PATH` | — | host-local grants file (default: `~/.config/mcp-google-multi/grants.json`) — see [Session grants](#session-grants-my-flowstyle) |
 | `GOOGLE_GRANTS_ENFORCE` | — | `true` force fail-closed grants; `false` disable even if grants file exists; default = enforce when file has ≥1 grant |
-| `GOOGLE_GRANT_CODE` | — | optional process-wide fallback code (prefer session tool `set_grant` or Grok OAuth-bound grant) |
-| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for house `POST /mcp` (Secret Manager). Grok OAuth wraps this token only. |
+| `GOOGLE_GRANT_CODE` | — | desk/stdio process-wide fallback code (prefer `set_grant`). Ignored on hosted. |
+| `MCP_HTTP_TOKEN` / `MCP_API_KEY` | hosted | Layer 2 gate for house `POST /mcp` (Secret Manager). Grok OAuth password field checks this value. It does not sign JWTs. |
+| `MCP_JWT_SIGNING_KEY_FILE` | hosted | File path of the house Grok JWT signing key (Secret Manager mount `google-mcp-jwt-signing-key`). At least 32 bytes. Missing, short, or unreadable fails closed on hosted and does not fall back to the bearer. |
+| `MCP_JWT_SIGNING_KEY` | desk | Same key as an env string for desk/stdio only. Ignored on hosted (`MCP_HOSTED` / `K_SERVICE`). At least 32 bytes. |
+| `MCP_OAUTH_REFRESH_TTL` | 30 days | House Grok refresh-token lifetime in seconds. Access tokens are 1 hour. Refresh keeps `gname`. |
+| `MCP_HTTP_TOKEN_GRANT` | — | Optional grant **name** bound to the static `MCP_HTTP_TOKEN` / `MCP_API_KEY` bearer. Resolved from the grants file on every request and wrapped in `runWithGrant`. Unset (the default) or unknown → that request is grantless and fails closed. It does not inherit in-process `set_grant` or `GOOGLE_GRANT_CODE`. Not set in deploy files. |
 | `MCP_PUBLIC_HOST` | hosted | Public hostname for house Streamable HTTP. Never `localhost:8787`. |
 | `MCP_HOSTED` | — | `1` force hosted (no browser, no 8000/8787/4242); `0` force desk. Cloud Run sets `K_SERVICE`. |
 | `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT` | desk SM | Explicit GCP project for desk→Secret Manager token uploads. Required when `--upload-sm` / `GOOGLE_UPLOAD_SM` is on. Never `gcloud config get-value project`. Interim pin if a comment must name one: `myflow-260730`. |
@@ -115,11 +119,14 @@ Inspect the resolved setup any time: `mcp-google-multi config check`.
 Without a session grant, multi-account tools can reach **every** alias in `GOOGLE_ACCOUNTS`. Session grants (layer 3) close that gap the same way My Flow MCP does for orgs. They do **not** log into Google — each alias is still minted with singular desk OAuth (layer 1).
 
 1. Host-local file `grants.json` (see `grants.example.json`) maps **name + code → account aliases**.
-2. **Stdio / CLI:** call `set_grant` / `clear_grant` / `grant_status` at session start (in-process).
-3. **Hosted Grok:** enter the grant code on `/oauth/authorize`; the access JWT carries the grant *name* (`gname`) so every Cloud Run replica restores the same slice (no sticky sessions). Hosted `set_grant` is refused — it only mutates process memory and does not survive another instance.
-4. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant.
+2. **Stdio / CLI:** call `set_grant` / `clear_grant` / `grant_status` at session start (in-process). Desk stdio may also use `GOOGLE_GRANT_CODE`.
+3. **Hosted Grok:** `/oauth/authorize` always requires the grant's secret code (constant-time compare), even when `GOOGLE_GRANTS_ENFORCE` is off. The bearer plus a grant name, or the bearer alone, does not mint a token. Desk/stdio still requires the code only when enforcement is on. The access JWT carries the grant *name* (`gname`) so every Cloud Run replica restores the same slice (no sticky sessions). Hosted `set_grant` is refused — it only mutates process memory and does not survive another instance. On hosted, a request has only its own grant or null: no in-process `set_grant` and no `GOOGLE_GRANT_CODE`.
+4. **Static bearer** (`Authorization: Bearer <MCP_HTTP_TOKEN>`, or `MCP_API_KEY`): wrapped in `runWithGrant` of `MCP_HTTP_TOKEN_GRANT` on every request. Unset fails closed. This is not the OAuth consent flow.
+5. When enforcement is on, `account_list`, fan-out `*`, and `getClient` only allow aliases on the active grant. Fail-closed if no grant.
 
 **Codes stay host-local** — never commit real codes. You may reuse the **same secret** as a My Flow grant code so operators keep one code per brain; Google only looks up its own `grants.json`.
+
+Optional `notBefore` (ISO-8601) on a grant record refuses refresh and `/mcp` for tokens whose `iat` is earlier. That revokes one grant without rotating the JWT signing key. See `grants.example.json`. Code lookup and name lookup re-read `grants.json` on each check, so a removed grant or a new `notBefore` applies without a restart. There is no file watcher. `grant_status` reports `code_sha8` (8 hex chars of SHA-256), never a prefix of the code. A code shorter than 24 characters, or equal to its grant name ignoring case, is rejected when the file loads. The error names the grant only. On hosted that load runs even when `GOOGLE_GRANTS_ENFORCE` is off, so a refused file does not open every alias. `GOOGLE_GRANT_CODE` is ignored on hosted. Authorization-code exchange uses the same live-grant and `notBefore` checks as refresh, on the code JWT's `iat`, before it mints access and refresh tokens.
 
 | Recipe name (example) | Typical accounts |
 |----------------------|------------------|
