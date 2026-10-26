@@ -37,10 +37,8 @@ export const SUPPORTED_APIS: Record<string, { id: string; version: string }> = {
   workspaceevents: { id: 'workspaceevents', version: 'v1' },
 };
 
-// Names agents actually type for an API, mapped to real SUPPORTED_APIS keys.
-// Motivated by observed escape-hatch misses ("analytics" is two Discovery
-// APIs, the Admin SDK is three); keep entries plural-target only when the
-// split is real.
+// Names agents actually type for an API, mapped to real SUPPORTED_APIS keys;
+// plural-target entries only where the split ("analytics" is two APIs) is real.
 export const API_ALIASES: Record<string, string[]> = {
   analytics: ['analyticsadmin', 'analyticsdata'],
   ga4: ['analyticsadmin', 'analyticsdata'],
@@ -113,9 +111,8 @@ export function discoveryCacheDir(env: NodeJS.ProcessEnv = process.env): string 
   );
 }
 
-// Default cache path only (an operator's DISCOVERY_CACHE_PATH may be shared,
-// even /tmp, and keeps its mode), only when this process owns it, and best
-// effort. Clears group/other bits and keeps setuid/setgid/sticky.
+// Default cache path only (an operator's DISCOVERY_CACHE_PATH may be shared
+// and keeps its mode), only when this process owns it; clears group/other bits.
 function tightenOwnDir(dir: string): void {
   if (process.platform === 'win32') return;
   try {
@@ -156,9 +153,8 @@ export function buildMethodIndex(doc: DiscoveryDoc, api: string): DiscoveryMetho
       };
       if (!method.id || !method.httpMethod || !method.path) continue;
       const params = method.parameters ?? {};
-      // Google serves parameters{} with unstable key order between fetches;
-      // parameterOrder is the canonical sequence, so sort by it (alphabetical
-      // tie-break) to keep gen-tools output deterministic.
+      // parameters{} has unstable key order between fetches; sort by the
+      // canonical parameterOrder (alphabetical tie-break) for deterministic output.
       const order = method.parameterOrder ?? [];
       const pos = (n: string) => {
         const i = order.indexOf(n);
@@ -220,9 +216,8 @@ export async function loadMethodIndex(api: string, deps: DiscoveryDeps = {}): Pr
   let staleFallback = false;
   if (cacheFresh()) doc = readCache();
   if (!doc) {
-    // Newer APIs (analyticsadmin/analyticsdata) are absent from the central
-    // discovery directory (404); each service's own $discovery endpoint is
-    // authoritative, so try both — same fallback as scripts/fetch-discovery.
+    // Newer APIs are absent from the central discovery directory (404); try
+    // each service's own $discovery endpoint too, as scripts/fetch-discovery does.
     const urls = [
       `https://www.googleapis.com/discovery/v1/apis/${spec.id}/${spec.version}/rest`,
       `https://${spec.id}.googleapis.com/$discovery/rest?version=${spec.version}`,
@@ -265,20 +260,11 @@ export function clearDiscoveryMemoryCache(): void {
 // GA4-style report execution (runReport, batchRunPivotReports, runAccessReport)
 // and check* predicates are POSTs purely for the request-body size — reads.
 const POST_READ_VERB = /^(get|list|search|query|lookup|count|batchGet|generateIds|export|download|inspect|check|suggest|(batch)?run\w*report)/i;
-// `cancelWipe` must be matched here, BEFORE `cancel` reaches the delete list:
-// it calls off a pending wipe, which is the opposite of one. Update is tested
-// before delete for exactly that reason.
-// State transitions on something that already exists: reversible, and none of
-// them creates anything, so `create` was both wrong and the most permissive
-// class available. `(batch)?` mirrors the delete list, without which every
-// `batchUpdate*` POST fell through to `create`.
+// Update, tested before delete, so cancelWipe (calling off a wipe) doesn't
+// reach the delete list via its "cancel" suffix. See docs/internals.md.
 const POST_UPDATE_VERB = /^(cancelWipe|(batch)?(untrash|undelete|restore|modify|move|set|sort|merge|unmerge|replace|resize|publish|resolve|update|patch|write|format|change|close|reopen|enable|disable|hide|unhide|accept|approve|decline|reassign|reactivate|renew|mark|turn|suspend|activate|make|return|reclaim|complete))/i;
-// archive sits with the deletes: in GA4 archiving a custom dimension/metric is
-// permanent, so the most restrictive write class is the safe classification.
-// So do the teardown verbs: `stop` and `cancel` tear down a push channel or a
-// long-running operation, `wipe`/`invalidate`/`signOut` destroy device data,
-// codes and sessions, `reset` discards a configuration, and `end` terminates a
-// live conference. Each removes something that existed.
+// archive/wipe/reset/stop/cancel/end etc. all remove or permanently discard
+// something that existed, so the most restrictive class is the safe one. See docs/internals.md.
 const POST_DELETE_VERB = /^(batch)?(delete|remove|trash|clear|empty|obliterate|purge|revoke|wipeout|archive|wipe|invalidate|signOut|stop|cancel|unregister|unreserve|reset|end)/i;
 
 export function cudFromMethod(method: Pick<DiscoveryMethod, 'httpMethod' | 'id'>): 'read' | 'create' | 'update' | 'delete' {
@@ -309,13 +295,8 @@ export function expandPath(template: string, pathParams: Record<string, string>)
     if (value === undefined) {
       throw new Error(`Missing required path parameter "${name}"`);
     }
-    // A blank segment collapses the path and Google routes the resulting
-    // trailing-slash URL to the COLLECTION: `sites.get` with siteUrl:"" came
-    // back as the whole site LIST, reported as success. Dot segments resolve
-    // at URL-parse time, so `../v1/contactGroups` retargets the call at a
-    // different endpoint and returns ITS response as success. Both are
-    // silent-wrong, so refuse locally rather than send a different request.
-    // `{+param}` keeps its slashes, so every segment has to be checked.
+    // Both a blank segment and a "." / ".." segment silently retarget the
+    // request to a different, successfully-answered endpoint. See docs/internals.md.
     const segments = plus ? String(value).split('/') : [String(value)];
     for (const segment of segments) {
       if (segment.trim() === '') {

@@ -16,10 +16,12 @@ body:
         - Search Console
         - Tasks
         - Meet
+        - Slides
         - Forms
         - Chat
+        - Analytics
         - Admin
-        - Alert Center
+        - Another generated service (see COVERAGE.md)
         - New service
         - Cross-cutting / infra
     validations:

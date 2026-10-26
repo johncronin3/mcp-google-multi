@@ -120,9 +120,8 @@ describe('screenArguments', () => {
   });
 });
 
-// Caller-controlled names reach an O(n*m) edit distance. Unbounded, one
-// megabyte-long key blocked the event loop for seconds (and a tool name for
-// minutes); these budgets are orders of magnitude above the bounded cost.
+// Caller-controlled names reach an O(n*m) edit distance; unbounded, a
+// megabyte-long key blocked the event loop for seconds.
 describe('suggestion work is bounded on caller input', () => {
   it('computes edit distance exactly inside the bound and caps it outside', () => {
     expect(editDistance('kitten', 'sitting')).toBe(3);

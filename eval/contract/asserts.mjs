@@ -50,8 +50,10 @@ export function gmailDiscoverFilter(output) {
 
 export function gmailDiscoverNoMatch(output) {
   const j = envelope(output);
-  if (!j || j.operations.length !== 0) return fail('expected empty operations');
-  return /without query/i.test(j.next) ? ok(j.next) : fail(j.next);
+  // No token matches: catalog() falls back to the full listing rather than empty.
+  if (!j || j.operations.length === 0) return fail('expected a fallback listing, not empty operations');
+  if (!j.operations.some((o) => o.tool === 'gmail_send')) return fail('fallback listing missing gmail_send');
+  return /exact name/i.test(j.next) ? ok(j.next) : fail(j.next);
 }
 
 export function discoverAllExpands(output) {
@@ -134,12 +136,12 @@ export function writeDisabled(output) {
 
 // Wizard failures used to be bare prose, so these asserted on substrings.
 // They are envelopes now: assert the slug and the recovery, not the wording.
-export function accountAddEnvMode(output) {
+export function accountAddNoArgs(output) {
   const j = envelope(output);
   if (!j) return fail('not a parseable envelope: ' + text(output).slice(0, 160));
-  if (j.error !== 'E_ENV_ACCOUNTS_MODE') return fail('wrong slug: ' + j.error);
-  if (j.retriable !== false) return fail('env mode is not retriable');
-  if (!/migrate-config/.test(j.hint ?? '')) return fail('hint does not name the way out');
+  if (j.error !== 'elicitation_unsupported') return fail('wrong slug: ' + j.error);
+  if (j.retriable !== false) return fail('no-args call is not retriable');
+  if (!/"alias"/.test(j.hint ?? '')) return fail('hint does not show the explicit-args form');
   return ok(j.error);
 }
 

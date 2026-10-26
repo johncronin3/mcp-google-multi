@@ -19,7 +19,7 @@ describe('addFormSchema', () => {
 });
 
 describe('validateAddForm', () => {
-  const existing = ['ic', 'personal'];
+  const existing = ['team', 'personal'];
 
   it('accepts a clean row and collects checkbox bundles', () => {
     const r = validateAddForm({ alias: 'work', email: 'a@b.com', forms: true, chat: true, admin: false }, existing);
@@ -53,6 +53,25 @@ describe('validateAddForm', () => {
     }
   });
 
+  it('allBundles leaves out the bundles Google refuses for a gmail.com address, and keeps them for any other domain', () => {
+    const personal = validateAddForm({ alias: 'me', email: 'Someone@Gmail.com', allBundles: true }, existing);
+    const work = validateAddForm({ alias: 'work', email: 'a@b.com', allBundles: true }, existing);
+    expect(personal.ok && work.ok).toBe(true);
+    if (personal.ok && work.ok) {
+      expect(personal.bundles).not.toContain('keep');
+      expect(personal.bundles).not.toContain('cloudidentity');
+      expect(work.bundles).toContain('keep');
+      expect(work.bundles).toContain('cloudidentity');
+      expect(personal.bundles.length).toBe(work.bundles.length - 2);
+    }
+  });
+
+  it('refuses a named keep or cloudidentity bundle for a personal address only', () => {
+    const r = validateAddForm({ alias: 'me', email: 'someone@googlemail.com', otherBundles: 'forms,keep' }, existing);
+    expect(r).toMatchObject({ ok: false, slug: 'E_VALIDATION', message: 'Google does not let a personal account grant "keep".' });
+    expect(validateAddForm({ alias: 'me', email: 'someone@b.com', otherBundles: 'forms,keep' }, existing).ok).toBe(true);
+  });
+
   it('rejects a bad alias', () => {
     const r = validateAddForm({ alias: 'has space', email: 'a@b.com' }, existing);
     expect(r.ok).toBe(false);
@@ -60,7 +79,7 @@ describe('validateAddForm', () => {
   });
 
   it('rejects a duplicate alias with E_ALIAS_EXISTS', () => {
-    const r = validateAddForm({ alias: 'ic', email: 'a@b.com' }, existing);
+    const r = validateAddForm({ alias: 'team', email: 'a@b.com' }, existing);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.slug).toBe('E_ALIAS_EXISTS');
   });
@@ -126,7 +145,7 @@ describe('argsToAddForm (argument-mode fallback)', () => {
   });
 });
 
-describe('scopeGrantDiff (BR5)', () => {
+describe('scopeGrantDiff', () => {
   it('returns the requested scopes that were not granted', () => {
     const requested = ['a', 'b', 'c'];
     expect(scopeGrantDiff(requested, 'a c')).toEqual(['b']);
@@ -140,11 +159,8 @@ describe('scopeGrantDiff (BR5)', () => {
 });
 
 describe('elicitation param shapes (validated against the SDK schemas)', () => {
-  // Schemas come from the SDK package we DECLARE as a dependency; the
-  // core package that defines them is only transitive.
-  // The url-mode branch shipped broken because `as never` at the call site
-  // disabled every shape check: elicitationId is required, so the request
-  // failed client-side validation and the branch always fell through.
+  // Schemas come from the SDK package (a direct dependency, not the transitive core package). The
+  // url-mode branch once shipped broken: `as never` hid that a required elicitationId was missing.
   it('url-mode params satisfy ElicitRequestURLParamsSchema', () => {
     const r = specTypeSchemas.ElicitRequestURLParams.safeParse(
       urlElicitationParams('work', 'https://accounts.google.com/o/oauth2/v2/auth?x=1', 'a'.repeat(32)),

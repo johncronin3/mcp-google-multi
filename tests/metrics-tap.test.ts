@@ -157,9 +157,8 @@ describe('normalizeMessage onRename observer', () => {
 });
 
 describe('closed vocabulary: only REGISTERED tool names may be persisted', () => {
-  // The name on a tools/call frame is client-supplied. A shape check alone
-  // would let a shape-valid invented name reach disk, which is exactly what
-  // the metrics privacy guarantee forbids.
+  // A shape check alone would let a shape-valid invented name reach disk,
+  // which the metrics privacy guarantee forbids.
   it('a shape-valid but UNREGISTERED name is never written; it counts as not-found', async () => {
     const { m, dir } = makeMetrics();
     const { tapped, inbound } = drive(m);

@@ -1,6 +1,6 @@
 # Keep secrets in a vault
 
-A plaintext `.env` is fine to try things out, but for a daily driver, **don't leave `GOOGLE_CLIENT_SECRET` + `MASTER_KEY` on disk** — inject them at launch from a secrets manager. The server just reads `process.env` (it has no idea where the values come from), so wrap it. Since v6 `MASTER_KEY` auto-provisions when absent (OS keychain, else a 0600 `master.key` file, else generated on first run) — that protects tokens **at rest**, not against same-user malware, exactly like an `.env` did. Back to the [README](../README.md).
+A plaintext `.env` is fine to try things out, but for a daily driver, **don't leave `GOOGLE_CLIENT_SECRET` + `MASTER_KEY` on disk** — inject them at launch from a secrets manager. The server just reads `process.env` (it has no idea where the values come from), so wrap it. `MASTER_KEY` auto-provisions when absent (OS keychain, else a 0600 `master.key` file, else generated on first run) — that protects tokens **at rest**, not against same-user malware, exactly like an `.env`. Back to the [README](../README.md).
 
 Example with [Infisical](https://infisical.com):
 
@@ -15,7 +15,7 @@ exec infisical run --projectId <project> --env prod --path /mcp-google-multi \
 ```
 
 ```bash
-claude mcp add google-multi -s user -- ~/.local/bin/mcp-google-multi-run
+claude mcp add mcp-google-multi -s user -- ~/.local/bin/mcp-google-multi-run
 ```
 
 Now the only thing on disk is the **encrypted** token store. Pass the token via the `INFISICAL_TOKEN` env var (as above), **not** a `--token` flag, so it never shows up in `ps`. Any secrets manager works — Doppler, Vault, 1Password CLI, etc. — the pattern is the same.

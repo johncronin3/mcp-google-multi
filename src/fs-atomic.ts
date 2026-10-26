@@ -11,12 +11,14 @@ const RENAME_RETRY_MS = 20;
 const LOCK_LEASE_MS = 60_000;
 // Breaking a lock takes microseconds, so an older breaker file was left by a crash.
 const BREAKER_STALE_MS = 2_000;
+// The no-hard-link fallback writes the lock in two syscalls (create, then the
+// pid); a reader can catch it empty in between. See docs/internals.md.
+const LOCK_WRITE_GRACE_MS = 2_000;
 const PROCESS_START_MS = performance.timeOrigin;
 const OWNER_NAME = /^(\d+)\.(\d+|host)\.(\d+)\.([0-9a-f]{8}|0)\.[0-9a-f]{12}\.owner$/;
 
-/** Which process instance holds a lock: PID namespace id, start time in
- * clock ticks since boot, and a boot id prefix. A part this process cannot
- * read is `host` or `0` (all three without /proc). */
+// Which process instance holds a lock: PID namespace id, start time in clock
+// ticks since boot, and a boot id prefix; an unreadable part is `host` or `0`.
 interface LockIdentity {
   ns: string;
   start: string;
@@ -77,8 +79,10 @@ interface LockHolder extends FileId {
   body: string;
   mtimeNs: bigint;
   mtimeMs: number;
-  /** The holder's owner file, still linked to the lock; absent for an older writer. */
+  /** The holder's owner file, linked to the lock or bound to it by a recorded identity; absent for an older writer. */
   owner?: LockIdentity & { path: string };
+  /** A same-pid owner file exists but its binding does not (yet) match this lock. See docs/internals.md. */
+  ownerPending?: boolean;
 }
 
 function sameFile(a: FileId, b: FileId): boolean {
@@ -89,11 +93,21 @@ function isEnoent(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
+function bindingRecord(id: LockAcquisition): string {
+  return `${id.dev}:${id.ino}:${id.mtimeNs}`;
+}
+
+function matchesBinding(content: string, id: LockAcquisition): boolean {
+  const m = /^(\d+):(\d+):(\d+)$/.exec(content);
+  return m !== null && BigInt(m[1]) === id.dev && BigInt(m[2]) === id.ino && BigInt(m[3]) === id.mtimeNs;
+}
+
 // Undefined when the lock changed hands while it was being read.
 function readHolder(lock: string): LockHolder | undefined {
   const before = fs.lstatSync(lock, { bigint: true });
   const body = before.isFile() ? fs.readFileSync(lock, 'utf8') : '';
   let owner: LockHolder['owner'];
+  let ownerPending = false;
   if (before.isFile()) {
     const dir = path.dirname(lock);
     const prefix = `${path.basename(lock)}.`;
@@ -103,10 +117,12 @@ function readHolder(lock: string): LockHolder | undefined {
       if (!m || m[1] !== body) continue;
       const ownerPath = path.join(dir, name);
       try {
-        if (sameFile(fs.lstatSync(ownerPath, { bigint: true }), before)) {
+        const ownerStat = fs.lstatSync(ownerPath, { bigint: true });
+        if (sameFile(ownerStat, before) || matchesBinding(fs.readFileSync(ownerPath, 'utf8'), before)) {
           owner = { path: ownerPath, ns: m[2], start: m[3], boot: m[4] };
           break;
         }
+        ownerPending = true;
       } catch (error) {
         if (!isEnoent(error)) throw error;
       }
@@ -114,7 +130,7 @@ function readHolder(lock: string): LockHolder | undefined {
   }
   const after = fs.lstatSync(lock, { bigint: true });
   if (!sameFile(before, after)) return undefined;
-  return { body, ino: after.ino, dev: after.dev, mtimeNs: after.mtimeNs, mtimeMs: Number(after.mtimeNs) / 1e6, owner };
+  return { body, ino: after.ino, dev: after.dev, mtimeNs: after.mtimeNs, mtimeMs: Number(after.mtimeNs) / 1e6, owner, ownerPending };
 }
 
 // The owner file's random name tells two holders apart even when the second
@@ -136,9 +152,19 @@ function probeDead(pid: number): boolean {
   }
 }
 
+// Symmetric: a clock step back must not make a write-in-progress lock look
+// permanently fresh (see docs/internals.md).
+function withinWriteGrace(now: number, mtimeMs: number): boolean {
+  return Math.abs(now - mtimeMs) < LOCK_WRITE_GRACE_MS;
+}
+
 function holderDead(holder: LockHolder, now: number): boolean {
+  if (holder.body === '' && withinWriteGrace(now, holder.mtimeMs)) return false;
   const pid = Number(holder.body);
   if (!(Number.isSafeInteger(pid) && pid > 0)) return true;
+  // A same-pid owner file exists but is not yet bound (the fallback lock's two
+  // writes race a reader); give it the same grace as an empty lock.
+  if (!holder.owner && holder.ownerPending && withinWriteGrace(now, holder.mtimeMs)) return false;
   const leaseOver = now - holder.mtimeMs >= LOCK_LEASE_MS;
   const owner = holder.owner;
   // No owner file: an older writer, whose namespace is unknown.
@@ -147,9 +173,8 @@ function holderDead(holder: LockHolder, now: number): boolean {
   // Two unreadable parts compare equal without naming the same namespace or
   // boot, so only a fully known identity is looked up by start time.
   if (SELF.ns !== 'host' && SELF.boot !== '0' && SELF.start !== '0' && owner.start !== '0') {
-    // A live namespace id is never shared, so the recorded pid is ours to
-    // look up: a restarted container reuses both the id and the pid, but not
-    // the start time.
+    // A live namespace id is never shared, so the recorded pid is ours to look
+    // up: a restarted container reuses both the id and the pid, but not the start time.
     const start = startOf(pid);
     if (start !== undefined) return start !== owner.start;
     return probeDead(pid) || leaseOver;
@@ -158,9 +183,8 @@ function holderDead(holder: LockHolder, now: number): boolean {
   return probeDead(pid) || leaseOver;
 }
 
-// One waiter at a time breaks a dead lock: two breakers could otherwise both
-// see the dead holder, and the second would unlink the first one's new lock.
-// False when another waiter is breaking it.
+// One waiter at a time breaks a dead lock, or the second could unlink the
+// first one's new lock; false when another waiter is already breaking it.
 function breakLock(lock: string, holder: LockHolder): boolean {
   const breaker = `${lock}.break`;
   // A token, not the inode: a breaker created after ours was removed can
@@ -206,10 +230,51 @@ function releaseBreaker(breaker: string, token: string): void {
   }
 }
 
-// Hardlink-based advisory lock, generalized path-keyed from the token store's
-// alias-keyed original. The lock body is the bare pid, as older readers expect;
-// the owner file stays linked while held and names the holder's process
-// instance. See docs/internals.md.
+/** The lock's own identity at the moment this call created it. */
+type LockAcquisition = FileId & { mtimeNs: bigint };
+
+// No hard links here (Android/Termux denies link() in private storage, some
+// filesystems lack it entirely): the lock is created directly with O_EXCL,
+// carrying the bare pid a linked owner file would carry, and the owner file
+// is bound to it by a recorded identity instead of a hard link. See docs/internals.md.
+function takeFallbackLock(lock: string, ownerFile: string): LockAcquisition {
+  const fd = fs.openSync(lock, 'wx', 0o600);
+  let acquired: LockAcquisition;
+  try {
+    fs.writeSync(fd, String(process.pid));
+    const stat = fs.fstatSync(fd, { bigint: true });
+    acquired = { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs };
+  } catch (error) {
+    // The lock is left empty; remove it only if it is still the one we just
+    // created, then rethrow so the caller never retries a write failure.
+    const stat = fs.fstatSync(fd, { bigint: true });
+    fs.closeSync(fd);
+    try {
+      if (sameFile(fs.lstatSync(lock, { bigint: true }), stat)) fs.rmSync(lock, { force: true });
+    } catch (cleanupError) {
+      if (!isEnoent(cleanupError)) throw cleanupError;
+    }
+    throw error;
+  }
+  fs.closeSync(fd);
+  try {
+    fs.writeFileSync(ownerFile, bindingRecord(acquired));
+  } catch (error) {
+    // The lock already exists holding our live pid; without this cleanup
+    // every other writer sees an ownerless holder and waits out the full lease.
+    try {
+      const current = fs.lstatSync(lock, { bigint: true });
+      if (sameFile(current, acquired) && current.mtimeNs === acquired.mtimeNs) fs.rmSync(lock, { force: true });
+    } catch (cleanupError) {
+      if (!isEnoent(cleanupError)) throw cleanupError;
+    }
+    throw error;
+  }
+  return acquired;
+}
+
+// Hardlink-based advisory lock; the lock body is the bare pid, as older
+// readers expect. See docs/internals.md.
 export function withFileLock<T>(absPath: string, fn: () => T, label = `lock: ${absPath}`): T {
   const dir = path.dirname(absPath);
   const lock = path.join(dir, `.${path.basename(absPath)}.lock`);
@@ -218,16 +283,28 @@ export function withFileLock<T>(absPath: string, fn: () => T, label = `lock: ${a
   fs.writeFileSync(ownerFile, String(process.pid), { mode: 0o600, flag: 'wx' });
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   let linked = false;
+  let acquired: LockAcquisition | undefined;
 
   try {
     while (true) {
       try {
         fs.linkSync(ownerFile, lock);
         linked = true;
+        acquired = fs.lstatSync(lock, { bigint: true });
         break;
       } catch (error) {
         const err = error as NodeJS.ErrnoException;
-        if (err.code !== 'EEXIST') throw error;
+        if (err.code === 'EACCES' || err.code === 'EPERM') {
+          try {
+            acquired = takeFallbackLock(lock, ownerFile);
+            linked = true;
+            break;
+          } catch (fbError) {
+            if ((fbError as NodeJS.ErrnoException).code !== 'EEXIST') throw fbError;
+          }
+        } else if (err.code !== 'EEXIST') {
+          throw error;
+        }
         try {
           const holder = readHolder(lock);
           if (holder && holderDead(holder, Date.now()) && breakLock(lock, holder)) continue;
@@ -245,22 +322,24 @@ export function withFileLock<T>(absPath: string, fn: () => T, label = `lock: ${a
     if (!linked) fs.rmSync(ownerFile, { force: true });
   }
 
-  let bound = false;
   try {
-    // Some network and FUSE filesystems give each name of one file its own
-    // inode number; there the owner file cannot vouch for the lock.
-    bound = sameFile(fs.lstatSync(ownerFile, { bigint: true }), fs.lstatSync(lock, { bigint: true }));
     return fn();
   } finally {
-    releaseLock(lock, ownerFile, bound);
+    releaseLock(lock, ownerFile, acquired);
   }
 }
 
 // A holder whose lock was broken (its owner file removed with it) must not
-// remove its successor's lock.
-function releaseLock(lock: string, ownerFile: string, bound: boolean): void {
+// remove its successor's lock: only drop the lock if it is still the exact
+// file this call created, and our own owner file is still there to vouch for it.
+function releaseLock(lock: string, ownerFile: string, acquired: LockAcquisition | undefined): void {
   try {
-    if (!bound || sameFile(fs.lstatSync(ownerFile, { bigint: true }), fs.lstatSync(lock, { bigint: true }))) fs.rmSync(lock, { force: true });
+    if (acquired) {
+      const current = fs.lstatSync(lock, { bigint: true });
+      if (sameFile(current, acquired) && current.mtimeNs === acquired.mtimeNs && fs.existsSync(ownerFile)) {
+        fs.rmSync(lock, { force: true });
+      }
+    }
   } catch (error) {
     if (!isEnoent(error)) throw error;
   }

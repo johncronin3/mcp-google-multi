@@ -9,9 +9,8 @@ import { coerceArray, coerceBoolean, coerceJson } from './_coerce.js';
 
 
 export function registerFormsTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -221,6 +220,9 @@ export function registerFormsTools(server: ToolRegistry, deps: CuratedToolDeps =
   );
 }
 
-function handleFormsError(error: any, account: Account) {
-  return handleGoogleApiError(error, account, "Forms tools require the optional \"forms\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=forms (or include \"forms\" in the list) and re-auth.");
+export function handleFormsError(error: any, account: Account) {
+  return handleGoogleApiError(error, account, {
+    scope: "Forms tools require the optional \"forms\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=forms (or include \"forms\" in the list) and re-auth.",
+    bundle: 'forms',
+  });
 }

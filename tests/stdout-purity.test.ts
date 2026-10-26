@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 // stdout IS the JSON-RPC channel for a stdio MCP server — nothing may write to
-// it at import time. Regression guard for the dotenv v17 banner (issue #109).
+// it at import time. Regression guard for the dotenv v17 banner that once corrupted it.
 describe('import-time stdout purity', () => {
   afterEach(() => {
     vi.restoreAllMocks();

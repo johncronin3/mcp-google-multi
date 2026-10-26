@@ -8,9 +8,8 @@ import { handleGoogleApiError } from './_errors.js';
 
 
 export function registerMeetTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   // ─── Conference records (past meetings) ────────────────────────────────
@@ -159,7 +158,7 @@ export function registerMeetTools(server: ToolRegistry, deps: CuratedToolDeps = 
   );
 }
 
-function handleMeetError(error: any, account: Account) {
+export function handleMeetError(error: any, account: Account) {
   return handleGoogleApiError(error, account, {
     scope: 'Meet needs the meetings.space.readonly scope and the Google Meet API enabled in Cloud Console. Confirm both for this account.',
     resource: `Meet denied this conference record to "${account}". Meet exposes records only to the organizer or a participant, so check which account hosted the meeting.`,

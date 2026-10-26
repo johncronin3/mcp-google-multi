@@ -1,10 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { htmlToMarkdown } from '../src/tools/gmail-mime.js';
 
-// D6 read: the HTML->Markdown converter behind gmail read's `markdown`
-// bodyFormat. The parseMessage-level discriminator matrix (plain/markdown/html)
-// lives in gmail-read.test.ts; this suite pins the converter's own contract.
-describe('htmlToMarkdown (A7 D6 read)', () => {
+// The HTML->Markdown converter behind gmail read's `markdown` bodyFormat. The parseMessage-level
+// discriminator matrix (plain/markdown/html) lives in gmail-read.test.ts; this suite pins the converter's own contract.
+describe('htmlToMarkdown', () => {
   it('converts headings, links, and lists to Markdown', () => {
     const { text, ok } = htmlToMarkdown(
       '<h1>Title</h1><p>see <a href="http://x.com">link</a></p><ul><li>a</li></ul>',

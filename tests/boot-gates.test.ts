@@ -21,7 +21,7 @@ const spyExit = () => {
   return { stderr, exit };
 };
 
-describe('boot gates (S1.16)', () => {
+describe('boot gates', () => {
   it('no gates installed = free core: not multi-tenant, no gate object', () => {
     expect(isMultiTenantBoot()).toBe(false);
     expect(mtBootGates()).toBeNull();

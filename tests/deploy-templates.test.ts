@@ -28,7 +28,7 @@ const env = new Map(svc.envVars.map((e) => [e.key, e]));
 // Secrets + user-specific values that must be prompted, never committed.
 const PROMPTED = ['MCP_PUBLIC_URL', 'MCP_OWNER_EMAILS', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_ACCOUNTS'];
 
-describe('Render blueprint (B17) — security invariants', () => {
+describe('Render blueprint — security invariants', () => {
   it('is a docker web service that never auto-deploys', () => {
     expect(svc.type).toBe('web');
     expect(svc.runtime).toBe('docker');
@@ -110,7 +110,7 @@ describe('Cloud Run deploy template', () => {
   });
 });
 
-describe('Railway config (B17)', () => {
+describe('Railway config', () => {
   const railway = read('railway.toml');
 
   it('builds the repo Dockerfile', () => {

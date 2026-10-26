@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Build the MCPB bundle in a clean staging directory so only production
-# dependencies ship. Runs from semantic-release's prepareCmd with the released
-# version as $1; the @semantic-release/github assets option then attaches the
-# file AT release creation. Immutable releases reject post-publish uploads, so
-# the asset must exist before the release does.
+# Packed in a clean staging dir (prod deps only); must exist before release
+# creation since immutable releases reject post-publish asset uploads.
 set -euo pipefail
 
 VERSION="${1:?usage: build-mcpb.sh <version>}"
@@ -16,9 +13,8 @@ cp "$ROOT/package.json" "$ROOT/package-lock.json" "$ROOT/manifest.json" \
 cp -R "$ROOT/dist" "$STAGE/dist"
 
 cd "$STAGE"
-# Stamp the released version everywhere npm or the runtime reads it (the git
-# copies are semantic-release placeholders); the lock's root entry must match
-# package.json or npm ci refuses to install.
+# Stamps versions since npm ci requires the lock's root entry to match
+# package.json.
 VERSION="$VERSION" node -e '
   const fs = require("node:fs");
   const v = process.env.VERSION;

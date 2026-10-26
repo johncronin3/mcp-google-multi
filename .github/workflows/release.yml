@@ -53,21 +53,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx semantic-release
 
-  # The MCPB bundle is packed by scripts/build-mcpb.sh from semantic-release's
-  # prepareCmd and attached at release creation via the github plugin's assets
-  # option: releases are immutable, so assets cannot be uploaded after publish
-  # (a chained job 422s), and there is no backfill for already-published tags.
+  # Packed by scripts/build-mcpb.sh via semantic-release's prepareCmd and attached
+  # at release creation; immutable releases reject post-publish asset uploads.
 
-  # Publishes STABLE releases to the official MCP Registry via GitHub OIDC
-  # (metadata only; npm hosts the package, and the npm tarball's mcpName field
-  # is the ownership proof). Prereleases are skipped on purpose: a prerelease
-  # published after its stable is never marked latest, so there is no listing
-  # benefit. The registry is in preview and may reset; this job makes a reset
-  # a non-event. A failure here never un-publishes npm/GHCR; re-run the job.
+  # OIDC metadata-only publish (ownership proof: npm's mcpName field); skips
+  # prereleases (no listing benefit) and tolerates registry resets; safe to re-run.
   registry:
-    needs: release
+    needs: [release, docker]
     if: >-
       !cancelled() && needs.release.result == 'success' &&
+      needs.docker.result == 'success' &&
       needs.release.outputs.version != '' &&
       needs.release.outputs.channel == 'latest'
     runs-on: ubuntu-latest
@@ -106,9 +101,8 @@ jobs:
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish
 
-  # Publishes the released version as a multi-arch image on GHCR. Chained here
-  # (not `on: push: tags`) because tags pushed with GITHUB_TOKEN never trigger
-  # other workflows. workflow_dispatch backfills an image for an existing tag.
+  # Chained here (not `on: push: tags`) since tags pushed with GITHUB_TOKEN never
+  # trigger other workflows; workflow_dispatch backfills an existing tag's image.
   docker:
     needs: release
     if: >-

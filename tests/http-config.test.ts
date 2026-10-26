@@ -37,7 +37,7 @@ describe('resolveTransport', () => {
   });
 });
 
-describe('canonicalizePublicUrl (BR4)', () => {
+describe('canonicalizePublicUrl', () => {
   it('strips a trailing slash', () => {
     expect(canonicalizePublicUrl('https://mcp.example.com/')).toBe('https://mcp.example.com');
     expect(canonicalizePublicUrl('https://mcp.example.com///')).toBe('https://mcp.example.com');
@@ -147,7 +147,6 @@ describe('resolveHttpConfig', () => {
       MCP_HTTP_PORT: '443',
       MCP_PUBLIC_URL: 'https://mcp.example.com',
     });
-    // no duplicate entries
     expect(new Set(c.allowedHosts).size).toBe(c.allowedHosts.length);
     expect(c.allowedHosts).toContain('mcp.example.com');
   });

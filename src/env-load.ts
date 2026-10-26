@@ -17,11 +17,8 @@ export interface EnvLoadPaths {
   configDir?: string;
 }
 
-// Precedence: real env > CWD .env > package-root .env > ~/.config .env.
-// process.loadEnvFile never overwrites keys already in process.env (pinned by
-// tests/env-load.test.ts T4), so highest-priority file loads FIRST and real
-// env wins by already being present; the boot snapshot re-assert is a second
-// line of defense should those semantics ever change.
+// Precedence: real env > CWD .env > package-root .env > ~/.config .env;
+// the boot snapshot re-assert below is a second line of defense.
 export function loadEnvFiles(paths: EnvLoadPaths = {}): EnvLoadResult {
   // loadEnvFile exists since 20.12, so a feature check alone would let 20.12-21.x through.
   const major = Number(process.versions.node.split('.', 1)[0]);
@@ -78,6 +75,15 @@ export function loadEnvFiles(paths: EnvLoadPaths = {}): EnvLoadResult {
 }
 
 let lastLoad: { bootKeys: Set<string>; loaded: string[] } | undefined;
+
+/** The .env files this process actually loaded a secret from (candidates
+ * that did not exist are not included). Used by the local-file guard to
+ * refuse reading or writing a file the server itself sourced secrets from,
+ * even though it sits outside the config/token directory (e.g. a project
+ * root .env, or MCP_GOOGLE_MULTI_ENV pointing elsewhere entirely). */
+export function getLoadedEnvFiles(): string[] {
+  return lastLoad?.loaded ?? [];
+}
 
 /**
  * Which layer supplied `key`: the real process env, or the first loaded .env
