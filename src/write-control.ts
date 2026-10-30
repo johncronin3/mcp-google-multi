@@ -145,7 +145,28 @@ const TRASH_MOVE_TOOLS = new Set([
   'gmail_users_threads_trash',
 ]);
 
+/**
+ * Emptying Trash. A `*trash` allow matches `drive:empty_trash` only as a
+ * suffix, so it does not open this under read-only. Opt in with
+ * `drive:empty_trash`. No profile permits it on its own.
+ */
+const EMPTY_TRASH_TOOLS = new Set(['drive_empty_trash']);
+
+function isEmptyTrash(tool: { name: string }): boolean {
+  return EMPTY_TRASH_TOOLS.has(tool.name);
+}
+
+function trashExplicitlyAllowed(tool: ToolRef, policy: Policy): boolean {
+  const op = `${tool.service}:${opOf(tool)}`;
+  return policy.allow.some((g) => {
+    if (!globToRegExp(g).test(op)) return false;
+    if (op.endsWith(':empty_trash') && !g.includes('empty_trash')) return false;
+    return true;
+  });
+}
+
 function profileAllows(profile: Profile, tool: ToolRef): boolean {
+  if (isEmptyTrash(tool)) return false;
   if (profile === 'full-writes') return true;
   if (profile === 'safe-writes') {
     if (privilegeOf(tool) !== undefined) return false;
@@ -159,6 +180,7 @@ export function isAllowed(tool: ToolRef, policy: Policy): boolean {
   if (tool.cud === 'read') return true;
   if (policy.readOnly) return false;
   if (matchesAny(tool, policy.deny)) return false;
+  if (isEmptyTrash(tool)) return trashExplicitlyAllowed(tool, policy);
   if (matchesAny(tool, policy.allow)) return true;
   return profileAllows(policy.profile, tool);
 }
@@ -219,6 +241,9 @@ export function denyReason(tool: ToolRef, policy: Policy): DenyReason | undefine
   if (policy.readOnly) return { rule: 'read_only' };
   const pattern = firstMatch(tool, policy.deny);
   if (pattern !== undefined) return { rule: 'deny_glob', pattern };
+  if (isEmptyTrash(tool)) {
+    return trashExplicitlyAllowed(tool, policy) ? undefined : { rule: 'profile', profile: policy.profile };
+  }
   if (matchesAny(tool, policy.allow)) return undefined;
   if (profileAllows(policy.profile, tool)) return undefined;
   const kind = privilegeOf(tool);
