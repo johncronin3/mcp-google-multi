@@ -1,7 +1,7 @@
 name: docker
 
-# Builds and smoke-checks the distroless image (B16). Scoped to Docker changes
-# so it does not run on every slice. Non-required check (only `ci` gates merges).
+# Scoped to Docker changes only (not every push); non-required check; only
+# `ci` gates merges.
 on:
   push:
     branches: [main, staging, dev]
@@ -34,6 +34,16 @@ jobs:
           uid=$(docker run --rm --entrypoint /nodejs/bin/node mcp-google-multi:ci -e 'process.stdout.write(String(process.getuid()))')
           echo "runtime uid: $uid"
           test "$uid" != "0"
+
+      # /data/files is GOOGLE_LOCAL_FILES_DIR's confined root inside the
+      # image (set via ENV in the Dockerfile); it must be owned by the
+      # distroless nonroot image's own uid, or the container's runtime user
+      # (also nonroot, same uid) cannot create files under it on first use.
+      - name: GOOGLE_LOCAL_FILES_DIR confined volume is owned by uid 65532
+        run: |
+          owner_uid=$(docker run --rm --entrypoint /nodejs/bin/node mcp-google-multi:ci -e 'process.stdout.write(String(require("fs").statSync("/data/files").uid))')
+          echo "/data/files owner uid: $owner_uid"
+          test "$owner_uid" = "65532"
 
       - name: No secret files baked into any layer
         run: |

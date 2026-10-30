@@ -10,15 +10,20 @@ import type { Metrics } from './usage-metrics.js';
 import { MAX_SUGGESTED_KEYS, suggestKeys } from './arg-strict.js';
 import { classifyScope } from './scope-observability.js';
 import { aliasesForHint, aliasesVisibleToSession, grantRefusalForCallArgs, missingGrantResult, usableDefaultAlias } from './session-grant.js';
+import { hints } from './hint-provider.js';
 
 /** Nothing granted, no profile: asks the BUNDLE CATALOG whether a scope is
  * reachable at all, independently of any account. */
 const EMPTY_SCOPES: ReadonlySet<string> = new Set<string>();
 
-// Client-side result budget advertised for tools that do not declare their own
-// (fat readers do; see trim.ts). ~50k chars stays well inside a default client
-// context limit while leaving room for real list payloads.
+// Client-side result budget for tools that do not declare their own (fat
+// readers do; see trim.ts); stays well inside a default client context limit.
 const DEFAULT_MAX_RESULT_CHARS = 50_000;
+
+// A human reading a real write's confirmation prompt and deciding takes far
+// longer than a typical tool round trip; the SDK's 60s request default would
+// otherwise time the ask out mid-read on a slow or distracted reviewer.
+const ELICIT_TIMEOUT_MS = 5 * 60_000;
 
 export type Cud = 'read' | 'create' | 'update' | 'delete';
 
@@ -81,6 +86,40 @@ export interface CatalogOperation {
   unreachable?: true;
 }
 
+/** The leading sentence of a (possibly multi-sentence) tool description. */
+export function firstSentence(text: string): string {
+  let openParens = 0;
+  let i = 0;
+  const abbrevs = /^(e\.g|i\.e|etc|vs)\.$/i;
+
+  while (i < text.length) {
+    const char = text[i];
+
+    if (char === '(') {
+      openParens++;
+    } else if (char === ')') {
+      openParens = Math.max(0, openParens - 1);
+    } else if (char === '.' && i + 1 < text.length && text[i + 1] === ' ' && openParens === 0) {
+      // Found a period-space outside parentheses
+      // Check if it's preceded by an abbreviation (e.g., i.e., etc, vs)
+      // Find the word before this period
+      let wordStart = i - 1;
+      while (wordStart > 0 && /[a-zA-Z.]/.test(text[wordStart - 1])) {
+        wordStart--;
+      }
+      const word = text.slice(wordStart, i + 1);
+
+      if (!abbrevs.test(word)) {
+        // Not an abbreviation, so this is a valid sentence boundary
+        return text.slice(0, i + 1);
+      }
+    }
+    i++;
+  }
+
+  return text;
+}
+
 interface ToolConfig {
   description?: string;
   inputSchema?: z.ZodRawShape;
@@ -90,6 +129,11 @@ interface ToolConfig {
   cud?: Cud;
   requiredScopes?: readonly string[];
   _meta?: Record<string, unknown>;
+  /** The escape hatch (google_api_call and every generated per-method
+   * tool): write-control for these runs INSIDE the handler itself
+   * (deny-check, then an elicitation round-trip), not this gate, since
+   * the gate here is synchronous and has no multi-name deny list. */
+  escapeHatch?: boolean;
 }
 
 const CUD_OVERRIDES: Record<string, Cud> = {
@@ -99,9 +143,10 @@ const CUD_OVERRIDES: Record<string, Cud> = {
   set_grant: 'read',
   // read-only resolver; the name's "resolve" verb would otherwise infer update.
   contacts_resolve: 'read',
-  // Account management is gated by anthropic/requiresUserInteraction (forced
-  // human approval), NOT the Google-data write-control profile — so onboarding
-  // works under any profile. cud=read also keeps them off the fan-out path.
+  // "respond" matches no write verb; it patches the event (a write).
+  calendar_respond_event: 'update',
+  // Gated by anthropic/requiresUserInteraction, not write-control, so
+  // onboarding works under any profile; cud=read also keeps them off fan-out.
   account_add: 'read',
   account_reauth: 'read',
   // Writes a LOCAL MCP-client config, not Google data; gated by
@@ -121,10 +166,12 @@ export function serviceOf(name: string): string {
 // read tools that write local files — same savePath fanned across accounts would clobber
 const FANOUT_EXCLUDE = new Set(['gmail_download_attachment', 'drive_download', 'drive_export']);
 
-/** Account-management tools: the `account` they take is the SUBJECT of the
- * operation, not the identity it runs as, so injecting the configured default
- * would silently retarget them. `account_add` would adopt the default as the
- * new alias, and `account_reauth` would re-authenticate the wrong account. */
+// cud=read for gating/fan-out, yet they write (local files, the account
+// registry, config): advertised as writes so annotation-keyed clients prompt.
+const WRITES_DESPITE_READ = new Set([...FANOUT_EXCLUDE, 'account_add', 'account_reauth', 'account_write_config']);
+
+// Their `account` is the SUBJECT of the operation (e.g. the new alias to add),
+// not the identity to run as, so injecting the configured default would retarget them.
 const DEFAULT_ACCOUNT_EXCLUDE = new Set(['account_add', 'account_reauth']);
 
 /** Unwrap optional/default/nullable to the declared scalar kind (zod 4 defs). */
@@ -151,7 +198,7 @@ function isAccountSelector(field: unknown): boolean {
   type Def = { type?: string; innerType?: { _zod?: { def?: Def } } };
   const def = (field as { _zod?: { def?: Def } } | undefined)?._zod?.def;
   if (!def) return false;
-  // A2 made account enums .optional(); unwrap it or fan-out silently dies.
+  // Account enums are .optional(); unwrap it or fan-out silently dies.
   if (def.type === 'optional') return def.innerType?._zod?.def?.type === 'enum';
   return def.type === 'enum';
 }
@@ -176,8 +223,7 @@ export class ToolRegistry {
   private readonly revealed = new Set<string>();
   private readonly jsonSchemaCache = new Map<string, unknown>();
   private readonly argShapeCache = new Map<string, ArgShape>();
-  /** Memoized isUngrantable verdict per tool: the answer depends on the frozen
-   * bundle catalog only, so it never changes within a process. */
+  // Memoized isUngrantable verdict: depends on the frozen bundle catalog only.
   private readonly ungrantable = new Map<string, boolean>();
   private readonly compactOutput = trimEnabled();
   private registeringMeta = false;
@@ -192,9 +238,8 @@ export class ToolRegistry {
     policy: Policy,
     mode: DiscoveryMode = resolveDiscoveryMode(),
     private readonly metrics: Metrics | null = null,
-    // The registry's OWN account view: fan-out expansion, selector validation
-    // and default-account injection all read through it so a registry built
-    // over a subset never observes (or leaks) the global set.
+    // The registry's OWN account view, so one built over a subset never
+    // observes (or leaks) the global set.
     private readonly accounts: () => AccountSet = getAccountSet,
   ) {
     this.policy = policy;
@@ -202,22 +247,17 @@ export class ToolRegistry {
     this.registerTool = ((name: string, config: ToolConfig, handler: (...a: unknown[]) => unknown) => {
       const service = serviceOf(name);
       const cud = config.cud ?? inferCud(name);
-      // destructiveHint=false claims "additive only" (MCP spec) — updates overwrite, so they stay true.
-      // idempotent: reads trivially, deletes (already-gone = same), updates
-      // (overwrite converges); creates are not (send twice = two emails).
+      // Every write is destructive (a create is no less consequential than an
+      // update); idempotent iff not a create (send twice = two emails).
+      const writes = cud !== 'read' || WRITES_DESPITE_READ.has(name);
       const annotations = {
-        readOnlyHint: cud === 'read',
-        destructiveHint: cud === 'delete' || cud === 'update',
+        readOnlyHint: !writes,
+        destructiveHint: writes,
         idempotentHint: cud !== 'create',
         ...config.annotations,
       };
-      // A12: forced per-call human approval on the irreversible set, even in
-      // bypass mode. Client-enforced via the wire _meta (Claude Code reads
-      // anthropic/* ONLY there); the server verdict stays separate.
-      // Every tool also advertises a result-size budget: fat readers declare
-      // their own, everything else inherits the default, so an uncapped tool
-      // can never blow past a client's context limit. Generated tools align
-      // with the executor's server-side cap.
+      // Irreversible-set approval and the result-size budget are both
+      // client-enforced via the wire _meta (anthropic/*); the server verdict stays separate.
       const clientMeta = {
         'anthropic/maxResultSizeChars': config.cud !== undefined ? MAX_RESPONSE_CHARS : DEFAULT_MAX_RESULT_CHARS,
         ...config._meta,
@@ -255,7 +295,7 @@ export class ToolRegistry {
         requiredScopes: config.requiredScopes,
       });
       const guarded =
-        cud === 'read'
+        cud === 'read' || config.escapeHatch
           ? baseHandler
           : (...args: unknown[]) =>
               isAllowed({ name, service, cud, scopes: config.requiredScopes }, policy)
@@ -266,10 +306,8 @@ export class ToolRegistry {
                     // Concrete by here: default-account injection wraps this.
                     (args[0] as { account?: unknown } | undefined)?.account as string | undefined,
                   );
-      // A2: the ONE default-account injection site — outside the CUD gate and
-      // the fan-out parse so both observe a concrete alias; NOT meta-skipped
-      // (that is what covers google_api_call with zero bespoke code). Explicit
-      // aliases, "*" and CSV pass through untouched.
+      // The ONE default-account injection site, outside the CUD gate and the
+      // fan-out parse (not meta-skipped, which is what covers google_api_call).
       // Out-of-grant aliases never reach a handler, so getClient is not called.
       const gate = (...args: unknown[]) => {
         const blocked = grantRefusalForCallArgs(args[0]);
@@ -279,6 +317,14 @@ export class ToolRegistry {
       const noDefaultResult = () => {
         const listed = aliasesForHint(this.accounts().aliases);
         if (listed === 'missing_grant') return missingGrantResult();
+        const accountSet = this.accounts();
+        const accounts = accountSet.aliases.map((alias) => ({ alias, email: accountSet.configs[alias]?.email ?? '' }));
+        const rendered = hints()?.render({ kind: 'no_default_account', accounts });
+        const visible = new Set(listed);
+        const pairs = accounts
+          .filter((a) => visible.has(a.alias))
+          .map((a) => `${a.alias}=${a.email}`)
+          .join(', ');
         return {
           content: [
             {
@@ -286,7 +332,7 @@ export class ToolRegistry {
               text: JSON.stringify({
                 error: 'E_NO_DEFAULT_ACCOUNT',
                 message: 'No "account" given and no default account is configured.',
-                hint: `Pass account explicitly (valid: ${listed.join(', ')}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
+                hint: rendered?.hint ?? `Pass account explicitly (valid: ${pairs}), or set GOOGLE_DEFAULT_ACCOUNT / "defaultAccount" in config.json.`,
                 retriable: false,
               }),
             },
@@ -300,9 +346,8 @@ export class ToolRegistry {
             const first = args[0] as { account?: unknown } | undefined;
             const value = first?.account;
             if (value != null && value !== '') return gate(...args);
-            // Refresh here or the unset->configured default transition never
-            // heals for a client that always omits account (this branch never
-            // reaches getClient's probe). One stat, only on omission.
+            // Refresh here, or a client that always omits account never heals
+            // the unset->configured default transition (getClient's probe is unreached).
             refreshAccountSetIfStale();
             const def = usableDefaultAlias(this.accounts().defaultAccount);
             if (def === 'missing_grant') return missingGrantResult();
@@ -312,10 +357,8 @@ export class ToolRegistry {
       const finalHandler = this.compactOutput
         ? async (...args: unknown[]) => compactResult(await (withDefault(...args) as Promise<Parameters<typeof compactResult>[0]>))
         : withDefault;
-      // Usage metrics wrap OUTERMOST and only when enabled: off means no
-      // wrapper exists and the chain is byte-identical to the pre-metrics
-      // chain. Fan-out width is derived here (bucketed in the module) so the
-      // metrics module never imports fanout.
+      // Usage metrics wrap outermost, only when enabled (off = byte-identical
+      // to the pre-metrics chain); fan-out width is derived here so the metrics module never imports fanout.
       const instrumented = this.metrics
         ? this.metrics.wrap(
             { name, service, meta: this.registeringMeta, generated: config.cud !== undefined },
@@ -341,6 +384,75 @@ export class ToolRegistry {
       this.registeringMeta = false;
     }
   }) as McpServer['registerTool'];
+
+  /**
+   * Server-side MCP elicitation: asks the connected human to confirm an
+   * escape-hatch write. `unsupported` covers every way asking can fail
+   * (no elicitation capability, the transport cannot deliver a mid-call
+   * request, the negotiated protocol era replaced the push-style
+   * request, a timeout, a closed connection, ...) uniformly, since the
+   * caller's only correct response to any of them is the same: refuse
+   * rather than silently proceed without an answer. `cause` lets the
+   * caller phrase the refusal correctly: `http_transport` covers BOTH a
+   * self-hosted HTTP deployment and an EE hosted tenant, which this
+   * server cannot tell apart, so the caller must not suggest
+   * GOOGLE_PROFILE there (a hosted tenant cannot set it); the other
+   * causes are stdio-only, where the caller IS the operator and that
+   * suggestion is safe.
+   *
+   * `policy.transport === 'http'` refuses before ever touching
+   * elicitInput, regardless of what the client declared. This server's
+   * HTTP (EE) transport dispatches every `/mcp` call through a fresh,
+   * disposable transport with `enableJsonResponse: true` (see
+   * docs/internals.md); a mid-call server-to-client request has nothing
+   * to be delivered over there, so even a client that DID declare the
+   * capability would otherwise just hang until elicitInput's own
+   * request timeout before this failed closed anyway, not fail fast.
+   * stdio keeps one live connection for the whole call, so it is
+   * unaffected and still attempts a real elicitation below.
+   *
+   * The capability check (same pattern account-wizard.ts's form
+   * elicitation already uses) covers the remaining case on stdio: a
+   * client that never declared the capability is refused immediately
+   * too, instead of attempting the call and only finding out once
+   * elicitInput's own request timeout elapses. A bare `elicitation: {}`
+   * (no nested `form` key) still counts as form support: some clients on
+   * the 2025-06-18 protocol revision declare the capability this way,
+   * before the form/url sub-modes existed to declare.
+   *
+   * The confirmation itself gets several minutes, not the SDK's 60s
+   * request default: reading a real call and deciding is slower than a
+   * typical tool round trip (documented in docs/configuration.md).
+   */
+  async elicitConfirmation(
+    message: string,
+  ): Promise<{ action: 'accept' | 'decline' | 'cancel' } | { action: 'unsupported'; reason: string; cause: 'http_transport' | 'no_capability' | 'error' }> {
+    if (this.policy.transport === 'http') {
+      return {
+        action: 'unsupported',
+        reason: 'elicitation is not available over this server\'s HTTP transport',
+        cause: 'http_transport',
+      };
+    }
+    const caps = this.server.server.getClientCapabilities?.() as { elicitation?: unknown } | undefined;
+    if (!caps?.elicitation || typeof caps.elicitation !== 'object') {
+      return { action: 'unsupported', reason: 'the connected client has not declared elicitation support', cause: 'no_capability' };
+    }
+    try {
+      const result = await (
+        this.server.server as { elicitInput: (params: unknown, options?: { timeout: number }) => Promise<{ action: string }> }
+      ).elicitInput(
+        { message, requestedSchema: { type: 'object', properties: {} } },
+        { timeout: ELICIT_TIMEOUT_MS },
+      );
+      if (result.action === 'accept' || result.action === 'decline' || result.action === 'cancel') {
+        return { action: result.action };
+      }
+      return { action: 'unsupported', reason: `unexpected elicitation result action "${result.action}"`, cause: 'error' };
+    } catch (err) {
+      return { action: 'unsupported', reason: err instanceof Error ? err.message : String(err), cause: 'error' };
+    }
+  }
 
   services(): string[] {
     return [...new Set(this.tools.filter((t) => !t.meta).map((t) => t.service))];
@@ -389,10 +501,8 @@ export class ToolRegistry {
     const declared = new Set(Object.keys(self.inputShape));
     const byKey = new Map<string, { tools: string[]; curated: boolean }>();
     for (const t of this.tools) {
-      // Only tools the agent can actually see in tools/list. A hint naming a
-      // registered-but-unadvertised generated tool turns a recoverable error
-      // into a dead end: in curated mode 353 tools are registered and 181 are
-      // advertised, and the hint used to reach for any of them.
+      // Only tools visible in tools/list: a hint naming a hidden generated
+      // tool would turn a recoverable error into a dead end.
       if (t.service !== self.service || t.name === tool || !this.isVisible(t)) continue;
       for (const key of Object.keys(t.inputShape)) {
         if (declared.has(key)) continue;
@@ -403,9 +513,8 @@ export class ToolRegistry {
       }
     }
     const candidates = [...byKey.entries()].filter(([, e]) => e.tools.length >= 2 || e.curated);
-    // Reuse the tiered matcher rather than a substring test: the motivating
-    // case (parentId against parentFolderId) fails containment and edit
-    // distance alike, which is the whole reason that matcher exists.
+    // The tiered matcher, not a substring test: parentId vs parentFolderId
+    // fails both containment and edit distance.
     const keys = candidates.map(([key]) => key);
     const hits = new Set(unknownKeys.slice(0, MAX_SUGGESTED_KEYS).flatMap((k) => suggestKeys(k, keys)));
     return candidates
@@ -415,17 +524,32 @@ export class ToolRegistry {
   }
 
   catalog(service: string, query?: string): CatalogOperation[] {
+    const candidates = this.tools.filter((t) => !t.meta && t.service === service);
+    const toOp = (t: ToolEntry, summary: string = t.description): CatalogOperation => ({
+      tool: t.name,
+      summary,
+      args: Object.keys(t.inputShape),
+      cud: t.cud,
+      ...(this.isUngrantable(t) ? { unreachable: true as const } : {}),
+    });
+
     const q = query?.trim().toLowerCase();
-    return this.tools
-      .filter((t) => !t.meta && t.service === service)
-      .filter((t) => !q || t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q))
-      .map((t) => ({
-        tool: t.name,
-        summary: t.description,
-        args: Object.keys(t.inputShape),
-        cud: t.cud,
-        ...(this.isUngrantable(t) ? { unreachable: true as const } : {}),
-      }));
+    if (!q) return candidates.map((t) => toOp(t));
+
+    // Tokenized OR-match (a strict superset of a plain substring test: a full-string
+    // hit implies every one of its tokens also hits) ranked by how many tokens matched.
+    const ranked = candidates
+      .map((t) => {
+        const hay = `${t.name} ${t.description}`.toLowerCase();
+        return { t, matched: q.split(/\s+/).filter(Boolean).filter((tok) => hay.includes(tok)).length };
+      })
+      .filter((r) => r.matched > 0)
+      .sort((a, b) => b.matched - a.matched);
+    if (ranked.length > 0) return ranked.map((r) => toOp(r.t));
+
+    // Nothing matched: list the whole service so the agent can still browse,
+    // one-line summaries only so a wide miss doesn't blow the response budget.
+    return candidates.map((t) => toOp(t, firstSentence(t.description)));
   }
 
   /** The metrics recorder, for hook sites (escape hatch); null when off. */
@@ -507,7 +631,7 @@ export class ToolRegistry {
   }
 
   /** discover_reset: back to the lean meta-only surface. Clears reveals too.
-   * BV-8: if a client mishandles a SHRINKING tools/list, this degrades to a
+   * If a client mishandles a SHRINKING tools/list, this degrades to a
    * no-op for that session — tools stay callable regardless (graceful
    * dispatch), zero correctness impact. */
   collapse(): boolean {
@@ -535,11 +659,8 @@ export class ToolRegistry {
     if (!tool.requiredScopes || tool.requiredScopes.length === 0) return false;
     const cached = this.ungrantable.get(tool.name);
     if (cached !== undefined) return cached;
-    // EVERY alternative must be ungrantable. `classifyMethodScopes` cannot
-    // answer this: `add_bundle` and `unknown_scope` share the
-    // `not_requestable` rank, so its first-best match hides a grantable
-    // alternative that appears later in the list. Discovery scope lists are
-    // ANY-OF, so one grantable alternative makes the method reachable.
+    // EVERY alternative must be ungrantable (scope lists are ANY-OF); a
+    // first-best classifyScope match would hide a grantable one later in the list.
     const verdict = tool.requiredScopes.every((scope) => {
       const c = classifyScope(scope, EMPTY_SCOPES, EMPTY_SCOPES);
       return c.state === 'not_requestable' && c.reason === 'unknown_scope';
@@ -551,10 +672,8 @@ export class ToolRegistry {
 
   isVisible(tool: ToolEntry): boolean {
     const mode = this.effectiveMode();
-    // Advertising a tool that can never succeed spends context budget to hand
-    // the agent a dead end. It stays registered and callable, so calling it by
-    // name still produces the real scope error plus its remediation, and
-    // {service}_discover still lists it, marked.
+    // Hidden, not unregistered: calling an ungrantable tool by name still
+    // produces the real scope error, and {service}_discover still lists it, marked.
     if (!tool.meta && this.isUngrantable(tool)) return false;
     return (
       tool.meta ||
@@ -577,10 +696,7 @@ export class ToolRegistry {
       throw new Error('installListHandler() requires at least one registered tool');
     }
     this.server.server.setRequestHandler('tools/list', async () => ({
-      // The wire Tool is hand-built because the SDK's own types drop the
-      // anthropic/* _meta keys honoring clients read. z.toJSONSchema emits a
-      // valid draft-7 object schema by construction, which the SDK's recursive
-      // JSON-Schema type cannot infer from our cached `unknown`.
+      // Hand-built: the SDK's own Tool type drops the anthropic/* _meta keys honoring clients read.
       tools: this.tools.filter((t) => this.isVisible(t)).map((t) => this.toToolJson(t)) as ListToolsResult['tools'],
     }));
   }
@@ -600,12 +716,8 @@ export class ToolRegistry {
     };
   }
 
-  /** Advertise the CURRENT alias enum on every tools/list: account validation
-   * is (or is becoming) live, so a cached boot-time enum would go stale the
-   * moment account_add lands mid-session. The structural schema stays cached;
-   * only the account property's values are refreshed per call. Skipped for
-   * the subject-taking account tools (their `account` is the OPERAND, e.g. a
-   * brand-new alias name, not an identity to enumerate). */
+  // Refreshes the account enum's values per call (structural schema stays
+  // cached), so a cached boot-time list doesn't go stale once account_add runs mid-session.
   private withLiveAccountEnum(tool: ToolEntry, schema: unknown): unknown {
     if (DEFAULT_ACCOUNT_EXCLUDE.has(tool.name)) return schema;
     const s = schema as { properties?: Record<string, unknown> };

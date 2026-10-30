@@ -1,8 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-// COVERAGE.md generator: enumerates the full tool surface from the registry
-// so the docs can never drift from the code. Usage: npm run gen:coverage
+// Enumerates the full tool surface from the registry so docs can never drift from code.
 
 // The registry surface is env-independent, but the account modules require
 // these at import time — set fixtures BEFORE any src import.
@@ -44,9 +43,8 @@ function gatingFor(service: string): string {
   return 'default';
 }
 
-// What a DEFAULT install actually registers: no optional bundles, no admin
-// account, so only the ungated services. `full` above is the ceiling, reached
-// only with every bundle plus an admin account.
+// Default install: no optional bundles/admin account, so only ungated
+// services register; `full` above is the ceiling with everything granted.
 const defaultInstall = makeRegistry();
 for (const svc of SERVICES) if (!svc.enabled) svc.register(defaultInstall);
 for (const gen of GENERATED_SERVICES) {

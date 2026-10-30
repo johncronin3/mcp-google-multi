@@ -1,4 +1,5 @@
 import type { Cud } from './registry.js';
+import { hints } from './hint-provider.js';
 
 export type Profile = 'read-only' | 'safe-writes' | 'full-writes';
 export type Transport = 'stdio' | 'http';
@@ -9,31 +10,31 @@ export interface Policy {
   allow: string[];
   deny: string[];
   /**
-   * B14 reserved seam (cc-write-control "HTTP posture", LOCKED to OQ-5
-   * "annotations only"): the dispatch transport is threaded into the resolved
-   * policy for the EE/future seam, but in v6 alpha it does NOT stiffen the
-   * profile or alter any `isAllowed` verdict. "Stricter on HTTP" is achieved
-   * entirely by the `anthropic/requiresUserInteraction` annotation on the
-   * irreversible set (A12), emitted identically on both transports.
+   * The dispatch transport, threaded into the resolved policy. Never
+   * alters `isAllowed`'s verdict or the profile itself: a curated tool's
+   * allow/deny/profile gate is identical on both transports. It DOES
+   * alter the escape hatch's ask step (`ToolRegistry.elicitConfirmation`,
+   * `src/registry.ts`): over HTTP, a write that would otherwise ask a
+   * human is refused instead, since the stateless HTTP transport cannot
+   * deliver the mid-call confirmation request (see docs/internals.md).
    * Optional so existing Policy literals (codegen/tests) need no change;
    * resolvePolicy always populates it.
    */
   transport?: Transport;
 }
 
-interface ToolRef {
+export interface ToolRef {
   name: string;
   service: string;
   cud: Cud;
-  /** The method's required OAuth scopes, when the caller knows them. Absent
-   * means "unknown", which is treated as not privileged: a missing scope list
-   * must not silently widen the gate OR silently break an ordinary write. */
+  // Absent means "unknown", treated as not privileged: a missing scope list
+  // must not silently widen the gate or break an ordinary write.
   scopes?: readonly string[];
 }
 
 const PROFILES: Profile[] = ['read-only', 'safe-writes', 'full-writes'];
 
-/** The irreversible set (frozen, cc-write-control): real sends leave the
+/** The irreversible set (frozen): real sends leave the
  * user's (or org's) identity unrecallably; permanent deletes bypass Trash.
  * Includes the callable GENERATED twins of the curated ops — the surface is
  * always callable by name, so a prompt-free twin would defeat the layer.
@@ -46,12 +47,12 @@ export const IRREVERSIBLE_TOOLS = new Set([
   'gmail_send',
   'gmail_send_draft',
   'gmail_delete',
+  'gmail_delete_draft',
   'gmail_batch_delete',
   'drive_delete',
   'drive_empty_trash',
   // generated twins (permanent deletes / real sends)
   'gmail_users_threads_delete',
-  'gmail_users_drafts_delete',
   'chat_spaces_messages_delete',
   'cloudidentity_customers_userinvitations_send',
   'vault_matters_holds_delete',
@@ -107,15 +108,17 @@ function matchesAny(tool: ToolRef, globs: string[]): boolean {
   return firstMatch(tool, globs) !== undefined;
 }
 
-/** Scopes that authorize acting on the whole organization, on legal holds, on
- * billing, or on deployed code. A write behind one of these is not a "safe"
- * write in any useful sense of the word, whatever its HTTP verb. */
+// Scopes that authorize acting on the whole organization, legal holds,
+// billing, or deployed code: not a "safe" write, whatever its HTTP verb.
 const PRIVILEGED_SCOPE_RE =
   /\/auth\/(admin\.directory|admin\.datatransfer|cloud-identity|apps\.licensing|apps\.order|apps\.groups\.settings|apps\.groups\.migration|ediscovery|script\.projects|script\.deployments)/;
 
 /** Registering a push channel hands this account's activity to an external URL.
- * It is shaped like a create and behaves like an export, so the verb hides it. */
-const PUSH_REGISTRATION_RE = /(_watch|_subscriptions_create|_subscriptions_reactivate)$/;
+ * It is shaped like a create and behaves like an export, so the verb hides it.
+ * forms.forms.watches.create/renew generate as _watches_create/_watches_renew
+ * (plural "watches", unlike every other API's singular *.watch), so they
+ * need their own branch alongside the common _watch suffix. */
+const PUSH_REGISTRATION_RE = /(_watch|_watches_create|_watches_renew|_subscriptions_create|_subscriptions_reactivate)$/;
 
 export type PrivilegeKind = 'push_registration' | 'privileged_scope';
 
@@ -130,15 +133,27 @@ export function privilegeOf(tool: ToolRef): PrivilegeKind | undefined {
   return undefined;
 }
 
+/** Moves an item to Trash rather than deleting it permanently: the owner can
+ * still recover it, so safe-writes treats this like its other reversible
+ * writes despite the delete-shaped verb. Named explicitly rather than matched
+ * by verb, so a synthetic delete-classified check (drive_transfer's move
+ * flag) never qualifies by accident, and so emptying Trash, which the same
+ * verb regex also classifies as delete, is never swept in by a suffix match. */
+const TRASH_MOVE_TOOLS = new Set([
+  'gmail_trash',
+  'drive_trash',
+  'gmail_users_threads_trash',
+]);
+
 /**
  * Emptying Trash. A `*trash` allow matches `drive:empty_trash` only as a
  * suffix, so it does not open this under read-only. Opt in with
  * `drive:empty_trash`. No profile permits it on its own.
  */
-const TRASH_MOVE_TOOLS = new Set(['drive_empty_trash']);
+const EMPTY_TRASH_TOOLS = new Set(['drive_empty_trash']);
 
-export function isTrashMove(tool: { name: string }): boolean {
-  return TRASH_MOVE_TOOLS.has(tool.name);
+function isEmptyTrash(tool: { name: string }): boolean {
+  return EMPTY_TRASH_TOOLS.has(tool.name);
 }
 
 function trashExplicitlyAllowed(tool: ToolRef, policy: Policy): boolean {
@@ -151,11 +166,12 @@ function trashExplicitlyAllowed(tool: ToolRef, policy: Policy): boolean {
 }
 
 function profileAllows(profile: Profile, tool: ToolRef): boolean {
-  if (isTrashMove(tool)) return false;
+  if (isEmptyTrash(tool)) return false;
   if (profile === 'full-writes') return true;
   if (profile === 'safe-writes') {
     if (privilegeOf(tool) !== undefined) return false;
-    return tool.cud === 'create' || tool.cud === 'update';
+    if (tool.cud === 'create' || tool.cud === 'update') return true;
+    return tool.cud === 'delete' && TRASH_MOVE_TOOLS.has(tool.name);
   }
   return false;
 }
@@ -164,9 +180,46 @@ export function isAllowed(tool: ToolRef, policy: Policy): boolean {
   if (tool.cud === 'read') return true;
   if (policy.readOnly) return false;
   if (matchesAny(tool, policy.deny)) return false;
-  if (isTrashMove(tool)) return trashExplicitlyAllowed(tool, policy);
+  if (isEmptyTrash(tool)) return trashExplicitlyAllowed(tool, policy);
   if (matchesAny(tool, policy.allow)) return true;
   return profileAllows(policy.profile, tool);
+}
+
+export type EscapeHatchDecision = 'allow' | 'deny' | 'ask';
+
+export interface EscapeHatchVerdict {
+  decision: EscapeHatchDecision;
+  /** The ref that explains the verdict: the specific name a deny glob
+   * matched, or `primaryName` for every other case. */
+  ref: ToolRef;
+}
+
+/**
+ * The escape hatch (google_api_call and every generated per-method tool)
+ * has no allow-list or privileged-write special case of its own anymore:
+ * an explicit deny on any name the operation is known by still wins
+ * (narrows what gets through, never widens it, so listing every curated
+ * tool sharing a raw method here is always safe); full-writes with the
+ * outbound allowlist off is the only automatic allow; everything else
+ * (the default profile, safe-writes, any allow list set, or full-writes
+ * with the allowlist on) asks a human via elicitation instead of
+ * resolving the question itself.
+ */
+export function escapeHatchVerdict(
+  denyNames: readonly string[],
+  base: { service: string; cud: Cud; scopes?: readonly string[] },
+  primaryName: string,
+  policy: Policy,
+  outboundAllowlistActive: boolean,
+): EscapeHatchVerdict {
+  const primaryRef: ToolRef = { name: primaryName, service: base.service, cud: base.cud, scopes: base.scopes };
+  if (base.cud === 'read') return { decision: 'allow', ref: primaryRef };
+  if (policy.readOnly) return { decision: 'deny', ref: primaryRef };
+  const denyRefs = denyNames.map((name): ToolRef => ({ name, service: base.service, cud: base.cud, scopes: base.scopes }));
+  const deniedRef = denyRefs.find((ref) => matchesAny(ref, policy.deny));
+  if (deniedRef) return { decision: 'deny', ref: deniedRef };
+  if (policy.profile === 'full-writes' && !outboundAllowlistActive) return { decision: 'allow', ref: primaryRef };
+  return { decision: 'ask', ref: primaryRef };
 }
 
 /** Which profiles would permit this tool at all. */
@@ -188,7 +241,7 @@ export function denyReason(tool: ToolRef, policy: Policy): DenyReason | undefine
   if (policy.readOnly) return { rule: 'read_only' };
   const pattern = firstMatch(tool, policy.deny);
   if (pattern !== undefined) return { rule: 'deny_glob', pattern };
-  if (isTrashMove(tool)) {
+  if (isEmptyTrash(tool)) {
     return trashExplicitlyAllowed(tool, policy) ? undefined : { rule: 'profile', profile: policy.profile };
   }
   if (matchesAny(tool, policy.allow)) return undefined;
@@ -202,6 +255,20 @@ export function denyReason(tool: ToolRef, policy: Policy): DenyReason | undefine
   return { rule: 'profile', profile: policy.profile };
 }
 
+const CUD_CLASSES: readonly string[] = ['read', 'create', 'update', 'delete'];
+
+// The allow-list vocabulary is service:cud or service:op, never the tool
+// name, so suggesting the name would hand back a pattern that never matches.
+function allowSuggestion(tool: ToolRef): string {
+  const op = opOf(tool);
+  const pattern = `${tool.service}:${op}`;
+  // An op spelled like a cud class (drive_update) is also that class's pattern.
+  if (CUD_CLASSES.includes(op)) {
+    return `allow it with GOOGLE_WRITE_ALLOW="${pattern}", which also allows every other ${op}-class ${tool.service} tool`;
+  }
+  return `allow just this one with GOOGLE_WRITE_ALLOW="${pattern}"`;
+}
+
 function denyHint(tool: ToolRef, reason: DenyReason): string {
   if (reason.rule === 'read_only') {
     return 'GOOGLE_READ_ONLY=true refuses every write, ahead of the profile and the allow-list, so neither of those can enable this. Unset GOOGLE_READ_ONLY to allow writes.';
@@ -213,25 +280,31 @@ function denyHint(tool: ToolRef, reason: DenyReason): string {
     const what = reason.kind === 'push_registration'
       ? 'registers a push channel, which sends this account\'s activity to an external URL'
       : 'needs a scope that acts on the whole organization, on legal holds, on billing, or on deployed code';
-    return `"${tool.name}" ${what}, so "${reason.profile}" refuses it whatever its verb. Use GOOGLE_PROFILE=full-writes, or allow just this one with GOOGLE_WRITE_ALLOW="${tool.service}:${opOf(tool)}".`;
+    return `"${tool.name}" ${what}, so "${reason.profile}" refuses it whatever its verb. Use GOOGLE_PROFILE=full-writes, or ${allowSuggestion(tool)}.`;
   }
   const usable = profilesAllowing(tool).filter((p) => p !== reason.profile);
   const profiles = usable.length > 0
     ? `Use GOOGLE_PROFILE=${usable.join(' or ')}`
     : 'No profile permits this operation';
-  // The allow-list vocabulary is service:cud or service:op, never the tool
-  // name, so suggesting the name would hand back a pattern that never matches.
-  return `Profile "${reason.profile}" does not permit ${tool.cud}. ${profiles}, or allow just this one with GOOGLE_WRITE_ALLOW="${tool.service}:${opOf(tool)}".`;
+  return `Profile "${reason.profile}" does not permit ${tool.cud}. ${profiles}, or ${allowSuggestion(tool)}.`;
 }
 
 export function writeDisabledResult(tool: ToolRef, policy: Policy, account?: string) {
   // Recomputed rather than passed in: every call site has already run
   // isAllowed, and a hint that disagrees with the verdict is worse than none.
   const reason = denyReason(tool, policy) ?? { rule: 'profile' as const, profile: policy.profile };
+  const rendered = hints()?.render({
+    kind: 'write_denied',
+    tool: { name: tool.name, service: tool.service, cud: tool.cud },
+    reason,
+    policy,
+  });
   const envelope = {
     error: 'write_disabled',
-    message: `"${tool.name}" (${tool.cud}) is disabled by the current write-control policy (profile: ${policy.profile}${policy.readOnly ? ', GOOGLE_READ_ONLY=true' : ''}).`,
-    hint: denyHint(tool, reason),
+    message:
+      rendered?.message ??
+      `"${tool.name}" (${tool.cud}) is disabled by the current write-control policy (profile: ${policy.profile}${policy.readOnly ? ', GOOGLE_READ_ONLY=true' : ''}).`,
+    hint: rendered?.hint ?? denyHint(tool, reason),
     retriable: false,
     ...(account ? { account } : {}),
   };

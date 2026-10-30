@@ -1,10 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { resolveReply, deriveReplySubject } from '../src/tools/gmail.js';
 
-// Fake Gmail client exposing only what resolveReply touches: messages.get
-// (metadata headers) and settings.sendAs.list (own-address set). resolveReply
-// memoizes the own-address set per account, so every test uses a UNIQUE account
-// string to avoid cross-test cache bleed.
+// Fake Gmail client exposing only what resolveReply touches. It memoizes the own-address set
+// per account, so every test below uses a unique account string to avoid cross-test cache bleed.
 function fakeGmail(opts: { headers?: Array<{ name: string; value: string }>; sendAs?: string[]; throwGet?: boolean; sendAsThrows?: boolean }) {
   return {
     users: {
@@ -37,7 +35,7 @@ describe('deriveReplySubject', () => {
   });
 });
 
-describe('resolveReply (A8 auto-fill)', () => {
+describe('resolveReply (auto-fill)', () => {
   it('derives to=From, subject=Re:, threading headers; no cc without replyAll', async () => {
     const g = fakeGmail({
       headers: H({ From: 'Alice <alice@ext.com>', To: 'me@acct.com', Subject: 'Question', 'Message-ID': '<abc@ext>' }),
@@ -67,9 +65,9 @@ describe('resolveReply (A8 auto-fill)', () => {
     const cc = r.cc ?? '';
     expect(cc).toContain('bob@ext.com');
     expect(cc).toContain('carol@ext.com');
-    expect(cc).not.toContain('me@acct.com');   // own primary excluded
-    expect(cc).not.toContain('alias@acct.com'); // own send-as excluded
-    expect(cc).not.toContain('alice@ext.com');  // already the to recipient
+    expect(cc).not.toContain('me@acct.com');
+    expect(cc).not.toContain('alias@acct.com');
+    expect(cc).not.toContain('alice@ext.com');
   });
 
   it('replying to your own sent mail: to falls back to source To', async () => {

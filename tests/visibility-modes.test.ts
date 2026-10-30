@@ -68,7 +68,7 @@ describe('visibility modes (layer x mode)', () => {
   });
 });
 
-describe('A11: anthropic/* keys ride _meta, never annotations (SDK strips unknown annotation keys)', () => {
+describe('anthropic/* keys ride _meta, never annotations (SDK strips unknown annotation keys)', () => {
   it('toToolJson emits _meta for client extension keys and keeps annotations spec-only', () => {
     const server = { registerTool: () => 'ok', sendToolListChanged: vi.fn(), server: { setRequestHandler: () => {} } };
     const registry = new ToolRegistry(server as never, POLICY, 'lazy');
@@ -143,7 +143,7 @@ describe('expand/collapse runtime overlay', () => {
   });
 });
 
-describe('A12: irreversible set carries requiresUserInteraction', () => {
+describe('irreversible set carries requiresUserInteraction', () => {
   it('gmail_send gets the annotation; reversible mutations never do', () => {
     const server = { registerTool: () => 'ok', sendToolListChanged: vi.fn(), server: { setRequestHandler: () => {} } };
     const registry = new ToolRegistry(server as never, POLICY, 'lazy');

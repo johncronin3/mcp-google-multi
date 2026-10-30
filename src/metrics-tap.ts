@@ -2,27 +2,15 @@ import type { Transport, JSONRPCMessage, MessageExtraInfo } from "@modelcontextp
 import type { Metrics } from './usage-metrics.js';
 import { isSchemaValidationText } from './arg-normalize.js';
 
-// Pre-handler failure tap (metrics spec section 3), following the
-// withArgNormalization proxy shape at the same two wrap sites. Inbound:
-// request id -> tool name for tools/call (name only; the transport's
-// method-only, no-params, no-PII rule). Outbound: a JSON-RPC ERROR frame
-// means no handler ran, so it is counted here and ONLY here; handler results
-// (isError envelopes included) return as results and are counted by the
-// registry wrapper. That partition is the no-double-counting guarantee.
-//
-// -32602 splits on the SDK's message: an unknown tool carries a client-typed
-// name (free text, never recorded), a schema rejection carries a registered
-// tool's name (safe to attribute).
+// Pre-handler failure tap: a JSON-RPC ERROR frame is counted here and ONLY
+// here, never by the registry wrapper. See docs/internals.md.
 
 type OnMessage = (<T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void) | undefined;
 
 const PENDING_CAP = 1_000;
 
-// The detector lives next to the rewriter that consumes the same frames, so
-// the two can never drift apart. This tap sees the ORIGINAL prose:
-// withValidationEnvelope sits BELOW it and converts that same frame into an
-// envelope for the client, so classification here and the contract on the wire
-// stay independent.
+// This tap sees the ORIGINAL prose; withValidationEnvelope sits BELOW it and
+// converts the same frame for the client, so the two stay independent.
 export { isSchemaValidationText };
 
 /**

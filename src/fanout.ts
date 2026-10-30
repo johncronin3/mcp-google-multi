@@ -2,24 +2,19 @@ import { z } from 'zod';
 import { getAccountSet, liveAccountCheck, unknownAliasMessage } from './accounts.js';
 import { echoName, echoNames, MAX_SUGGESTED_KEYS } from './arg-strict.js';
 import { allowedAccounts, isGrantEnforced } from './session-grant.js';
+import { hints } from './hint-provider.js';
 
 export const CSV_RE = /^[a-zA-Z0-9_-]+(\s*,\s*[a-zA-Z0-9_-]+)+$/;
 
 const FANOUT_CONCURRENCY = 5;
 
-// `aliases` is required (no global default): the field is baked into a
-// registry's inputSchema, so it must read THAT registry's account set or a
-// '*' would advertise and accept another registry's aliases. It is a getter:
-// the set is read at parse time, so an alias added mid-session (account_add,
-// a tenant link) is valid on tools registered before it existed.
+// `aliases` is a getter read at parse time (not baked), so a registry only
+// ever sees ITS OWN account set, and a mid-session alias (account_add) is valid on tools registered before it existed.
 export function fanoutAccountField(description: string, aliases: () => readonly string[]): z.ZodType {
   const boot = aliases();
   const csvExample = boot.length > 1 ? `; or a CSV subset like "${boot.slice(0, 2).join(',')}"` : '';
-  // The union's OWN error only fires when every branch aborts at the type
-  // check (a non-string). For a string, zod surfaces the single non-aborted
-  // branch verbatim, which is the CSV regex, so a mistyped alias used to read
-  // as "Invalid string: must match pattern /^[a-zA-Z0-9_-]+(,...)/" and never
-  // named an alias. Hence the same message on BOTH.
+  // Same message on both union branches: for a string, zod surfaces the
+  // single non-aborted branch (the CSV regex) verbatim, which never named the alias.
   const bad = () => unknownAliasMessage(aliases(), true);
   return z
     // The selector branch stays first: tools/list injects the live
@@ -76,6 +71,8 @@ export function parseAccountSelector(
   }
 
   if (value === '*') return { ok: true, fanout: true, aliases: [...universe] };
+  // A single alias used to skip validation and reach getClient, whose throw
+  // landed on the mapper's floor as an unclassified upstream_error.
   if (!value.includes(',')) {
     return universe.includes(value)
       ? { ok: true, fanout: false, aliases: [value] }
@@ -191,10 +188,17 @@ export async function runFanout(
         const payload = parsePayload(res);
         results[i] = res?.isError ? { account, ok: false, error: payload } : { account, ok: true, data: payload };
       } catch (err) {
+        const rendered = hints()?.render({ kind: 'internal', account });
         results[i] = {
           account,
           ok: false,
-          error: { error: 'internal', message: (err as Error).message, retriable: false, account },
+          error: {
+            error: 'internal',
+            message: rendered?.message ?? (err as Error).message,
+            hint: rendered?.hint,
+            retriable: false,
+            account,
+          },
         };
       }
     }
@@ -202,10 +206,8 @@ export async function runFanout(
   await Promise.all(Array.from({ length: Math.min(FANOUT_CONCURRENCY, aliases.length) }, () => worker()));
   const failed = results.filter((r) => !r.ok).length;
   if (failed === results.length && results.length > 0) {
-    // Every account failed, so this IS an error result, and used to carry
-    // `isError` with no top-level error, hint or retriable: the agent saw a
-    // successful-looking object flagged as an error, and metrics bucketed it
-    // as `other`. Hoist a real envelope, keeping the per-account detail.
+    // Every account failed, so this IS an error result: hoist a real
+    // top-level envelope (error/hint/retriable), keeping the per-account detail.
     const slugs = [...new Set(results.map((r) => (r.error as { error?: string } | undefined)?.error ?? 'internal'))];
     const hints = [...new Set(results.map((r) => (r.error as { hint?: string } | undefined)?.hint).filter(Boolean))];
     const retriable = results.every((r) => (r.error as { retriable?: boolean } | undefined)?.retriable === true);

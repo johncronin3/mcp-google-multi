@@ -1,105 +1,32 @@
-import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { buildRegistry, requestHooksFor } from '../src/compose.js';
-import { buildIdentityContext, isOwnerContext, type IdentityContext } from '../src/identity.js';
+import { buildIdentityContext, isOwnerContext } from '../src/identity.js';
 import { clearDiscoveryMemoryCache } from '../src/discovery-client.js';
 import type { AccountSet } from '../src/accounts.js';
-import type { ScopeProfile } from '../src/scope-catalog.js';
+import { accountSet, fakeServer, toolHarness, parseResult as parse, type GoogleRequest } from './_tool-harness.js';
 
-// buildRegistry must resolve every handler through the context it is given.
-// tests/setup.ts seeds the GLOBAL registry with `test:test@example.com`, and
-// every context below reuses the alias `test`: wherever a handler fell back to
-// the process global it would surface test@example.com (or the global token
-// store), so each case fails against a registry that ignores its context.
+// buildRegistry must resolve every handler through the context it is given. tests/setup.ts seeds the
+// GLOBAL registry with the same alias `test`, so a handler that fell back to it would surface the wrong email/token, not silently pass.
 
-type Result = { content: { text: string }[]; isError?: boolean };
-type Handler = (args: Record<string, unknown>, extra?: unknown) => Promise<Result>;
-type Req = { url: string; method?: string; data?: unknown };
-
-interface Row {
-  email: string;
-  admin?: boolean;
-  scopeProfile?: string;
-}
-
-function setWith(rows: Record<string, Row>, opts: { defaultAccount?: string; scopeProfiles?: Record<string, ScopeProfile> } = {}): AccountSet {
-  const configs: AccountSet['configs'] = {};
-  for (const [alias, r] of Object.entries(rows)) {
-    configs[alias] = {
-      email: r.email,
-      tokenPath: `/nonexistent/${alias}/token.json`,
-      encPath: `/nonexistent/${alias}.enc`,
-      source: 'config',
-      ...(r.admin ? { admin: true } : {}),
-      ...(r.scopeProfile ? { scopeProfile: r.scopeProfile } : {}),
-    };
-  }
-  return {
-    aliases: Object.keys(rows),
-    configs,
-    scopeProfiles: { base: { bundles: [] }, ...opts.scopeProfiles },
-    source: 'file',
-    stamp: '1:0',
-    ...(opts.defaultAccount ? { defaultAccount: opts.defaultAccount, defaultAccountSource: 'config' as const } : {}),
-  };
-}
-
-function fakeServer() {
-  const handlers: Record<string, Handler> = {};
-  const schemas: Record<string, Record<string, unknown>> = {};
-  const server = {
-    registerTool: (name: string, config: { inputSchema?: Record<string, unknown> }, handler: Handler) => {
-      handlers[name] = handler;
-      schemas[name] = config.inputSchema ?? {};
-      return 'ok';
-    },
-    sendToolListChanged: vi.fn(),
-    server: { setRequestHandler: () => {}, getClientCapabilities: () => undefined },
-  };
-  return { server, handlers, schemas };
-}
-
-const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
+type Req = GoogleRequest;
+const setWith = accountSet;
 
 function contextFor(
   subject: string,
   set: AccountSet,
   opts: { scope?: string; requestImpl?: (req: Req) => Promise<unknown> } = {},
 ) {
-  const request = vi.fn(opts.requestImpl ?? (async () => ({ data: {}, headers: new Headers() })));
-  const getClient = vi.fn(async () => ({ request }));
-  const token = {
-    access_token: `at-${subject}`,
-    refresh_token: `rt-${subject}`,
-    scope: opts.scope ?? GMAIL_SCOPE,
-    token_type: 'Bearer',
-    expiry_date: Date.now() + 3_600_000,
-  };
-  const tokenStore = {
-    readToken: vi.fn(() => token),
-    writeToken: vi.fn(),
-    updateToken: vi.fn(),
-    hasToken: vi.fn(() => true),
-  };
-  const ctx = {
-    subject,
-    accounts: set,
-    policy: { profile: 'full-writes', readOnly: false, allow: [], deny: [] },
-    getClient,
-    tokenStore,
-  } as unknown as IdentityContext;
-  const { server, handlers, schemas } = fakeServer();
-  buildRegistry(server as never, ctx, 'eager');
-  return { ctx, request, getClient, tokenStore, handlers, schemas };
+  return toolHarness({ subject, accounts: set, scope: opts.scope, requestImpl: opts.requestImpl });
 }
 
 type Built = ReturnType<typeof contextFor>;
 
-const parse = (r: Result) => JSON.parse(r.content[0].text);
 const WIZARD = ['account_add', 'account_reauth', 'account_write_config'];
-const HOST_FILE_TOOLS = ['drive_upload', 'drive_download', 'drive_export', 'gmail_download_attachment'];
+// drive_upload is always registered (contentBase64 needs no host disk); localPath is owner-only, checked below.
+const HOST_FILE_TOOLS = ['drive_download', 'drive_export', 'gmail_download_attachment'];
 
 let A: Built;
 let B: Built;
@@ -163,18 +90,27 @@ describe('buildRegistry resolves every handler through its context', () => {
     expect(B.tokenStore.readToken).not.toHaveBeenCalled();
   });
 
-  it('account_list lists only the context accounts, token health and admin flags', async () => {
+  it('account_list is terse by default: alias, email, admin, token status, default flag', async () => {
     const out = parse(await A.handlers.account_list({}));
     expect(out.defaultAccount).toBe('test');
     expect(out.accounts.map((a: { email: string }) => a.email)).toEqual(['a-test@ctx-a.example', 'a-second@ctx-a.example']);
     const test = out.accounts.find((a: { alias: string }) => a.alias === 'test');
     expect(test.admin).toBe(true);
-    for (const a of out.accounts) expect(a.token.status).toBe('ok');
+    expect(test.default).toBe(true);
+    for (const a of out.accounts) expect(a.tokenStatus).toBe('ok');
     expect(A.tokenStore.hasToken).toHaveBeenCalled();
     expect(B.tokenStore.hasToken).not.toHaveBeenCalled();
     const text = JSON.stringify(out);
     expect(text).not.toContain('test@example.com');
     expect(text).not.toContain('ctx-b');
+    expect(text).not.toContain('scopes');
+  });
+
+  it("account_list verbose:true keeps today's full per-account scope report", async () => {
+    const out = parse(await A.handlers.account_list({ verbose: true }));
+    const test = out.accounts.find((a: { alias: string }) => a.alias === 'test');
+    expect(test.token.status).toBe('ok');
+    expect(test.scopes).toBeDefined();
   });
 
   const decodeRaw = (req: Req | undefined): string => {
@@ -245,6 +181,8 @@ describe('buildRegistry resolves every handler through its context', () => {
     expect(isOwnerContext(forged.ctx)).toBe(false);
     for (const name of [...WIZARD, ...HOST_FILE_TOOLS]) expect(forged.handlers[name], name).toBeUndefined();
     expect(forged.schemas.drive_update).not.toHaveProperty('localPath');
+    expect(forged.handlers.drive_upload).toBeDefined();
+    expect(forged.schemas.drive_upload).not.toHaveProperty('localPath');
     const ids = parse(await forged.handlers.diagnose({})).sections.map((s: { id: number }) => s.id);
     expect(ids).not.toContain(3);
     expect(ids).not.toContain(7);
@@ -257,6 +195,10 @@ describe('buildRegistry resolves every handler through its context', () => {
     expect(A.schemas.gmail_create_draft).not.toHaveProperty('attachments');
     const upd = await A.handlers.drive_update({ account: 'test', fileId: 'F1', localPath: '/etc/hostname' });
     expect(upd.isError).toBe(true);
+    expect(A.handlers.drive_upload).toBeDefined();
+    expect(A.schemas.drive_upload).not.toHaveProperty('localPath');
+    const uploadLocal = await A.handlers.drive_upload({ account: 'test', filename: 'f.txt', localPath: '/etc/hostname' });
+    expect(uploadLocal.isError).toBe(true);
     const mail = { account: 'test', to: 'x@y.example', subject: 's', body: 'b', attachments: [{ path: '/etc/hostname' }] };
     for (const tool of ['gmail_send', 'gmail_create_draft']) {
       const res = await A.handlers[tool](mail);
@@ -358,6 +300,25 @@ describe('the owner context keeps the single-owner surface', () => {
     expect(s4.lines.join('\n')).toContain('test@example.com');
     const s2 = report.sections.find((s: { id: number }) => s.id === 2);
     expect(s2.lines.some((l: string) => l.startsWith('local usage metrics:'))).toBe(true);
+  });
+});
+
+describe('GOOGLE_LOCAL_FILES=off removes the host-file surface even from the owner', () => {
+  const prior = process.env.GOOGLE_LOCAL_FILES;
+  afterEach(() => {
+    if (prior === undefined) delete process.env.GOOGLE_LOCAL_FILES;
+    else process.env.GOOGLE_LOCAL_FILES = prior;
+  });
+
+  it('drops every host-file tool and the localPath/attachments params', () => {
+    process.env.GOOGLE_LOCAL_FILES = 'off';
+    const ctx = buildIdentityContext({} as NodeJS.ProcessEnv);
+    expect(isOwnerContext(ctx)).toBe(true);
+    const { server, handlers, schemas } = fakeServer();
+    buildRegistry(server as never, ctx, 'eager');
+    for (const name of HOST_FILE_TOOLS) expect(handlers[name], name).toBeUndefined();
+    expect(schemas.drive_update).not.toHaveProperty('localPath');
+    expect(schemas.drive_upload).not.toHaveProperty('localPath');
   });
 });
 

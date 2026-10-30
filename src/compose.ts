@@ -1,10 +1,7 @@
-// S1.12: registry composition, extracted from index.ts so the tenancy module
-// (and tests) can build registries without touching the CLI entrypoint. This
-// module must stay free of import-time side effects of its own: no argv
-// parsing, no process.exit, no prints (accounts.js module-load resolution is
-// the one inherited, pre-existing exception on the import chain).
+// Registry composition, extracted from index.ts so tests can build registries
+// without touching the CLI entrypoint. No import-time side effects of its own.
 
-import type { McpServer } from "@modelcontextprotocol/server";
+import { McpServer } from "@modelcontextprotocol/server";
 import { GENERATED_SERVICES } from './tools/generated/index.js';
 import { GENERATED_GATES, SERVICES, servicesAwaitingRestart, unknownToolMessage } from './services.js';
 import { argNormalizationEnabled } from './arg-normalize.js';
@@ -23,18 +20,37 @@ import { resolveScopesForAccount } from './auth.js';
 import type { CuratedToolDeps } from './client.js';
 import type { ExecuteDeps } from './executor.js';
 import type { Metrics } from './usage-metrics.js';
+import { localFilesDisabledByEnv, logLocalFilesRootAtStartup } from './tools/_local-files.js';
+
+export interface McpServerOptions {
+  /** Sent in the initialize result; omitted entirely when absent or blank. */
+  instructions?: string;
+}
+
+/** The one place the MCP server is constructed, so an embedding host can pass
+ * per-session `instructions` without re-deriving the server identity. */
+export function createMcpServer(version: string, opts: McpServerOptions = {}): McpServer {
+  const instructions = opts.instructions?.trim() ? opts.instructions : undefined;
+  return new McpServer({ name: 'mcp-google-multi', version }, instructions ? { instructions } : undefined);
+}
 
 export function buildRegistry(server: McpServer, ctx: IdentityContext, mode?: DiscoveryMode, metrics: Metrics | null = null): ToolRegistry {
   const policy = ctx.policy;
-  // The registry's account view IS the context's: fan-out expansion,
-  // selector validation and default-account injection all follow this
-  // context, not the process global (identical for the free core's one ctx).
+  // The registry's account view IS the context's, not the process global.
   const registry = new ToolRegistry(server, policy, mode, metrics, () => ctx.accounts);
-  // Every handler resolves its client, token reads and scope hints through
-  // this context; ctx.accounts is read per call, never snapshotted here, so
-  // the owner's live getter stays live.
+  // ctx.accounts is read per call, never snapshotted here, so a live getter stays live.
   const owner = isOwnerContext(ctx);
-  const clientDeps: CuratedToolDeps = { getClientFn: ctx.getClient, localFiles: owner };
+  // GOOGLE_LOCAL_FILES=off removes every host-file tool/param for every
+  // context, including the owner, regardless of the transport.
+  const localFilesEnabled = owner && !localFilesDisabledByEnv();
+  // Log (never create) the effective GOOGLE_LOCAL_FILES_DIR root so an
+  // operator sees where uploads/downloads/attachments will be confined
+  // without triggering a tool call first; the root itself is created
+  // lazily, on first actual use, so a read-only or missing HOME (hardened
+  // systemd, an isolated service user) cannot fail server startup over a
+  // feature this run might never use. `config check` hits this same path.
+  if (localFilesEnabled) logLocalFilesRootAtStartup();
+  const clientDeps: CuratedToolDeps = { getClientFn: ctx.getClient, localFiles: localFilesEnabled };
   const execDeps: ExecuteDeps = {
     getClientFn: ctx.getClient,
     scopeDeps: {

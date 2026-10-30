@@ -41,7 +41,7 @@ function formatContact(person: any) {
   };
 }
 
-// --- A10 contacts_resolve: name -> one canonical email ---------------------
+// --- contacts_resolve: name -> one canonical email -------------------------
 
 export interface ResolveCandidate {
   resourceName: string;
@@ -51,7 +51,7 @@ export interface ResolveCandidate {
   hasOrg: boolean;
 }
 
-/** Accent-fold + lowercase for name comparison ("Rym" == "Rÿm"). */
+/** Accent-fold + lowercase for name comparison ("Zoe" == "Zoë"). */
 const foldName = (s: string): string =>
   s.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().trim();
 
@@ -70,7 +70,7 @@ function pickEmail(c: ResolveCandidate): { value: string; type?: string; primary
 }
 
 /** Deterministic rank tuple; higher wins, compared lexicographically so the
- * first discriminating rule decides (A10 tie-break table). */
+ * first discriminating rule decides. */
 function scoreTuple(c: ResolveCandidate, foldedQuery: string): number[] {
   const exact = foldName(c.displayName) === foldedQuery ? 1 : 0;   // 1. exact over prefix
   const saved = c.source === 'contacts' ? 1 : 0;                    // 2. saved over other-contact
@@ -147,9 +147,8 @@ function dedupeCandidates(list: ResolveCandidate[]): ResolveCandidate[] {
 }
 
 export function registerContactsTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -203,7 +202,7 @@ export function registerContactsTools(server: ToolRegistry, deps: CuratedToolDep
       description: 'Resolve a free-text name/alias to ONE canonical email address (ranked + tie-broken), so you need not hand-expand transliteration OR-queries. Returns a single confident match, an explicit ambiguous candidate list, or null when nothing matches. For picking a recipient before gmail_send.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        name: z.string().min(1).describe('Free-text name or alias to resolve (e.g. "Rym")'),
+        name: z.string().min(1).describe('Free-text name or alias to resolve (e.g. "Zoe")'),
         maxCandidates: z.number().min(1).max(10).default(5).optional()
           .describe('Max candidates to return when ambiguous (1-10, default: 5)'),
         includeOtherContacts: coerceBoolean.optional()
@@ -233,7 +232,7 @@ export function registerContactsTools(server: ToolRegistry, deps: CuratedToolDep
             });
             candidates.push(...(other.data.results ?? []).map((r: any) => toCandidate(r.person, 'otherContacts')));
           } catch {
-            // otherContacts unavailable (scope/5xx): degrade to saved-contacts only.
+            // otherContacts unavailable: degrade silently
           }
         }
 
@@ -279,8 +278,8 @@ export function registerContactsTools(server: ToolRegistry, deps: CuratedToolDep
       description: 'List all contacts (paginated)',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
-        pageSize: z.number().min(1).max(1000).default(100).optional()
-          .describe('Number of contacts per page (default: 100)'),
+        pageSize: z.number().min(1).max(1000).default(50).optional()
+          .describe('Number of contacts per page (default: 50)'),
         pageToken: z.string().optional().describe('Page token for pagination'),
         sortOrder: z.enum([
           'LAST_MODIFIED_ASCENDING',
@@ -289,20 +288,24 @@ export function registerContactsTools(server: ToolRegistry, deps: CuratedToolDep
           'LAST_NAME_ASCENDING',
         ]).default('FIRST_NAME_ASCENDING').optional()
           .describe('Sort order (default: FIRST_NAME_ASCENDING)'),
+        requireEmail: coerceBoolean.optional().describe('Only return contacts with at least one email address. Filtering happens after the page is fetched, so the returned page can hold fewer than pageSize contacts; nextPageToken still continues the underlying, unfiltered listing'),
+        requireName: coerceBoolean.optional().describe('Only return contacts with a name. Filtering happens after the page is fetched, so the returned page can hold fewer than pageSize contacts; nextPageToken still continues the underlying, unfiltered listing'),
       },
     },
-    async ({ account, pageSize, pageToken, sortOrder }) => {
+    async ({ account, pageSize, pageToken, sortOrder, requireEmail, requireName }) => {
       try {
         const auth = await getClientFn(account as Account);
         const people = peopleClient({ version: 'v1', auth });
         const res = await people.people.connections.list({
           resourceName: 'people/me',
           personFields: PERSON_FIELDS,
-          pageSize: pageSize ?? 100,
+          pageSize: pageSize ?? 50,
           pageToken: pageToken ?? undefined,
           sortOrder: sortOrder ?? 'FIRST_NAME_ASCENDING',
         });
-        const contacts = (res.data.connections ?? []).map(formatContact);
+        let contacts = (res.data.connections ?? []).map(formatContact);
+        if (requireEmail) contacts = contacts.filter((c) => c.emails.length > 0);
+        if (requireName) contacts = contacts.filter((c) => c.name !== '');
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({
             contacts,
@@ -530,8 +533,8 @@ export function registerContactsTools(server: ToolRegistry, deps: CuratedToolDep
         const members: unknown[] = [];
         let fetchFailures = 0;
         let firstError: unknown;
-        // getBatchGet caps at 200 names while maxMembers goes to 1000, so a
-        // large group used to fail outright rather than come back in pages.
+        // getBatchGet caps at 200 names while maxMembers goes to 1000, so fetch
+        // in chunks rather than fail outright on a large group.
         for (let i = 0; i < memberResourceNames.length; i += BATCH_GET_LIMIT) {
           const chunk = memberResourceNames.slice(i, i + BATCH_GET_LIMIT);
           try {

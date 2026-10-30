@@ -49,12 +49,8 @@ function parseCsvEnv(name: string): string[] {
     .filter(Boolean);
 }
 
-/**
- * Legacy global override (BC7): a set GOOGLE_OPTIONAL_SCOPES acts as an
- * implicit "legacy-global" profile applied to every account (env wins over
- * file profiles, cc-config R2). Unknown names now fail loudly (BR3) where v5
- * silently dropped them — the intended migration signal.
- */
+// A set GOOGLE_OPTIONAL_SCOPES acts as an implicit profile applied to every
+// account (env wins over file profiles); unknown names fail loudly.
 function legacyGlobalProfile(): ScopeProfile | null {
   const names = parseCsvEnv('GOOGLE_OPTIONAL_SCOPES');
   if (names.length === 0) return null;
@@ -87,7 +83,7 @@ function profileForAccount(alias: string, set: AccountSet = getAccountSet()): Sc
 }
 
 /** Union of every account's resolved bundles: a service registers if ANY
- * account can authorize it; per-account authz happens at call time (BR2). */
+ * account can authorize it; per-account authz happens at call time. */
 export function getOptionalBundles(set: AccountSet = getAccountSet()): string[] {
   const legacy = legacyGlobalProfile();
   if (legacy) return legacy.bundles.filter(b => b !== 'admin');
@@ -182,9 +178,8 @@ export async function runAuthFlow(args: string[]): Promise<void> {
     }
   }
 
-  // Shared ephemeral-port loopback flow (oauth-consent.ts): listen first, then
-  // build the auth URL from the assigned redirect. CLI gets a patient timeout;
-  // errors propagate to main()'s fatal handler like every other CLI failure.
+  // Listen first, then build the auth URL from the assigned redirect; errors
+  // propagate to main()'s fatal handler like every other CLI failure.
   const loop = await openLoopbackConsent({ timeoutMs: 10 * 60_000 });
   const oauth2Client = buildConsentClient(loop.redirect);
 

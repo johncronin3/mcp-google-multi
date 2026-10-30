@@ -21,20 +21,6 @@ export function registerGmailGeneratedTools(registry: ToolRegistry, deps: Execut
     ["https://mail.google.com/"],
   ];
   registerGeneratedTool(registry, {
-    name: "gmail_users_drafts_delete",
-    cud: "delete",
-    description: "Immediately and permanently deletes the specified draft. Does not simply trash it. For more information, see [Create and send draft emails](https://developers.g",
-    method: { id: "gmail.users.drafts.delete", httpMethod: "DELETE", path: "gmail/v1/users/{userId}/drafts/{id}", baseUrl: "https://gmail.googleapis.com/", requiredParams: ["userId","id"], scopes: S_gmail_v1[0] },
-    params: [{"field":"id","api":"id","location":"path"},{"field":"userId","api":"userId","location":"path"},{"field":"fields","api":"fields","location":"query"}],
-    hasBody: false,
-    shape: {
-      account: accountField(() => registry.accountAliases()),
-      id: z.string().min(1).describe("The ID of the draft to delete."),
-      userId: z.string().min(1).describe("The user's email address. The special value `me` can be used to indicate the authenticated user."),
-      fields: z.string().optional().describe('Response field mask.'),
-    },
-  }, deps);
-  registerGeneratedTool(registry, {
     name: "gmail_users_drafts_update",
     cud: "update",
     description: "Replaces a draft's content. For more information, see [Create and send draft emails](https://developers.google.com/workspace/gmail/api/guides/drafts).",

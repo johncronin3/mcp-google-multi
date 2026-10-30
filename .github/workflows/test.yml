@@ -31,6 +31,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # CURATED_METHOD_TOOLS feeds write-control's escape-hatch name
+      # resolution (google_api_call); a curated tool that starts or stops
+      # calling a Discovery method would otherwise silently drift the map
+      # without anyone noticing. See scripts/extract-curated-method-map.ts.
+      - name: Curated method map drift check
+        run: npx tsx scripts/extract-curated-method-map.ts --check
+
       - name: Build
         run: npm run build
 
@@ -48,9 +55,8 @@ jobs:
           PROMPTFOO_DISABLE_UPDATE: '1'
         run: npm run eval:contract
 
-  # Separate job on purpose: branch protection requires the check literally named
-  # "ci" — a version matrix would rename it to "ci (...)". This is the only leg
-  # exercising the declared engines floor (BV-7); the main job stays on 24.
+  # Separate job: branch protection requires the check named "ci" exactly; a
+  # matrix would rename it. Only leg exercising the declared Node engines floor.
   ci-node22:
     runs-on: ubuntu-latest
     steps:

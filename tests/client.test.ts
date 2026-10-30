@@ -45,7 +45,7 @@ function depsFor(aliases: string[], tokens: Record<string, object | null>, count
   };
 }
 
-describe('makeGetClient (S1.7 factory + single-flight)', () => {
+describe('makeGetClient (factory + single-flight)', () => {
   it('same-tick callers share ONE in-flight client; sequential callers get fresh ones', async () => {
     const d = depsFor(['work'], { work: { refresh_token: 'rt-1' } });
     const fn = makeGetClient('ctx-a', d);
@@ -146,7 +146,7 @@ describe('makeGetClient (S1.7 factory + single-flight)', () => {
   });
 });
 
-describe('createTokenStore (S1.7 custody closures)', () => {
+describe('createTokenStore (custody closures)', () => {
   const dirs: string[] = [];
   afterEach(() => {
     for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
@@ -166,9 +166,8 @@ describe('createTokenStore (S1.7 custody closures)', () => {
     storeB.writeToken('work', { refresh_token: 'rt-b' });
     expect(storeA.readToken('work')).toMatchObject({ refresh_token: 'rt-a' });
     expect(storeB.readToken('work')).toMatchObject({ refresh_token: 'rt-b' });
-    // simulate a mis-resolved path: B's file dropped into A's dir still cannot
-    // decrypt under A's subkey — custody isolation is cryptographic, not just
-    // directory layout
+    // simulate a mis-resolved path: B's file dropped into A's dir still can't decrypt under A's
+    // subkey; custody isolation is cryptographic, not just directory layout.
     fs.copyFileSync(path.join(dirB, 'work.enc'), path.join(dirA, 'work.enc'));
     expect(() => storeA.readToken('work')).toThrow();
   });
@@ -180,6 +179,22 @@ describe('createTokenStore (S1.7 custody closures)', () => {
     store.updateToken('work', { access_token: 'at', scope: undefined });
     expect(store.readToken('work')).toMatchObject({ refresh_token: 'rt', scope: 's', access_token: 'at' });
     expect(store.hasToken('work')).toBe(true);
+  });
+
+  it('updateToken never recreates a token file that was never written, or one removed out from under it', () => {
+    const dir = tmp();
+    const store = createTokenStore(dir, { tenantId: 'tenant-a', resolveKey: () => 'k' });
+
+    // First write: no token stored yet, a refresh-style update must not create one.
+    expect(() => store.updateToken('work', { access_token: 'at' })).not.toThrow();
+    expect(store.hasToken('work')).toBe(false);
+
+    // A stored token removed (e.g. a revoked linked account) while a refresh
+    // is in flight must stay removed, not get resurrected by the merge.
+    store.writeToken('work', { refresh_token: 'rt', scope: 's' });
+    fs.rmSync(path.join(dir, 'work.enc'));
+    expect(() => store.updateToken('work', { access_token: 'at2' })).not.toThrow();
+    expect(store.hasToken('work')).toBe(false);
   });
 
   it('rejects a traversal-shaped alias before touching the filesystem', () => {
