@@ -2,15 +2,19 @@ import type { ToolRegistry } from '../registry.js';
 import { z } from 'zod';
 import { coerceBoolean } from './_coerce.js';
 import { admin as adminClient } from '@googleapis/admin';
-import { ACCOUNTS } from '../accounts.js';
+import { accountArgLive } from '../accounts.js';
 import type { Account } from '../accounts.js';
-import { getClient } from '../client.js';
-import { handleGoogleApiError } from './_errors.js';
+import { getClient, type CuratedToolDeps } from '../client.js';
+import { handleGoogleApiError, invalidParams } from './_errors.js';
 
-const accountEnum = z.enum(ACCOUNTS);
 
 // Admin SDK requires Workspace super-admin (or delegated admin) on the account — personal @gmail.com accounts 403 on every endpoint.
-export function registerAdminTools(server: ToolRegistry): void {
+export function registerAdminTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
+  // Per-registry, LIVE account enum + injectable client (S1.10): the
+  // schema follows the registry's account view at parse time, and the
+  // custody path is the context's, not the process global.
+  const accountEnum = accountArgLive(() => server.accountAliases()).optional();
+  const getClientFn = deps.getClientFn ?? getClient;
   // ─── Reports / audit log ───────────────────────────────────────────────
 
   server.registerTool(
@@ -42,7 +46,7 @@ export function registerAdminTools(server: ToolRegistry): void {
     },
     async ({ account, applicationName, userKey, startTime, endTime, eventName, actorIpAddress, filters, orgUnitID, groupIdFilter, customerId, maxResults, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const reports = adminClient({ version: 'reports_v1', auth });
         const res = await reports.activities.list({
           applicationName,
@@ -87,7 +91,7 @@ export function registerAdminTools(server: ToolRegistry): void {
     },
     async ({ account, customer, domain, query, maxResults, pageToken, orderBy, showDeleted, projection }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const directory = adminClient({ version: 'directory_v1', auth });
         const res = await directory.users.list({
           customer: customer ?? 'my_customer',
@@ -114,13 +118,13 @@ export function registerAdminTools(server: ToolRegistry): void {
       description: 'Get a single Workspace user by email or user ID',
       inputSchema: {
         account: accountEnum.describe('Google account alias (must be a Workspace admin)'),
-        userKey: z.string().describe('User email or ID'),
+        userKey: z.string().min(1).describe('User email or ID'),
         projection: z.enum(['basic', 'custom', 'full']).optional(),
       },
     },
     async ({ account, userKey, projection }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const directory = adminClient({ version: 'directory_v1', auth });
         const res = await directory.users.get({
           userKey,
@@ -141,7 +145,7 @@ export function registerAdminTools(server: ToolRegistry): void {
       description: 'Update a Workspace user (PATCH semantics). Gated by write-control (a CUD tool).',
       inputSchema: {
         account: accountEnum.describe('Google account alias (must be a Workspace admin)'),
-        userKey: z.string().describe('User email or ID'),
+        userKey: z.string().min(1).describe('User email or ID'),
         givenName: z.string().optional(),
         familyName: z.string().optional(),
         suspended: coerceBoolean.optional(),
@@ -152,7 +156,7 @@ export function registerAdminTools(server: ToolRegistry): void {
     },
     async ({ account, userKey, givenName, familyName, suspended, password, changePasswordAtNextLogin, orgUnitPath }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const directory = adminClient({ version: 'directory_v1', auth });
         const requestBody: any = {};
         if (givenName !== undefined || familyName !== undefined) {
@@ -166,7 +170,11 @@ export function registerAdminTools(server: ToolRegistry): void {
         if (orgUnitPath !== undefined) requestBody.orgUnitPath = orgUnitPath;
 
         if (Object.keys(requestBody).length === 0) {
-          return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'No fields to update' }) }], isError: true };
+          return invalidParams(
+            account as Account,
+            'No fields to update: every optional field was omitted, so the request would have been a no-op.',
+            'Pass at least one of: givenName, familyName, suspended, password, changePasswordAtNextLogin, orgUnitPath.',
+          );
         }
 
         const res = await directory.users.patch({ userKey, requestBody });
@@ -197,7 +205,7 @@ export function registerAdminTools(server: ToolRegistry): void {
     },
     async ({ account, customer, domain, userKey, query, maxResults, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const directory = adminClient({ version: 'directory_v1', auth });
         const res = await directory.groups.list({
           customer: customer ?? 'my_customer',
@@ -222,7 +230,7 @@ export function registerAdminTools(server: ToolRegistry): void {
       description: 'List members of a Workspace group',
       inputSchema: {
         account: accountEnum.describe('Google account alias (must be a Workspace admin)'),
-        groupKey: z.string().describe('Group email or ID'),
+        groupKey: z.string().min(1).describe('Group email or ID'),
         roles: z.string().optional().describe('Comma-separated roles to include (OWNER, MANAGER, MEMBER)'),
         includeDerivedMembership: coerceBoolean.optional(),
         maxResults: z.number().min(1).max(200).optional(),
@@ -231,7 +239,7 @@ export function registerAdminTools(server: ToolRegistry): void {
     },
     async ({ account, groupKey, roles, includeDerivedMembership, maxResults, pageToken }) => {
       try {
-        const auth = await getClient(account as Account);
+        const auth = await getClientFn(account as Account);
         const directory = adminClient({ version: 'directory_v1', auth });
         const res = await directory.members.list({
           groupKey,
@@ -251,5 +259,6 @@ export function registerAdminTools(server: ToolRegistry): void {
 }
 
 function handleAdminError(error: any, account: Account) {
-  return handleGoogleApiError(error, account, "Admin tools require Workspace super-admin privileges AND the account must be listed in GOOGLE_ADMIN_ACCOUNTS (then re-authenticated). Personal Gmail accounts cannot use these endpoints.");
+  const admin = 'Admin tools require Workspace super-admin privileges AND the account must be listed as an admin account (then re-authenticated). Personal Gmail accounts cannot use these endpoints.';
+  return handleGoogleApiError(error, account, { scope: admin, resource: admin });
 }

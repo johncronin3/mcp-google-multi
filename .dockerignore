@@ -1,13 +1,33 @@
+# Never enter an image layer.
 node_modules
 dist
-.git
-tokens
-.env
-*.enc
-grants.json
 coverage
+
+# Secrets / local state — MUST never be copied into a layer.
+.env
+.env.*
+*.enc
+master.key
+mcp-tokens.enc
+config.json
+tokens
+grants.json
+
+# Build/test/dev cruft not needed to compile dist/.
+.git
+.github
+.gitignore
 tests
 docs
 scripts
+discovery
 *.md
+*.log
+*.mcpb
+.claude
+.vscode
+.idea
+npm-debug.log*
+
+# House image copies docker/entrypoint.sh explicitly.
 !docker/entrypoint.sh
