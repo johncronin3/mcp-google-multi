@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "grants": [
+    {
+      "name": "StrombackBrain2",
+      "code": "fixture-strombackbrain2-code-0001",
+      "accounts": ["stromback"]
+    },
+    {
+      "name": "Personal Brain Grant 3",
+      "code": "fixture-personal-brain-grant-3-0001",
+      "accounts": ["personal", "stromback", "opcenter", "buildcoin", "usa-house", "olga"]
+    }
+  ]
+}
