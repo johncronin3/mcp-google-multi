@@ -305,7 +305,7 @@ describe('upstream isolate does not widen fixture grants', () => {
     }
   });
 
-  it.skipIf(!hasHide)('calling a hidden service tool by name is not refused under either fixture grant', async () => {
+  it.skipIf(!hasHide)('proposal: a hidden service tool called by name is refused under either fixture grant', async () => {
     const hide = (registry as unknown as { hideServices: (services: Iterable<string>) => void }).hideServices.bind(registry);
     hide(['gmail']);
     expect(
@@ -320,10 +320,10 @@ describe('upstream isolate does not widen fixture grants', () => {
       const alias = grant.accounts[0];
       const res = await call('gmail_search', { account: alias, query: 'in:inbox' });
       const parsed = body(res);
-      expect(parsed.error, name).not.toBe('account_outside_grant');
-      expect(parsed.error, name).not.toBe('grant_required');
-      expect(JSON.stringify(parsed), name).not.toContain('service_hidden');
-      expect(seen, name).toEqual([alias]);
+      expect(res.isError, name).toBe(true);
+      expect(parsed.error, name).toBe('service_hidden');
+      expect(seen, name).toEqual([]);
+      expect(grant.accounts).toContain(alias);
     }
   });
 });
