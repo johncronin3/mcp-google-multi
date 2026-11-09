@@ -8,22 +8,25 @@
 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIPv4 } from 'node:net';
+import { decodeJwt } from 'jose';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AuthOutcome, RouteHandler } from './http-transport.js';
 import {
   signAccessToken, verifyAccessToken, signState, verifyState, signAuthzCode, verifyAuthzCode,
   signReauthLink, verifyReauthLink,
   signPending, verifyPending,
-  ReplayGuard, RefreshStore, STATE_TTL_DEFAULT, CODE_TTL_DEFAULT, ACCESS_TTL_DEFAULT,
+  ReplayGuard, type ReplaySpend, RefreshStore, STATE_TTL_DEFAULT, CODE_TTL_DEFAULT, ACCESS_TTL_DEFAULT,
   type StatePayload,
 } from './mcp-token.js';
-import { fetchCimdDocument, SsrfBlockedError } from './ssrf-guard.js';
+import { fetchCimdDocument } from './ssrf-guard.js';
+import { CimdClientCache } from './cimd-cache.js';
+import { logSafe } from './trim.js';
 
 const CLAUDE_AI_FIXED_CALLBACK = 'https://claude.ai/api/mcp/auth_callback';
 
 // DCR (/register) is public + unauthenticated, so its in-memory store must be
-// bounded like every sibling store (ReplayGuard cap, RefreshStore SPENT_CAP) or
-// a request loop OOMs the process. Cap client count (FIFO-evict the oldest) and
+// bounded like every sibling store (the ReplayGuard cap) or a request loop
+// OOMs the process. Cap client count (FIFO-evict the oldest) and
 // the per-request redirect_uris shape so one entry can't be arbitrarily large.
 export const DCR_MAX_CLIENTS = 1000;
 export const DCR_MAX_REDIRECT_URIS = 10;
@@ -47,6 +50,12 @@ export interface AuthServerConfig {
   accessTtlSec?: number;
   masterKey: string;
   refreshStorePath: string;
+  /** `maxAgeSec` of the refresh store buildAuthServer creates: sessions end
+   * this long after their sign-in. Unset: unlimited. */
+  refreshMaxAgeSec?: number;
+  /** `idleSec` of that store: sessions end this long after their last
+   * refresh. Unset: unlimited. */
+  refreshIdleSec?: number;
   /** Default true. The clientless `flow=alias_reauth` link names an alias with
    * no tenant binding, so a multi-tenant deployment sets false: with several
    * tenants an alias name alone is ambiguous and the branch becomes a
@@ -154,7 +163,9 @@ export interface AuthServer {
   /** Mint a signed, single-use, TTL-bound clientless flow URL
    * (`${base}/authorize?flow=...&state=<signed>`). The tenantId/bundles ride
    * INSIDE the signed state, so nothing at /authorize or /callback trusts a
-   * caller-supplied identity. Inert unless something calls it. */
+   * caller-supplied identity. The URL works only on this AuthServer, and only
+   * until its process restarts: sign-in artifacts are signed with a key each
+   * buildAuthServer call generates. Inert unless something calls it. */
   mintFlowState: (opts: { flow: 'alias_add'; alias: string; tenantId?: string; bundles?: string[]; nonce?: string }) => Promise<string>;
   /** The owner's re-auth link for `alias`: HMAC-signed, expiring, not single
    * use (a chat client may prefetch it). /authorize refuses any alias_reauth
@@ -171,8 +182,8 @@ function json(res: ServerResponse, status: number, body: unknown, extraHeaders: 
   return true;
 }
 
-function errorPage(res: ServerResponse, status: number, slug: string, message: string): true {
-  res.writeHead(status, { 'Content-Type': 'text/plain' });
+function errorPage(res: ServerResponse, status: number, slug: string, message: string, extraHeaders: Record<string, string> = {}): true {
+  res.writeHead(status, { 'Content-Type': 'text/plain', ...extraHeaders });
   res.end(`${slug}: ${message}`);
   return true;
 }
@@ -181,6 +192,16 @@ class SubjectCheckUnavailable extends Error {}
 
 function subjectUnavailable(res: ServerResponse): true {
   return json(res, 503, { error: 'temporarily_unavailable', message: 'the sign-in could not be checked right now; retry shortly' }, { 'Retry-After': '5' });
+}
+
+// Not invalid_client: clients and people read that as a permanent misconfiguration.
+function clientUnavailable(res: ServerResponse): true {
+  return json(res, 503, { error: 'temporarily_unavailable', message: 'the client could not be checked right now; retry shortly' }, { 'Retry-After': '5' });
+}
+
+// The replay guard is full: every slot holds a jti that is still live.
+function signInBusy(res: ServerResponse): true {
+  return errorPage(res, 503, 'E_SIGNIN_BUSY', 'sign-in is busy right now; retry in a minute', { 'Retry-After': '60' });
 }
 
 function redirect(res: ServerResponse, location: string, extraHeaders: Record<string, string> = {}): true {
@@ -300,14 +321,43 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
   const base = config.base;
   const resource = config.resourceUri;
   const secret = config.secret;
+  // States, approvals and codes live minutes, and their single use rests on an
+  // in-memory replay guard that a restart empties. So they are signed with a
+  // key only this AuthServer holds: a restart invalidates every one in flight,
+  // instead of letting a spent or unreserved one pass the new, empty guard.
+  const flowSecret = new Uint8Array(randomBytes(32));
   const accessTtl = config.accessTtlSec ?? ACCESS_TTL_DEFAULT;
   const cimd = deps.fetchCimd ?? ((clientId: string) => fetchCimdDocument(clientId));
   const replay = deps.replayGuard ?? new ReplayGuard();
-  const refresh = deps.refreshStore ?? new RefreshStore(config.refreshStorePath, config.masterKey);
   const registered = deps.registeredClients ?? new Map<string, { redirect_uris: string[] }>();
   const now = deps.now ?? (() => Date.now());
   const log = deps.log ?? (() => undefined);
+  // Silently dropping a lifetime the caller asked for would leave sessions unlimited.
+  if (deps.refreshStore && (config.refreshMaxAgeSec !== undefined || config.refreshIdleSec !== undefined)) {
+    throw new Error('E_REFRESH_OPTION_CONFLICT: refreshMaxAgeSec and refreshIdleSec configure the refresh store buildAuthServer creates; set them on the injected refreshStore instead');
+  }
+  const refresh =
+    deps.refreshStore ?? new RefreshStore(config.refreshStorePath, config.masterKey, { maxAgeSec: config.refreshMaxAgeSec, idleSec: config.refreshIdleSec, log });
   const nowSec = () => Math.floor(now() / 1000);
+  // A full guard is refused at whatever rate the caller likes, so its line is
+  // written at most once a minute (or at once after the clock stepped back).
+  let fullLoggedAt = -Infinity;
+  let fullSuppressed = 0;
+  const noteFull = (at: number): void => {
+    if (at >= fullLoggedAt && at - fullLoggedAt < 60_000) {
+      fullSuppressed++;
+      return;
+    }
+    log(`replay guard full: sign-in refused${fullSuppressed > 0 ? ` (n=${fullSuppressed} suppressed)` : ''}`);
+    fullLoggedAt = at;
+    fullSuppressed = 0;
+  };
+  const spend = (artifact: { jti: string; exp: number }, ttlSec: number): ReplaySpend => {
+    const at = now();
+    const r = replay.spend(artifact.jti, ttlSec * 1000, at, artifact.exp * 1000);
+    if (r === 'full') noteFull(at);
+    return r;
+  };
   const resolveSubject = deps.resolveSubject ?? ((email: string) => (config.ownerEmails.includes(email) ? { sub: 'owner' } : null));
   const issHeader = { 'Cache-Control': 'no-store' };
 
@@ -331,10 +381,9 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     scopes_supported: ['mcp:use'],
   };
 
-  const cimdCache = new Map<string, { doc: Record<string, unknown>; exp: number }>();
-  const CIMD_CACHE_TTL_MS = 5 * 60_000;
+  const cimdClients = new CimdClientCache({ fetch: cimd, now, log });
 
-  async function validateClient(clientId: string): Promise<{ redirect_uris: string[]; dcr: boolean } | { error: string; message: string }> {
+  async function validateClient(clientId: string): Promise<{ redirect_uris: string[]; dcr: boolean } | { error: string; message: string } | { busy: true }> {
     const reg = registered.get(clientId);
     if (reg) return { redirect_uris: reg.redirect_uris, dcr: true };
     // C7/#5: validate the issuer host + scheme BEFORE any outbound fetch, so we
@@ -349,31 +398,23 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       return { error: 'E_CIMD_INVALID', message: 'invalid client' };
     }
     if (scheme !== 'https:' || !config.cimdIssuers.includes(issuerHost)) {
-      log(`CIMD rejected: client_id ${clientId} issuer not allowlisted`);
+      // The issuer and a length, never the path: an attacker picks the path freely.
+      log(`CIMD rejected: issuer=${logSafe(`${scheme}//${issuerHost}`, 80)} not allowlisted client_id_len=${clientId.length}`);
       return { error: 'E_CIMD_INVALID', message: 'invalid client' };
     }
-    let doc: Record<string, unknown>;
-    const cached = cimdCache.get(clientId);
-    if (cached && cached.exp > now()) {
-      doc = cached.doc;
-    } else {
-      try {
-        doc = await cimd(clientId);
-      } catch (e) {
-        // #13: never echo internal fetch details to the caller (blind-SSRF
-        // oracle); log server-side, return a generic message.
-        log(`CIMD fetch failed for ${clientId}: ${(e as Error).message}`);
-        const slug = e instanceof SsrfBlockedError ? 'E_CIMD_SSRF_BLOCKED' : 'E_CIMD_INVALID';
-        return { error: slug, message: 'invalid client' };
-      }
-      cimdCache.set(clientId, { doc, exp: now() + CIMD_CACHE_TTL_MS }); // #15
-    }
-    if (doc.client_id !== clientId) return { error: 'E_CIMD_INVALID', message: 'invalid client' };
-    const uris = Array.isArray(doc.redirect_uris) ? (doc.redirect_uris as string[]) : [];
-    if (uris.length === 0) return { error: 'E_CIMD_INVALID', message: 'invalid client' };
-    // C6 #14: warn on a localhost-only redirect set (loopback impersonation).
-    if (uris.every((u) => { try { return isLoopbackHostname(new URL(u).hostname); } catch { return false; } })) {
-      log(`client ${clientId} advertises only loopback redirect_uris`);
+    // #15: cached only once it validates; the cache logs a failed fetch.
+    const got = await cimdClients.resolve(
+      clientId,
+      (doc) => doc.client_id === clientId && Array.isArray(doc.redirect_uris) && doc.redirect_uris.length > 0,
+    );
+    if ('busy' in got) return got;
+    // #13: never echo internal fetch details to the caller (blind-SSRF oracle).
+    if ('error' in got) return { error: got.error, message: 'invalid client' };
+    const uris = got.doc.redirect_uris as string[];
+    // C6 #14: warn on a localhost-only redirect set (loopback impersonation),
+    // once per fetch rather than on every sign-in the cache serves.
+    if (got.fresh && uris.every((u) => { try { return isLoopbackHostname(new URL(u).hostname); } catch { return false; } })) {
+      log(`client ${logSafe(clientId, 128)} advertises only loopback redirect_uris`);
     }
     return { redirect_uris: uris, dcr: false };
   }
@@ -382,7 +423,9 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
   }
 
-  async function toGoogle(res: ServerResponse, sp: StatePayload): Promise<true> {
+  /** `incoming`: the artifact spent to get here. If no slot is left for the
+   * new state it is unspent, so retrying it works once a slot frees. */
+  async function toGoogle(res: ServerResponse, sp: StatePayload, incoming?: string): Promise<true> {
     // H4 F1: without this, a Google URL minted here and forwarded to someone
     // else signs THEM in and hands their subject to the starting client.
     const headers: Record<string, string> = {};
@@ -392,7 +435,15 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       sp = { ...sp, bind };
       headers['Set-Cookie'] = `${bindCookieName(base, bind)}=${value}; ${bindCookieAttrs(base, STATE_TTL_DEFAULT)}`;
     }
-    const state = await signState(sp, base, secret, nowSec());
+    const state = await signState(sp, base, flowSecret, nowSec());
+    // Its /callback must find a slot even while a flood fills the guard, or a
+    // refusal there (the browser binding) could not be recorded.
+    const at = now();
+    if (replay.reserve(String(decodeJwt(state).jti), STATE_TTL_DEFAULT * 1000, at) === 'full') {
+      if (incoming) replay.unspend(incoming);
+      noteFull(at);
+      return signInBusy(res);
+    }
     const authUrl = deps.buildGoogleAuthUrl
       ? deps.buildGoogleAuthUrl({ flow: sp.flow, alias: sp.alias, state, bundles: sp.bundles })
       : `https://accounts.google.com/o/oauth2/v2/auth?state=${encodeURIComponent(state)}`;
@@ -409,23 +460,24 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       } catch {
         return errorPage(res, 400, 'invalid_request', 'bad form');
       }
-      let pending: StatePayload & { jti: string };
+      let pending: StatePayload & { jti: string; exp: number };
       try {
-        pending = await verifyPending(form.pending ?? '', base, secret);
+        pending = await verifyPending(form.pending ?? '', base, flowSecret, nowSec());
       } catch {
         return errorPage(res, 400, 'E_STATE_INVALID', 'the approval is invalid or expired');
       }
-      // Only the client leg signs pendings, and it is always the owner sign-in;
-      // a pending signed before that rule (flow=alias_reauth) is refused here.
+      // Only the client leg signs pendings, and it is always the owner sign-in.
+      // Defence in depth: a pending from an earlier release, which could carry
+      // flow=alias_reauth, was signed with MCP_JWT_KEY and no longer verifies.
       if (pending.flow !== 'owner_gate') {
         return errorPage(res, 400, 'E_STATE_INVALID', 'the approval is invalid or expired');
       }
-      if (!replay.consume(pending.jti, STATE_TTL_DEFAULT * 1000, now())) {
-        return errorPage(res, 400, 'E_STATE_INVALID', 'this approval was already used');
-      }
+      const spent = spend(pending, STATE_TTL_DEFAULT);
+      if (spent === 'full') return signInBusy(res);
+      if (spent === 'replay') return errorPage(res, 400, 'E_STATE_INVALID', 'this approval was already used');
       const { jti: _drop, ...sp } = pending;
       void _drop;
-      return toGoogle(res, sp as StatePayload);
+      return toGoogle(res, sp as StatePayload, pending.jti);
     }
     const q = url.searchParams;
     const clientId = q.get('client_id') ?? '';
@@ -441,21 +493,21 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     // then re-sign fresh for the Google leg. A tampered tenantId breaks the
     // signature; a caller cannot supply one at all.
     if (q.get('flow') === 'alias_add' && !clientId) {
-      let minted: StatePayload & { jti: string };
+      let minted: StatePayload & { jti: string; exp: number };
       try {
-        minted = await verifyState(q.get('state') ?? '', base, secret);
+        minted = await verifyState(q.get('state') ?? '', base, flowSecret, nowSec());
       } catch {
         return errorPage(res, 400, 'E_STATE_INVALID', 'the add-account link is invalid, expired, or tampered');
       }
       if (minted.flow !== 'alias_add' || !minted.alias || !minted.tenantId) {
         return errorPage(res, 400, 'E_STATE_INVALID', 'the add-account link is malformed');
       }
-      if (!replay.consume(minted.jti, STATE_TTL_DEFAULT * 1000, now())) {
-        return errorPage(res, 400, 'E_STATE_INVALID', 'this add-account link was already used');
-      }
+      const spent = spend(minted, STATE_TTL_DEFAULT);
+      if (spent === 'full') return signInBusy(res);
+      if (spent === 'replay') return errorPage(res, 400, 'E_STATE_INVALID', 'this add-account link was already used');
       const { jti: _spent, ...sp } = minted;
       void _spent;
-      return toGoogle(res, sp as StatePayload);
+      return toGoogle(res, sp as StatePayload, minted.jti);
     }
 
     // In-call re-auth (BV-1): a user-clicked `flow=alias_reauth` link has NO
@@ -479,6 +531,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
 
     if (!clientId) return json(res, 400, { error: 'invalid_request', message: 'client_id required', iss: base }, issHeader);
     const client = await validateClient(clientId);
+    if ('busy' in client) return clientUnavailable(res);
     if ('error' in client) return json(res, 400, { error: 'invalid_client', message: client.message, iss: base }, issHeader);
 
     // (2) exact redirect_uri match BEFORE minting anything (open-redirect defense)
@@ -512,7 +565,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     // it — their redirect_uris come from an issuer-allowlisted document a rogue
     // cannot forge, so there is nothing to spoof.
     if (client.dcr) {
-      const pendingToken = await signPending(statePayload, base, secret, nowSec());
+      const pendingToken = await signPending(statePayload, base, flowSecret, nowSec());
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "frame-ancestors 'none'", 'X-Frame-Options': 'DENY' });
       res.end(
         `<!doctype html><meta charset=utf-8><title>Authorize access</title>` +
@@ -533,15 +586,15 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
   const callback: RouteHandler = async (req, res, url) => {
     const code = url.searchParams.get('code') ?? '';
     const stateToken = url.searchParams.get('state') ?? '';
-    let st: StatePayload & { jti: string };
+    let st: StatePayload & { jti: string; exp: number };
     try {
-      st = await verifyState(stateToken, base, secret);
+      st = await verifyState(stateToken, base, flowSecret, nowSec());
     } catch {
       return errorPage(res, 400, 'E_STATE_INVALID', 'state is invalid, expired, or tampered');
     }
-    if (!replay.consume(st.jti, STATE_TTL_DEFAULT * 1000, now())) {
-      return errorPage(res, 400, 'E_STATE_INVALID', 'state has already been used (replay)');
-    }
+    const spent = spend(st, STATE_TTL_DEFAULT);
+    if (spent === 'full') return signInBusy(res);
+    if (spent === 'replay') return errorPage(res, 400, 'E_STATE_INVALID', 'state has already been used (replay)');
     // After the spend, so a refused callback URL cannot be replayed from the
     // browser that holds the cookie; before the exchange and resolveSubject.
     if (st.flow === 'owner_gate') {
@@ -560,7 +613,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     } catch (e) {
       // The detail can name proxies and hosts; it goes to the log, not the browser.
       const detail = e instanceof Error ? e.message : typeof e === 'string' ? e : 'non-Error rejection';
-      log(`callback exchange failed flow=${st.flow}: ${detail.replace(/[\r\n]+/g, ' ')}`);
+      log(`callback exchange failed flow=${st.flow}: ${logSafe(detail, 300)}`);
       return errorPage(res, 400, 'invalid_grant', 'Google could not complete the sign-in; start again from your app');
     }
 
@@ -575,17 +628,17 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
         refusal = (out as AliasBindRefusal | undefined)?.refused;
       } catch (e) {
         // Any rejection reason, even none, must still reach this answer.
-        log(`alias_add bind failed for "${st.alias}": ${e instanceof Error ? e.message : typeof e === 'string' ? e : 'non-Error rejection'}`);
+        log(`alias_add bind failed for "${logSafe(st.alias, 64)}": ${logSafe(e instanceof Error ? e.message : typeof e === 'string' ? e : 'non-Error rejection', 200)}`);
         return errorPage(res, 500, 'E_ALIAS_ADD_FAILED', 'the account could not be saved; try the link again or ask for a fresh one');
       }
       if (refusal) {
         // The slug lands in a text/plain body; keep it a bare identifier.
         const slug = typeof refusal.slug === 'string' && /^[A-Za-z0-9_]+$/.test(refusal.slug) ? refusal.slug : 'access_denied';
         const message = typeof refusal.message === 'string' && refusal.message ? refusal.message : 'the account could not be linked';
-        log(`alias_add refused for "${st.alias}": ${slug}`);
+        log(`alias_add refused for "${logSafe(st.alias, 64)}": ${logSafe(slug, 64)}`);
         return errorPage(res, 403, slug, message);
       }
-      log(`callback ok flow=alias_add alias=${st.alias}`);
+      log(`callback ok flow=alias_add alias=${logSafe(st.alias, 64)}`);
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(`<!doctype html><meta charset=utf-8><p>Connected "${escapeHtml(st.alias)}". You can close this window and retry your request.</p>`);
       return true;
@@ -601,7 +654,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       const gotEmail = (exchanged.email ?? '').toLowerCase();
       const expected = (deps.aliasEmail?.(st.alias) ?? '').toLowerCase();
       if (!expected || !gotEmail || gotEmail !== expected) {
-        log(`alias_reauth identity mismatch for "${st.alias}" (got ${gotEmail || 'none'})`);
+        log(`alias_reauth identity mismatch for "${logSafe(st.alias, 64)}" (got ${logSafe(gotEmail || 'none', 254)})`);
         return errorPage(res, 403, 'access_denied', 'the Google account you signed in with is not the one configured for this alias');
       }
       // A completion without a refresh token (a Google URL built without
@@ -609,7 +662,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       // dies within the hour. Keep the stored token instead.
       const refreshToken = exchanged.tokens.refresh_token;
       if (typeof refreshToken !== 'string' || refreshToken === '') {
-        log(`alias_reauth for "${st.alias}" returned no refresh token; stored token kept`);
+        log(`alias_reauth for "${logSafe(st.alias, 64)}" returned no refresh token; stored token kept`);
         return errorPage(res, 400, 'E_REAUTH_INCOMPLETE', 'Google did not return a long-lived token, so the stored one was kept. Open the re-auth link again and approve access.');
       }
       const granted = typeof exchanged.tokens.scope === 'string' ? exchanged.tokens.scope : undefined;
@@ -619,13 +672,13 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
       // for an hour and the Google URL's scope is not signed, so a narrower
       // grant is not necessarily the account holder's choice.
       if (missing.length > 0 && deps.hasToken?.(st.alias)) {
-        log(`alias_reauth for "${st.alias}" granted ${missing.length} fewer scope(s); stored token kept`);
+        log(`alias_reauth for "${logSafe(st.alias, 64)}" granted ${missing.length} fewer scope(s); stored token kept`);
         res.writeHead(400, { 'Content-Type': 'text/html' });
         res.end(`<!doctype html><meta charset=utf-8><p>E_SCOPE_NOT_GRANTED: Google did not grant ${missing.length} requested scope(s): ${listed}, so the stored access for "${escapeHtml(st.alias)}" was kept. Ask for a fresh re-auth link and leave every box ticked.</p>`);
         return true;
       }
       deps.writeToken?.(st.alias, exchanged.tokens);
-      log(`callback ok flow=alias_reauth alias=${st.alias}`);
+      log(`callback ok flow=alias_reauth alias=${logSafe(st.alias, 64)}`);
       // With no stored token a partial grant still beats none; say what is missing.
       const gap = missing.length
         ? `<p>Google did not grant ${missing.length} requested scope(s): ${listed}. Ask for a fresh re-auth link and leave every box ticked to restore them.</p>`
@@ -649,7 +702,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     const authzCode = await signAuthzCode(
       { redirect_uri: st.redirect_uri, code_challenge: st.code_challenge, resource: st.resource, sub: subject.sub },
       base,
-      secret,
+      flowSecret,
       nowSec(),
     );
     log('callback ok flow=owner_gate');
@@ -670,13 +723,13 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     if (grant === 'authorization_code') {
       let code: Awaited<ReturnType<typeof verifyAuthzCode>>;
       try {
-        code = await verifyAuthzCode(form.code ?? '', base, secret);
+        code = await verifyAuthzCode(form.code ?? '', base, flowSecret, nowSec());
       } catch {
         return json(res, 400, { error: 'invalid_grant', message: 'authorization code invalid or expired' });
       }
-      if (!replay.consume(code.jti, CODE_TTL_DEFAULT * 1000, now())) {
-        return json(res, 400, { error: 'invalid_grant', message: 'authorization code already redeemed' });
-      }
+      const spent = spend(code, CODE_TTL_DEFAULT);
+      if (spent === 'full') return subjectUnavailable(res);
+      if (spent === 'replay') return json(res, 400, { error: 'invalid_grant', message: 'authorization code already redeemed' });
       if (form.redirect_uri !== code.redirect_uri) {
         return json(res, 400, { error: 'invalid_grant', message: 'redirect_uri mismatch' });
       }
@@ -692,7 +745,9 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
         try {
           active = deps.subjectActive(code.sub);
         } catch (e) {
-          log(`token deferred grant=authorization_code: subject check failed: ${e instanceof Error ? e.message : 'non-Error throw'}`);
+          log(`token deferred grant=authorization_code: subject check failed: ${e instanceof Error ? logSafe(e.message, 200) : 'non-Error throw'}`);
+          // Nothing was issued and PKCE passed, so the retry the 503 asks for may redeem it.
+          replay.unspend(code.jti);
           return subjectUnavailable(res);
         }
         if (!active) {
@@ -723,7 +778,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
         next = refresh.rotate(form.refresh_token ?? '', now(), accept);
       } catch (e) {
         if (!(e instanceof SubjectCheckUnavailable)) throw e;
-        log(`token deferred grant=refresh_token: subject check failed: ${e.cause instanceof Error ? e.cause.message : 'non-Error throw'}`);
+        log(`token deferred grant=refresh_token: subject check failed: ${e.cause instanceof Error ? logSafe(e.cause.message, 200) : 'non-Error throw'}`);
         return subjectUnavailable(res);
       }
       if (!next) return json(res, 400, { error: 'invalid_grant', message: 'unknown or rotated refresh token' });
@@ -737,14 +792,23 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
   // POST /register (minimal DCR, D2). Parse the raw JSON body directly (the
   // redirect_uris array must survive intact).
   const register: RouteHandler = async (req, res) => {
-    let parsed: { redirect_uris?: unknown };
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(await readBody(req)) as { redirect_uris?: unknown };
+      parsed = JSON.parse(await readBody(req));
     } catch {
       return json(res, 400, { error: 'invalid_client_metadata', message: 'a JSON body with redirect_uris is required' });
     }
-    const redirectUris = Array.isArray(parsed.redirect_uris) ? parsed.redirect_uris.map(String) : [];
+    // Shape first: a throw here is an unauthenticated 500 per request, and a
+    // `null` body has no properties while String() throws on {"toString":1}.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return json(res, 400, { error: 'invalid_client_metadata', message: 'a JSON body with redirect_uris is required' });
+    }
+    const raw = (parsed as { redirect_uris?: unknown }).redirect_uris;
+    const redirectUris = Array.isArray(raw) ? raw : [];
     if (redirectUris.length === 0) return json(res, 400, { error: 'invalid_client_metadata', message: 'redirect_uris required' });
+    if (!redirectUris.every((u): u is string => typeof u === 'string')) {
+      return json(res, 400, { error: 'invalid_client_metadata', message: 'every redirect_uri must be a string' });
+    }
     if (redirectUris.length > DCR_MAX_REDIRECT_URIS || redirectUris.some((u) => u.length > DCR_MAX_URI_LEN)) {
       return json(res, 400, { error: 'invalid_client_metadata', message: 'too many or oversized redirect_uris' });
     }
@@ -794,7 +858,7 @@ export function buildAuthServer(config: AuthServerConfig, deps: AuthServerDeps =
     const state = await signState(
       { flow, client_id: '', redirect_uri: '', code_challenge: '', resource, alias, tenantId, bundles, nonce },
       base,
-      secret,
+      flowSecret,
       nowSec(),
     );
     return `${base}/authorize?flow=${flow}&state=${encodeURIComponent(state)}`;
