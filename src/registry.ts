@@ -315,28 +315,9 @@ export class ToolRegistry {
       // The ONE default-account injection site, outside the CUD gate and the
       // fan-out parse (not meta-skipped, which is what covers google_api_call).
       // Out-of-grant aliases never reach a handler, so getClient is not called.
-      // Proposal: a hidden service stays callable from {service}_discover (meta)
-      // and is refused when an operational tool is named directly. A tool: deny
-      // cannot do this for a read (isAllowed returns before the deny list).
-      const registeredAsMeta = this.registeringMeta;
       const gate = (...args: unknown[]) => {
         const blocked = grantRefusalForCallArgs(args[0]);
         if (blocked) return blocked;
-        if (!registeredAsMeta && this.hiddenServices.has(service)) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: JSON.stringify({
-                  error: 'service_hidden',
-                  message: `Service "${service}" is hidden. ${name} stays registered and is refused when called by name.`,
-                  retriable: false,
-                }),
-              },
-            ],
-            isError: true,
-          };
-        }
         return guarded(...args);
       };
       const noDefaultResult = () => {
