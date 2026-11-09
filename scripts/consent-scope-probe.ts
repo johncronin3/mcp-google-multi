@@ -61,10 +61,11 @@ for (const [mode, email] of Object.entries(EMAILS)) {
     if (!added.ok) throw new Error(`allBundles form refused for ${mode} home=${home ?? ''}: ${added.message}`);
     for (const profile of profiles) {
       const scopes = resolveScopesForAccount('a', accountSet(email, profile));
-      const aliasReauth = ownerAuthUrlOptions(
-        { flow: 'alias_reauth', alias: 'a', state: 'probe' },
-        () => scopes,
-      ).scope;
+      const scopeList = (opts: { scope?: string | string[] } | undefined): string[] => {
+        const scope = opts?.scope;
+        if (scope === undefined) return [];
+        return Array.isArray(scope) ? scope : [scope];
+      };
       rows.push({
         mode,
         email,
@@ -72,8 +73,10 @@ for (const [mode, email] of Object.entries(EMAILS)) {
         profile: profile.name,
         hostedCli: isHostedHttp({ MCP_HOSTED: '1' }) ? 'refused' : scopes,
         deskCli: scopes,
-        aliasReauth,
-        ownerLogin: ownerAuthUrlOptions({ flow: 'login', state: 'probe' }, () => scopes).scope,
+        aliasReauth: scopeList(
+          ownerAuthUrlOptions({ flow: 'alias_reauth', alias: 'a', state: 'probe' }, () => scopes),
+        ),
+        ownerLogin: scopeList(ownerAuthUrlOptions({ flow: 'login', state: 'probe' }, () => scopes)),
         allBundles: added.bundles,
       });
     }

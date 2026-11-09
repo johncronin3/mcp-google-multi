@@ -7,14 +7,18 @@
  * Grant 3 to the same six aliases. keep and cloudidentity stay off the base
  * consent set, so neither grant registers those services. When the registry
  * grows a hideServices() API, a hidden service stays out of tools/list for
- * every fixture grant.
+ * every fixture grant. Hiding is display-only: a hidden tool called by name
+ * still runs, and google_api_call can still reach that service.
  */
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { invalidateAccountSet } from '../src/accounts.js';
 import { BASE_SCOPES, resolveScopesForAccount } from '../src/auth.js';
 import { buildRegistry } from '../src/compose.js';
+import { clearDiscoveryMemoryCache } from '../src/discovery-client.js';
 import type { IdentityContext } from '../src/identity.js';
 import { ToolRegistry } from '../src/registry.js';
 import { isAllowed } from '../src/write-control.js';
@@ -305,7 +309,12 @@ describe('upstream isolate does not widen fixture grants', () => {
     }
   });
 
-  it.skipIf(!hasHide)('calling a hidden service tool by name is not refused under either fixture grant', async () => {
+  // Hiding is display-only. It drops operational tools from tools/list.
+  // It is not a wall: the same tool called by name still runs, a generated
+  // per-method tool still runs, and google_api_call still reaches the hidden
+  // service. A tool: deny does not stop a read (write-control.ts returns
+  // true for cud === 'read' before the deny list). Account reach is the grant.
+  it.skipIf(!hasHide)('display-only: a hidden tool called by name still runs under either fixture grant', async () => {
     const hide = (registry as unknown as { hideServices: (services: Iterable<string>) => void }).hideServices.bind(registry);
     hide(['gmail']);
     expect(
@@ -322,8 +331,101 @@ describe('upstream isolate does not widen fixture grants', () => {
       const parsed = body(res);
       expect(parsed.error, name).not.toBe('account_outside_grant');
       expect(parsed.error, name).not.toBe('grant_required');
-      expect(JSON.stringify(parsed), name).not.toContain('service_hidden');
+      expect(parsed.error, name).not.toBe('service_hidden');
       expect(seen, name).toEqual([alias]);
+
+      seen.length = 0;
+      const generated = await call('gmail_users_settings_cse_identities_get', {
+        account: alias,
+        userId: 'me',
+        cseEmailAddress: 'cse@example.com',
+      });
+      expect(body(generated).error, `${name} generated`).not.toBe('service_hidden');
+      expect(seen, `${name} generated`).toEqual([alias]);
+
+      const discover = await call('gmail_discover', {});
+      expect(body(discover).error, `${name} discover`).not.toBe('service_hidden');
+    }
+  });
+
+  it.skipIf(!hasHide)('display-only: google_api_call still reaches a hidden service under either fixture grant', async () => {
+    const hide = (registry as unknown as { hideServices: (services: Iterable<string>) => void }).hideServices.bind(registry);
+    hide(['gmail']);
+    const cache = mkdtempSync(path.join(tmpdir(), 'hide-discovery-'));
+    const prevCache = process.env.DISCOVERY_CACHE_PATH;
+    process.env.DISCOVERY_CACHE_PATH = cache;
+    clearDiscoveryMemoryCache();
+    writeFileSync(
+      path.join(cache, 'gmail.json'),
+      JSON.stringify({
+        baseUrl: 'https://gmail.googleapis.com/',
+        resources: {
+          users: {
+            resources: {
+              messages: {
+                methods: {
+                  list: {
+                    id: 'gmail.users.messages.list',
+                    httpMethod: 'GET',
+                    path: 'gmail/v1/users/{userId}/messages',
+                    description: 'Lists messages.',
+                    parameters: { userId: { location: 'path', required: true, type: 'string' } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      path.join(cache, 'drive.json'),
+      JSON.stringify({
+        baseUrl: 'https://www.googleapis.com/',
+        resources: {
+          files: {
+            methods: {
+              get: {
+                id: 'drive.files.get',
+                httpMethod: 'GET',
+                path: 'drive/v3/files/{fileId}',
+                description: 'Gets a file.',
+                parameters: { fileId: { location: 'path', required: true, type: 'string' } },
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    try {
+      for (const name of [SB2_NAME, PBG3_NAME]) {
+        const grant = activate(name);
+        const alias = grant.accounts[0];
+        const hidden = await call('google_api_call', {
+          account: alias,
+          api: 'gmail',
+          methodId: 'gmail.users.messages.list',
+          pathParams: { userId: 'me' },
+        });
+        expect(body(hidden).error, name).not.toBe('service_hidden');
+        expect(seen, name).toEqual([alias]);
+
+        seen.length = 0;
+        const open = await call('google_api_call', {
+          account: alias,
+          api: 'drive',
+          methodId: 'drive.files.get',
+          pathParams: { fileId: 'f1' },
+        });
+        expect(body(open).error, `${name} drive`).not.toBe('service_hidden');
+        expect(seen, `${name} drive`).toEqual([alias]);
+      }
+    } finally {
+      clearDiscoveryMemoryCache();
+      if (prevCache === undefined) delete process.env.DISCOVERY_CACHE_PATH;
+      else process.env.DISCOVERY_CACHE_PATH = prevCache;
+      rmSync(cache, { recursive: true, force: true });
     }
   });
 });
