@@ -6,15 +6,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAccounts, accountAliasSchemaFor } from '../src/accounts.js';
 
-// Gap #23: a fresh install (zero accounts) must NOT crash the bootstrap/diagnostic
-// CLIs at module load. resolveAccounts and the account-field schema are the two
-// module-load choke points; both are exercised here without a subprocess.
+// A fresh install (zero accounts) must not crash the bootstrap/diagnostic CLIs at module load.
+// resolveAccounts and the account-field schema are the two module-load choke points, exercised here without a subprocess.
 
 const nonexistent = () => path.join(mkdtempSync(path.join(tmpdir(), 'mcp-gm-empty-')), 'config.json');
 
-describe('resolveAccounts on an empty registry (gap #23)', () => {
+describe('resolveAccounts on an empty registry', () => {
   it('returns an empty AccountSet (not a process exit) at module-load severity', () => {
-    // env with NO GOOGLE_ACCOUNTS + an absent config.json => zero accounts.
     const set = resolveAccounts({}, nonexistent(), 'exit');
     expect(set.aliases).toEqual([]);
     expect(set.configs).toEqual({});
@@ -31,7 +29,7 @@ describe('resolveAccounts on an empty registry (gap #23)', () => {
     expect(set.aliases).toEqual([]);
   });
 
-  it('STILL throws on the reload path so a mid-session empty keeps the last-good set (BR-7)', () => {
+  it('STILL throws on the reload path so a mid-session empty keeps the last-good set', () => {
     // onInvalid: 'throw' is the dispatch-reload contract — it must not silently
     // drop a running server to zero accounts.
     expect(() => resolveAccounts({}, nonexistent(), 'throw')).toThrowError(/E_NO_ACCOUNTS_CONFIGURED/);
@@ -44,7 +42,7 @@ describe('resolveAccounts on an empty registry (gap #23)', () => {
   });
 });
 
-describe('accountAliasSchemaFor: empty-safe account field (gap #23)', () => {
+describe('accountAliasSchemaFor: empty-safe account field', () => {
   it('falls back to a plain string when there are no aliases (z.enum would throw)', () => {
     const schema = accountAliasSchemaFor([]);
     // any string parses — there is nothing to enumerate, and dispatch validates
@@ -62,16 +60,14 @@ describe('accountAliasSchemaFor: empty-safe account field (gap #23)', () => {
   });
 });
 
-// End-to-end: a real process on a truly empty registry. Guards the two invariants
-// that no in-process test can reach (the account snapshot is non-empty in-suite):
-// the bootstrap/diagnostic CLIs must RUN, and the SERVER must REFUSE (BR-4).
-describe('empty registry, end-to-end via the CLI (gap #23)', () => {
+// End-to-end via a real process: in-process tests can't exercise a truly empty registry (the account
+// snapshot stays non-empty in-suite), so this guards that the CLIs RUN and the SERVER REFUSES.
+describe('empty registry, end-to-end via the CLI', () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const srcIndex = path.join(repoRoot, 'src', 'index.ts');
 
-  // Run the built entry through tsx (reflects src, no dist dependency) on a fresh
-  // config home, with MCP_GOOGLE_MULTI_ENV pointed at an EMPTY file so a stray
-  // repo-root .env can't leak accounts in. stdin is closed so the server can't hang.
+  // Runs through tsx (reflects src, no dist dependency) on a fresh config home; MCP_GOOGLE_MULTI_ENV
+  // points at an empty file so a stray repo-root .env can't leak accounts in, and stdin is closed so the server can't hang.
   function runCli(args: string[], envOver: Record<string, string> = {}): { status: number | null; out: string } {
     const home = mkdtempSync(path.join(tmpdir(), 'mcp-gm-e2e-'));
     const emptyEnv = path.join(home, 'empty.env');
@@ -111,13 +107,13 @@ describe('empty registry, end-to-end via the CLI (gap #23)', () => {
     expect(out).not.toMatch(/E_NO_ACCOUNTS_CONFIGURED/);
   });
 
-  it('the SERVER still REFUSES to boot on an empty registry (BR-4)', () => {
+  it('the SERVER still REFUSES to boot on an empty registry', () => {
     const { status, out } = runCli([]); // no subcommand => server path
     expect(status).not.toBe(0);
     expect(out).toMatch(/E_NO_ACCOUNTS_CONFIGURED/);
   });
 
-  // S1.16 golden: the boot reorder (transport derivation before the accounts
+  // Golden: the boot reorder (transport derivation before the accounts
   // gate) must keep both free-core refusals byte-recognizable.
   it('http boot with accounts but no MCP_OWNER_EMAILS still refuses: E_OWNER_EMAILS_REQUIRED', () => {
     const { status, out } = runCli([], {

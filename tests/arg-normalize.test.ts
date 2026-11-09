@@ -172,8 +172,7 @@ describe('registry integration + flag', () => {
   });
 });
 
-// The reject path had no coverage at all while it was opt-in. It is the
-// default now, so every branch that decides forward-vs-reject is pinned here.
+// reject is the default, so every branch that decides forward-vs-reject is pinned here.
 describe('screenMessage (unknown-argument screening)', () => {
   const DECLARED: Record<string, readonly string[]> = {
     drive_create_folder: ['account', 'name', 'parentFolderId'],
@@ -212,6 +211,23 @@ describe('screenMessage (unknown-argument screening)', () => {
     expect(lines.join('\n').length).toBeLessThan(300);
   });
 
+  it('logs hostile undeclared key names on one escaped, bounded line; the envelope keeps them as sent', () => {
+    const lines: string[] = [];
+    const key = `x\n[args] drive_create_folder: forged${String.fromCharCode(0x2028)}y`;
+    const out = screenMessage(call('drive_create_folder', { [key]: 1 }), strict('reject'), (l) => lines.push(l));
+    expect(lines).toEqual(['[args] drive_create_folder: undeclared x\\u000a[args] drive_create_folder: forged\\u2028y (rejected)']);
+    expect(envelopeOf(out).message).toContain(`"${key}"`);
+
+    const many: string[] = [];
+    const nel = String.fromCharCode(0x85);
+    const keys = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`k${i}${nel.repeat(100)}`, 1]));
+    screenMessage(call('drive_create_folder', keys), strict('warn'), (l) => many.push(l));
+    expect(many).toHaveLength(1);
+    expect(many[0]).not.toMatch(/[\r\n\p{Cc}]/u);
+    expect(many[0].length).toBeLessThan(6 * 600 + 100);
+    expect(many[0]).toMatch(/ and 12 more \(dropped\)$/);
+  });
+
   it('answers as a tool result, not a JSON-RPC error, so the model can self-correct', () => {
     const out = screenMessage(call('drive_create_folder', { parentId: 'x' }, 42), strict('reject'), () => {});
     if (out.action !== 'reject') throw new Error('expected a reject');
@@ -227,9 +243,8 @@ describe('screenMessage (unknown-argument screening)', () => {
     const msg = call('drive_create_folder', { parentId: 'x' });
     const out = screenMessage(msg, strict('warn', onDrop), log);
     expect(out.action).toBe('forward');
-    // The caller's own key is never handed to the metrics observer: only the
-    // DECLARED key it resolved to, or the literal placeholder. That is the
-    // closed-vocabulary rule that keeps local metrics free of caller strings.
+    // The caller's own key is never handed to the metrics observer, only the DECLARED key it resolved
+    // to (or the literal placeholder); a closed vocabulary that keeps local metrics free of caller strings.
     expect(onDrop).toHaveBeenCalledWith('drive_create_folder', ['parentFolderId']);
     expect(String(log.mock.calls[0]?.[0])).toContain('dropped');
   });

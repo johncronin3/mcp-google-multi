@@ -9,12 +9,8 @@ import { handleGoogleApiError, invalidParams } from './_errors.js';
 import { capText } from '../trim.js';
 
 
-// A single very large insertText has been observed to apply only partially while
-// the request still returns success, silently dropping the tail. Split a large
-// insert into bounded pieces sent as sequential insertText requests in one atomic
-// batchUpdate: small inserts keep the exact single-request path, and a large one
-// can no longer be silently truncated. Docs indices are UTF-16 code units (= JS
-// string length), so index math advances by `.length`; never split a surrogate pair.
+// A single large insertText can silently apply only partially despite returning
+// success; split into <=DOCS_INSERT_CHUNK sequential inserts in one atomic batchUpdate (UTF-16-safe, no split surrogate pairs).
 export const DOCS_INSERT_CHUNK = 5000;
 
 export function splitInsertText(text: string, maxLen = DOCS_INSERT_CHUNK): string[] {
@@ -178,9 +174,8 @@ export function listTabs(tabs: any[] | undefined): { tabId: string; title: strin
 }
 
 export function registerDocsTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -421,36 +416,77 @@ export function registerDocsTools(server: ToolRegistry, deps: CuratedToolDeps = 
     {
       // Insert/append-capable or non-convergent: a retry duplicates content.
       annotations: { idempotentHint: false },
-      description: 'Find and replace all occurrences of text in a document',
+      description: 'Find and replace text in a document. Pass findText/replaceText for a single pair, or replacements for several pairs applied in one batchUpdate.',
       inputSchema: {
         account: accountEnum.describe('Google account alias'),
         documentId: z.string().min(1).describe('Google Docs document ID'),
-        findText: z.string().describe('Text to search for'),
-        replaceText: z.string().describe('Replacement text'),
+        findText: z.string().optional().describe('Text to search for. Use with replaceText; exactly one of this pair or `replacements` is required.'),
+        replaceText: z.string().optional().describe('Replacement text for findText'),
         matchCase: coerceBoolean.default(true).optional()
           .describe('Case-sensitive match (default: true)'),
+        replacements: coerceJson(z.array(z.object({
+          findText: z.string(),
+          replaceText: z.string(),
+          matchCase: coerceBoolean.optional(),
+        })).min(1)).optional().describe('Several find/replace pairs applied in one batchUpdate, each returning its own count. Exactly one of this or findText/replaceText is required.'),
       },
     },
-    async ({ account, documentId, findText, replaceText, matchCase }) => {
+    async ({ account, documentId, findText, replaceText, matchCase, replacements }) => {
+      const singlePair = findText !== undefined || replaceText !== undefined;
+      if (singlePair && replacements) {
+        return invalidParams(
+          account as Account,
+          'Pass either findText/replaceText or replacements, not both.',
+          'Use findText and replaceText for one pair, or replacements for several pairs in one call.',
+        );
+      }
+      if (!singlePair && !replacements) {
+        return invalidParams(
+          account as Account,
+          'Pass findText and replaceText, or a replacements array.',
+          'Use findText and replaceText for one pair, or replacements for several pairs in one call.',
+        );
+      }
+      if (singlePair && (findText === undefined || replaceText === undefined)) {
+        return invalidParams(
+          account as Account,
+          'Both findText and replaceText are required together.',
+          'Pass both, or use replacements for several pairs.',
+        );
+      }
+      const pairs = replacements ?? [{ findText: findText!, replaceText: replaceText!, matchCase }];
       try {
         const auth = await getClientFn(account as Account);
         const docs = docsClient({ version: 'v1', auth });
         const res = await docs.documents.batchUpdate({
           documentId,
           requestBody: {
-            requests: [{
+            requests: pairs.map((p) => ({
               replaceAllText: {
-                containsText: { text: findText, matchCase: matchCase ?? true },
-                replaceText,
+                containsText: { text: p.findText, matchCase: p.matchCase ?? true },
+                replaceText: p.replaceText,
               },
-            }],
+            })),
           },
         });
-        const occurrences = (res.data.replies?.[0] as any)?.replaceAllText?.occurrencesChanged ?? 0;
+        const counts = (res.data.replies ?? []).map((r: any) => r?.replaceAllText?.occurrencesChanged ?? 0);
+        const warning = counts.every((c) => c === 0)
+          ? 'No occurrences were replaced; check spelling and matchCase.'
+          : undefined;
+        if (replacements) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              documentId: res.data.documentId,
+              replacements: pairs.map((p, i) => ({ findText: p.findText, replaceText: p.replaceText, occurrencesReplaced: counts[i] })),
+              ...(warning ? { warning } : {}),
+            }, null, 2) }],
+          };
+        }
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({
             documentId: res.data.documentId,
-            occurrencesReplaced: occurrences,
+            occurrencesReplaced: counts[0],
+            ...(warning ? { warning } : {}),
           }, null, 2) }],
         };
       } catch (error: any) {

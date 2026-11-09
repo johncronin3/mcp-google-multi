@@ -1,11 +1,11 @@
 {
-  "comment": "Tier-2 agent eval tasks (read-only by design; safe under GOOGLE_PROFILE=read-only). expectFirst = acceptable FIRST tool calls (selection metric); successTools = at least one non-error result from this set makes the run a success. Derived from the WS3 transcript task mix.",
+  "comment": "Tier-2 agent eval tasks (read-only by design; safe under GOOGLE_PROFILE=read-only). expectFirst = acceptable FIRST calls to the eval server's tools (selection metric; client-side ToolSearch calls are not counted, and the expected tool's own <service>_discover is scored separately as first-service); successTools = at least one non-error result from this set makes the run a success. Derived from a real-usage transcript task mix.",
   "tasks": [
     {
       "id": "unread-count",
       "prompt": "Using my Google tools, how many unread emails are in my inbox right now? Reply with just the number.",
-      "expectFirst": ["gmail_search"],
-      "successTools": ["gmail_search"]
+      "expectFirst": ["gmail_search", "gmail_users_labels_get"],
+      "successTools": ["gmail_search", "gmail_users_labels_get"]
     },
     {
       "id": "find-file",
@@ -52,14 +52,14 @@
     {
       "id": "fanout-unread",
       "prompt": "Across ALL of my configured Google accounts at once, how many unread emails does each account have? Use a single fan-out call with account \"*\".",
-      "expectFirst": ["gmail_search"],
-      "successTools": ["gmail_search"]
+      "expectFirst": ["gmail_search", "gmail_users_labels_get"],
+      "successTools": ["gmail_search", "gmail_users_labels_get"]
     },
     {
       "id": "attachment-name",
       "prompt": "Find the most recent email in my inbox that has an attachment and tell me the attachment's filename. Do not download it.",
       "expectFirst": ["gmail_search"],
-      "successTools": ["gmail_read"]
+      "successTools": ["gmail_read", "gmail_read_batch", "gmail_read_thread"]
     },
     {
       "id": "tasklists",
@@ -71,7 +71,7 @@
       "id": "doc-first-line",
       "prompt": "Find my most recently modified Google Doc in Drive and quote its first line of text.",
       "expectFirst": ["drive_search"],
-      "successTools": ["drive_read", "docs_get"]
+      "successTools": ["drive_read", "docs_get", "docs_read"]
     }
   ]
 }

@@ -1,4 +1,4 @@
-# Railway config-as-code (B17) — one-click remote HTTP deploy.
+# Railway config-as-code — one-click remote HTTP deploy.
 # Railway builds the repo Dockerfile; set the variables below in the Railway
 # dashboard (Variables), never here. Walkthrough: docs/http-setup.md#railway
 #

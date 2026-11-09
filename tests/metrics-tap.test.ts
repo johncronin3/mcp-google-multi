@@ -157,9 +157,8 @@ describe('normalizeMessage onRename observer', () => {
 });
 
 describe('closed vocabulary: only REGISTERED tool names may be persisted', () => {
-  // The name on a tools/call frame is client-supplied. A shape check alone
-  // would let a shape-valid invented name reach disk, which is exactly what
-  // the metrics privacy guarantee forbids.
+  // A shape check alone would let a shape-valid invented name reach disk,
+  // which the metrics privacy guarantee forbids.
   it('a shape-valid but UNREGISTERED name is never written; it counts as not-found', async () => {
     const { m, dir } = makeMetrics();
     const { tapped, inbound } = drive(m);
@@ -217,5 +216,66 @@ describe('v2 transport member forwarding', () => {
     const { m } = makeMetrics();
     const { t } = fakeTransport();
     expect(tapUsageMetrics(t, m).setSupportedProtocolVersions).toBeUndefined();
+  });
+});
+
+describe('protocol and client counters', () => {
+  const init = (id: number, protocolVersion: unknown, clientInfo: unknown): JSONRPCMessage =>
+    ({ jsonrpc: '2.0', id, method: 'initialize', params: { protocolVersion, capabilities: {}, clientInfo } }) as JSONRPCMessage;
+
+  it('counts an initialize by protocol version and client name@major.minor, and nothing else about the caller', () => {
+    const { m, dir } = makeMetrics();
+    const { inbound } = drive(m);
+    inbound(init(1, '2025-06-18', { name: 'Claude-AI', version: '1.4.7-beta', title: 'Someone', websiteUrl: 'https://x.example' }));
+    inbound(init(2, '2025-06-18', { name: 'claude-ai', version: '1.4.0' }));
+    m.flush();
+    const day = readDay(dir);
+    expect(day.proto).toEqual({ '2025-06-18': 2 });
+    expect(day.clients).toEqual({ 'claude-ai@1.4': 2 });
+  });
+
+  it('counts each modern-era request from its envelope', () => {
+    const { m, dir } = makeMetrics();
+    const { inbound } = drive(m);
+    const modern = (id: number): JSONRPCMessage =>
+      ({
+        jsonrpc: '2.0', id, method: 'tools/call',
+        params: {
+          name: 'tasks_update', arguments: {},
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientInfo': { name: 'inspector', version: '0.9.1' },
+          },
+        },
+      }) as JSONRPCMessage;
+    inbound(modern(1));
+    inbound(modern(2));
+    m.flush();
+    const day = readDay(dir);
+    expect(day.proto).toEqual({ '2026-07-28': 2 });
+    expect(day.clients).toEqual({ 'inspector@0.9': 2 });
+  });
+
+  it('buckets anything off-shape under other and never stores free text', () => {
+    const { m, dir } = makeMetrics();
+    const { inbound } = drive(m);
+    inbound(init(1, 'latest; drop table', { name: 'me@example.com', version: '1.0' }));
+    inbound(init(2, '2025-03-26', { name: 'good-client', version: 'weird' }));
+    inbound(init(3, 5, 'not an object'));
+    m.flush();
+    const day = readDay(dir);
+    expect(day.proto).toEqual({ other: 1, '2025-03-26': 1 });
+    expect(day.clients).toEqual({ other: 1, 'good-client@other': 1 });
+    expect(JSON.stringify(day)).not.toContain('example.com');
+  });
+
+  it('omits both maps when no client ever announced itself', () => {
+    const { m, dir } = makeMetrics();
+    const { inbound } = drive(m);
+    inbound(call(1, 'tasks_update'));
+    m.flush();
+    const day = readDay(dir);
+    expect(day.proto).toBeUndefined();
+    expect(day.clients).toBeUndefined();
   });
 });

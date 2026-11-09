@@ -7,9 +7,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const server = JSON.parse(readFileSync(path.join(root, 'server.json'), 'utf-8'));
 const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf-8'));
 
-// The MCP Registry entry (launch checklist A2). Publish is CI-automated on
-// STABLE releases; these guards keep the committed template publishable
-// (constraints verified against the live registry's validate endpoint).
+// The MCP Registry entry: publish is CI-automated on STABLE releases, so these guards keep the
+// committed template publishable (constraints verified against the live registry's validate endpoint).
 describe('MCP Registry entry', () => {
   it('server.json name matches the npm ownership proof (package.json mcpName)', () => {
     expect(pkg.mcpName).toBe('io.github.bakissation/mcp-google-multi');

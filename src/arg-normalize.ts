@@ -7,13 +7,10 @@ import {
   type SiblingSpelling,
   type UnknownArgMode,
 } from './arg-strict.js';
-import { sliceClean } from './trim.js';
+import { logSafe, sliceClean } from './trim.js';
 
-// The SDK synthesizes input-validation failures as isError RESULTS, skipping
-// the handler entirely: no handler of ours runs, so no envelope exists and the
-// client gets free text. The text is prose in both SDK eras (v1 prefixed it
-// with "MCP error -32602: ", v2 dropped that prefix), while handler envelopes
-// are always JSON starting with "{".
+// The SDK synthesizes input-validation failures as isError RESULTS (no handler
+// runs), so the client gets free prose; handler envelopes always start with "{".
 const SCHEMA_VALIDATION_TEXT = /^(MCP error -32602: )?Input validation error:/;
 
 export function isSchemaValidationText(text: string): boolean {
@@ -25,19 +22,12 @@ export function isSchemaValidationText(text: string): boolean {
 const VALIDATION_PROSE =
   /^(?:MCP error -32602: )?Input validation error: Invalid arguments for tool ([A-Za-z0-9_.-]+): ([\s\S]+)$/;
 
-/** The SDK's OTHER synthesized prose on the same catch. Both prefixes are
- * SDK-authored; a HANDLER's free text is not, and must survive untouched
- * (the account wizard answers in prose today). */
+/** The SDK's OTHER synthesized prose on the same catch; a HANDLER's free text
+ * is not SDK-authored and must survive untouched. */
 const SDK_OUTPUT_PROSE = /^(?:MCP error -32602: )?Output validation error: /;
 
-// Wire-level tools/call argument normalization. Clients (LLMs) recurringly
-// snake_case a camelCase parameter (thread_id for threadId) and burn a retry
-// on the -32602. A schema-level fix is off the table: the SDK advertises an
-// EMPTY input schema for any non-object wrapper (pipe/preprocess), so the
-// only seam that keeps tools/list intact is the JSON-RPC message itself —
-// which is versioned MCP spec, stabler than any SDK internal. The rename is
-// provably lossless: it fires only when the sent key is NOT in the tool's
-// schema, its camelCase twin IS, and that twin was not also sent.
+// Wire-level, not schema-level: the SDK advertises an EMPTY input schema for
+// any non-object wrapper, so the JSON-RPC message is the only stable seam. See docs/internals.md.
 
 export function argNormalizationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return !/^(0|false|off|no)$/i.test((env.GOOGLE_ARG_NORMALIZE ?? '').trim());
@@ -141,11 +131,8 @@ export function screenMessage(
   if (!args || typeof args !== 'object' || Array.isArray(args)) return { action: 'forward', msg };
   const tool = m.params.name;
   const declared = opts.declaredFor(tool);
-  // Unregistered tool. The spec keeps this a PROTOCOL error (unknown tool is
-  // not something the model can fix by adjusting arguments), so the channel
-  // stays a JSON-RPC error; only the message gets the did-you-mean and the
-  // gated-service next step. Without `unknownTool`, or on a notification,
-  // the SDK's own "not found" still answers.
+  // Unregistered tool stays a PROTOCOL error (not an arguments problem); only
+  // the message gets the did-you-mean. No `unknownTool`, or a notification: the SDK's own answers.
   if (!declared) {
     if (!opts.unknownTool || m.id === undefined) return { action: 'forward', msg };
     return {
@@ -162,8 +149,8 @@ export function screenMessage(
   if (screened.unknown.length === 0 && screened.redundant.length === 0) return { action: 'forward', msg };
 
   const all = [...screened.unknown.map((u) => u.sent), ...screened.redundant];
-  // Key names only; argument VALUES never reach the log.
-  log(`[args] ${tool}: undeclared ${echoNames(all)}${opts.mode === 'warn' ? ' (dropped)' : ' (rejected)'}`);
+  // Key names only, escaped here and only here: the caller's names, never values, reach the log.
+  log(`[args] ${tool}: undeclared ${logSafe(echoNames(all), 600)}${opts.mode === 'warn' ? ' (dropped)' : ' (rejected)'}`);
   try {
     // Only ever a DECLARED key or the literal placeholder, so the metrics
     // closed-vocabulary rule holds: the caller's key is never persisted.
@@ -225,13 +212,10 @@ export function withArgNormalization(
             const outcome = screenMessage(normalized, strict, log);
             if (outcome.action === 'forward') return handler(outcome.msg as typeof message, extra);
             // Last-resort fallback: dispatch as before rather than hang the
-            // caller. The stderr line and the counter already fired above.
-            // `send` is async, so a rejected promise needs catching too: a
-            // bare `void` left the client waiting for a frame that never came.
+            // caller; send is async, so a bare `void` would leave it waiting forever on rejection.
             const fallback = () => handler(normalized as typeof message, extra);
             try {
-              // Answer on the INNER transport so the metrics tap still sees the
-              // frame and clears its pending id.
+              // On the INNER transport so the metrics tap still sees the frame and clears its pending id.
               void Promise.resolve(transport.send(outcome.response)).catch(fallback);
             } catch {
               fallback();
@@ -252,23 +236,16 @@ export function withArgNormalization(
   if (transport.setProtocolVersion) {
     wrapper.setProtocolVersion = (v: string) => transport.setProtocolVersion!(v);
   }
-  // v2-only, called by Protocol.connect() before start(). A no-op today (both
-  // sides default to the same exported constant), but a proxy that silently
-  // eats a member the SDK calls is a bug waiting for the first caller that
-  // passes supportedProtocolVersions explicitly.
+  // A no-op today, but a proxy silently eating an SDK-called member is a bug
+  // waiting for the first caller that passes this explicitly.
   if (transport.setSupportedProtocolVersions) {
     wrapper.setSupportedProtocolVersions = (v: string[]) => transport.setSupportedProtocolVersions!(v);
   }
   return wrapper;
 }
 
-// ---------------------------------------------------------------------------
-// The same wire seam owns one OUTBOUND job. withValidationEnvelope converts the
-// SDK's bare validation prose back into the 6.0.0 envelope. It must be wrapped
-// INNERMOST, below the metrics tap: outbound runs outermost-first, so this is
-// the LAST thing to touch the frame and the tap above it still classifies the
-// ORIGINAL prose as schema_validation.
-// ---------------------------------------------------------------------------
+// The same wire seam's OUTBOUND job: converts the SDK's bare validation prose
+// back into the envelope. Wrapped innermost; see docs/internals.md.
 
 export interface ValidationEnvelopeOptions {
   /** Membership against the REGISTERED tool set: the name on the frame is
@@ -318,9 +295,8 @@ export function rewriteValidationFrame(
     method?: unknown;
     result?: { isError?: boolean; content?: { type?: string; text?: string }[] };
   };
-  // Responses only. A server-initiated REQUEST (elicitation, sampling) also
-  // carries an id, from a different id space, and evicting on it would drop a
-  // real pending call.
+  // Responses only: a server-initiated REQUEST also carries an id (a
+  // different id space), and evicting on it would drop a real pending call.
   if (m.id === undefined || m.method !== undefined) return message;
   const call = pending.get(m.id);
   pending.delete(m.id);

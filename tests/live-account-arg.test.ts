@@ -7,10 +7,8 @@ import type { Policy } from '../src/write-control.js';
 import { SERVICES } from '../src/services.js';
 import { GENERATED_SERVICES } from '../src/tools/generated/index.js';
 
-// S1.10-A: the generic mid-session account_add mechanism. Validation is LIVE
-// (accountArgLive consults the accessor at parse time) and tools/list
-// advertises the CURRENT enum (injected per call over the cached structural
-// schema) — accounts-config.md section 4 test #4.
+// The generic mid-session account_add mechanism: validation is LIVE (accountArgLive consults the
+// accessor at parse time) and tools/list advertises the CURRENT enum (injected per call).
 
 const POLICY: Policy = { profile: 'full-writes', readOnly: false, allow: [], deny: [] };
 
@@ -42,7 +40,7 @@ function harness(initial: string[]) {
   return { registry, captured, aliases };
 }
 
-describe('accountArgLive (S1.10-A)', () => {
+describe('accountArgLive', () => {
   it('an alias added AFTER registration is immediately valid on the already-registered schema', () => {
     const { registry, captured, aliases } = harness(['first']);
     registry.registerTool(
@@ -65,7 +63,7 @@ describe('accountArgLive (S1.10-A)', () => {
   });
 });
 
-describe('tools/list advertises the LIVE enum (S1.10-A)', () => {
+describe('tools/list advertises the LIVE enum', () => {
 
   it('the account enum tracks the live set across an add, on the SAME cached schema', async () => {
     const { registry, aliases } = harness(['first']);
@@ -96,7 +94,7 @@ describe('tools/list advertises the LIVE enum (S1.10-A)', () => {
     stubInner.setRequestHandler = (method: string, h: never) => {
       if (method === 'tools/list') listHandler = h as never;
     };
-    // a READ tool with an enum-shaped account joins the fan-out path (S1.8),
+    // a READ tool with an enum-shaped account joins the fan-out path,
     // whose field is the union enum | CSV
     registry.registerTool(
       'thing_search',
@@ -114,10 +112,8 @@ describe('tools/list advertises the LIVE enum (S1.10-A)', () => {
   });
 });
 
-// The REAL tool schemas, not synthetic enums: curated tools build their
-// account field with accountArgLive, generated tools with accountField(getter).
-// A synthetic z.enum hid that live fields were never recognised as selectors,
-// so no curated read tool accepted "*" or a CSV.
+// The REAL tool schemas, not synthetic enums (curated: accountArgLive, generated: accountField(getter)) , 
+// a synthetic z.enum hid that live fields were never recognised as selectors, so no curated read tool accepted "*" or a CSV.
 describe('real tools keep fan-out and validate live', () => {
   type Shape = Record<string, z.ZodType>;
   function realRegistry(initial: string[]) {
@@ -150,7 +146,7 @@ describe('real tools keep fan-out and validate live', () => {
 
   it('an alias added after build is valid on curated and generated tools, read and write', () => {
     const { aliases, schemaOf } = realRegistry(['a']);
-    const tools = ['gmail_search', 'gmail_send', 'gmail_users_labels_get', 'gmail_users_drafts_delete'];
+    const tools = ['gmail_search', 'gmail_send', 'gmail_users_labels_get', 'gmail_delete_draft'];
     for (const t of tools) expect(schemaOf(t).partial().safeParse({ account: 'fresh' }).success).toBe(false);
     aliases.push('fresh');
     for (const t of tools) expect(schemaOf(t).partial().safeParse({ account: 'fresh' }).success).toBe(true);

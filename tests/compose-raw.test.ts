@@ -5,7 +5,7 @@ function decode(b64: string): string {
   return Buffer.from(b64, 'base64url').toString('utf-8');
 }
 
-describe('composeRaw (A4 MailComposer)', () => {
+describe('composeRaw (MailComposer)', () => {
   it('plain body: text/plain, CRLF-only, From/To/Subject present', async () => {
     const msg = decode(await composeRaw({ from: 'me@x.com', to: 'a@y.com', subject: 'Hi', text: 'l1\nl2' }));
     expect(msg).toMatch(/^From: me@x\.com/m);

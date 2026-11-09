@@ -1,11 +1,11 @@
-# Render Blueprint (B17) — one-click remote HTTP deploy.
+# Render Blueprint — one-click remote HTTP deploy.
 # New → Blueprint → point at your fork. Render builds the repo Dockerfile and
 # prompts for the `sync: false` values; nothing secret is committed here.
 # Walkthrough: docs/http-setup.md#render
 services:
   - type: web
     name: mcp-google-multi
-    runtime: docker           # reuses the distroless Dockerfile (B16)
+    runtime: docker           # reuses the distroless Dockerfile
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: starter

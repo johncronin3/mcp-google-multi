@@ -1,9 +1,7 @@
 import net from 'node:net';
 
-// Node's happy-eyeballs gives each address family 250ms per connect attempt on
-// every LTS line (raised to 500ms only in v25.2+); on high-latency or
-// broken-IPv6 links that aborts EVERY Google call while curl works. Raise the
-// process default unless the user tuned it themselves. Why: docs/internals.md.
+// Node's happy-eyeballs 250ms-per-attempt default aborts EVERY Google call on
+// a high-latency or broken-IPv6 link while curl works. See docs/internals.md.
 export const CONNECT_ATTEMPT_TIMEOUT_MS = 2000;
 
 const USER_FLAGS = ['--network-family-autoselection-attempt-timeout', '--no-network-family-autoselection'];

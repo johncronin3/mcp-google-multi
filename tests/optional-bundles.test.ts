@@ -38,7 +38,7 @@ describe('optional scope bundles', () => {
     expect(resolveScopesForAccount('test')).not.toContain(PRESENTATIONS_SCOPE);
   });
 
-  it('parses CSV with whitespace; an unknown bundle now fails loudly (BR3, was a silent drop in v5)', () => {
+  it('parses CSV with whitespace; an unknown bundle now fails loudly (was a silent drop in v5)', () => {
     process.env.GOOGLE_OPTIONAL_SCOPES = ' slides , forms ';
     expect(getOptionalBundles()).toEqual(['slides', 'forms']);
     process.env.GOOGLE_OPTIONAL_SCOPES = ' slides , forms ,bogus';

@@ -12,7 +12,7 @@ describe('IdentityContext (the forward-compat seam)', () => {
     expect(Object.keys(ctx.tokenStore).sort()).toEqual(['hasToken', 'readToken', 'updateToken', 'writeToken']);
   });
 
-  it('subject is a plain string: a context can carry a tenant id (S1.5 widen)', () => {
+  it('subject is a plain string: a context can carry a tenant id', () => {
     const base = buildIdentityContext({} as NodeJS.ProcessEnv);
     const tenantCtx: IdentityContext = { ...base, subject: 'tenant-a' };
     expect(tenantCtx.subject).toBe('tenant-a');

@@ -1,13 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { buildSetupText } from '../src/setup-prompt.js';
 
-describe('buildSetupText (B8 setup prompt)', () => {
-  it('states plainly that the Console steps have no creation API (BR9)', () => {
+describe('buildSetupText (setup prompt)', () => {
+  it('states plainly that the Console steps have no creation API', () => {
     const t = buildSetupText();
     expect(t).toMatch(/no creation API/i);
   });
 
-  it('pre-explains the unverified-app scare before consent (BR10)', () => {
+  it('pre-explains the unverified-app scare before consent', () => {
     const t = buildSetupText();
     expect(t).toMatch(/unverified app/i);
     expect(t).toMatch(/Advanced/);

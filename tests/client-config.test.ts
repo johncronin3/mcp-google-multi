@@ -158,7 +158,6 @@ describe('applyFileEntry', () => {
     expect(res.ok).toBe(false);
     expect((res as { reason: string }).reason).toBe('parse_error');
     expect((res as { snippet?: string }).snippet).toContain('mcpServers');
-    // the original file is untouched
     expect(files.get(p)).toBe('{ this is not json');
     expect(files.has(`${p}.bak`)).toBe(false);
   });

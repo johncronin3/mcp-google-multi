@@ -59,7 +59,7 @@ describe('parseMessage body selection', () => {
     expect(out.bodyFormat).toBe('plain');
   });
 
-  it('converts an HTML-only message to Markdown (D6)', () => {
+  it('converts an HTML-only message to Markdown', () => {
     const out = parseMessage(msg(textPart('text/html', '<p>Hello <strong>world</strong></p>')));
     expect(out.body).toBe('Hello **world**');
     expect(out.bodyFormat).toBe('markdown');

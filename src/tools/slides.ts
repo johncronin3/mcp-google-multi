@@ -12,9 +12,8 @@ import { sliceClean } from '../trim.js';
 const SLIDE_TEXT_DIGEST_CHARS = 200;
 
 export function registerSlidesTools(server: ToolRegistry, deps: CuratedToolDeps = {}): void {
-  // Per-registry, LIVE account enum + injectable client (S1.10): the
-  // schema follows the registry's account view at parse time, and the
-  // custody path is the context's, not the process global.
+  // Per-registry, live account enum + injectable client: the schema follows
+  // the registry's account view at parse time, not a process-global default.
   const accountEnum = accountArgLive(() => server.accountAliases()).optional();
   const getClientFn = deps.getClientFn ?? getClient;
   server.registerTool(
@@ -210,6 +209,9 @@ export function summarizePresentation(p: Record<string, any>): Record<string, un
   };
 }
 
-function handleSlidesError(error: any, account: Account) {
-  return handleGoogleApiError(error, account, "Slides tools require the optional \"slides\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=slides (or include \"slides\" in the list) and re-auth.");
+export function handleSlidesError(error: any, account: Account) {
+  return handleGoogleApiError(error, account, {
+    scope: "Slides tools require the optional \"slides\" scope bundle. Add GOOGLE_OPTIONAL_SCOPES=slides (or include \"slides\" in the list) and re-auth.",
+    bundle: 'slides',
+  });
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { capText, compactResult, sliceClean, trimEnabled } from '../src/trim.js';
-import { formatEvent } from '../src/tools/calendar.js';
+import { capText, compactResult, logSafe, sliceClean, trimEnabled } from '../src/trim.js';
+import { formatEvent, inEventZone } from '../src/tools/calendar.js';
 import { parseMessage } from '../src/tools/gmail.js';
 
 describe('trimEnabled', () => {
@@ -39,6 +39,66 @@ describe('sliceClean', () => {
     expect(sliceClean(text, 4)).toBe('aaa');
     expect(sliceClean(text, 5)).toBe(`${'a'.repeat(3)}😀`);
     expect(sliceClean('plain', 3)).toBe('pla');
+  });
+});
+
+describe('logSafe', () => {
+  const ch = (code: number) => String.fromCharCode(code);
+  const esc = (code: number) => `\\u${code.toString(16).padStart(4, '0')}`;
+
+  it('escapes every line break, terminal control and bidi or invisible format control, range ends included', () => {
+    const unsafe = [
+      0x00, 0x09, 0x0a, 0x0d, 0x1b, 0x1f, // C0
+      0x7f, 0x80, 0x85, 0x9b, 0x9d, 0x9f, // DEL, C1 (NEL, CSI, OSC)
+      0x2028, 0x2029, // line and paragraph separators
+      0x061c, 0x200e, 0x200f, 0x202a, 0x202d, 0x202e, 0x2066, 0x2069, // bidi and invisible format controls
+    ];
+    for (const code of unsafe) expect(logSafe(`a${ch(code)}b`, 10), esc(code)).toBe(`a${esc(code)}b`);
+  });
+
+  it('leaves the neighbours of each range alone', () => {
+    for (const code of [0x20, 0x7e, 0xa0, 0x061b, 0x061d, 0x200d, 0x2010, 0x2027, 0x202f, 0x2065, 0x206a]) {
+      expect(logSafe(`a${ch(code)}b`, 10), esc(code)).toBe(`a${ch(code)}b`);
+    }
+  });
+
+  it('returns a clean value under the cap unchanged, backslashes included', () => {
+    for (const v of ['403 host_rejected', 'C:\\Users\\x', 'caf\u00e9 \u{1F600}', '']) expect(logSafe(v, 64)).toBe(v);
+  });
+
+  it('keeps a forged second line on the first one', () => {
+    const out = logSafe('x\naudit line lost (forged)\r\n', 100);
+    expect(out).toBe('x\\u000aaudit line lost (forged)\\u000d\\u000a');
+    expect(out).not.toMatch(/[\r\n\u2028\u2029\p{Cc}]/u);
+  });
+
+  it('cuts at max characters and says how long the value was', () => {
+    expect(logSafe('a'.repeat(10), 4)).toBe('aaaa...(len=10)');
+    expect(logSafe('a'.repeat(4), 4)).toBe('aaaa');
+    expect(logSafe(`${'\n'.repeat(5)}tail`, 3)).toBe('\\u000a\\u000a\\u000a...(len=9)');
+  });
+
+  it('drops a lone high surrogate at the cut', () => {
+    expect(logSafe('aaa\u{1F600}x', 4)).toBe('aaa...(len=6)');
+    expect(logSafe('aaa\u{1F600}x', 5)).toBe('aaa\u{1F600}...(len=6)');
+  });
+
+  it('is stable when applied again with a cap the first output fits', () => {
+    const once = logSafe('a\u2028b\u0085c'.repeat(20), 30);
+    expect(logSafe(once, 1000)).toBe(once);
+  });
+
+  it('never throws, whatever the value', () => {
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expect(logSafe({ toString: 1 }, 64)).toBe('<unprintable>');
+    expect(logSafe(Object.create(null), 64)).toBe('<unprintable>');
+    expect(logSafe(revoked.proxy, 64)).toBe('<unprintable>');
+    expect(logSafe({ toString: () => { throw new Error('no'); } }, 64)).toBe('<unprintable>');
+    expect(logSafe(Symbol('a\nb'), 64)).toBe('Symbol(a\\u000ab)');
+    expect(logSafe(5, 64)).toBe('5');
+    expect(logSafe(undefined, 64)).toBe('undefined');
+    expect(logSafe(null, 64)).toBe('null');
   });
 });
 
@@ -143,5 +203,49 @@ describe('formatEvent trimming', () => {
   it('never truncates when the marker would make the output longer', () => {
     const e = formatEvent({ ...FAT_EVENT, description: 'x'.repeat(320) }, { full: false }) as Record<string, unknown>;
     expect(e.description).toBe('x'.repeat(320));
+  });
+});
+
+describe('event time zones', () => {
+  // Google renders dateTime in the calendar's zone (-06:00 here) even though
+  // the event was entered in America/Panama.
+  const ZONED = {
+    id: 'e2',
+    summary: 'Dive',
+    start: { dateTime: '2026-11-18T07:30:00-06:00', timeZone: 'America/Panama' },
+    end: { dateTime: '2026-11-18T11:30:00-06:00', timeZone: 'America/Panama' },
+  };
+
+  it('renders start/end in the event zone and reports it', () => {
+    for (const full of [true, false]) {
+      const e = formatEvent(ZONED, { full }) as Record<string, unknown>;
+      expect(e.start).toBe('2026-11-18T08:30:00-05:00');
+      expect(e.end).toBe('2026-11-18T12:30:00-05:00');
+      expect(e.startTimeZone).toBe('America/Panama');
+      expect(e.endTimeZone).toBe('America/Panama');
+    }
+  });
+
+  it('keeps the same instant', () => {
+    const e = formatEvent(ZONED) as Record<string, string>;
+    expect(Date.parse(e.start)).toBe(Date.parse(ZONED.start.dateTime));
+  });
+
+  it('leaves events without a zone, and all-day events, alone', () => {
+    const plain = formatEvent({ id: 'p', start: { dateTime: '2026-06-11T09:00:00Z' },
+      end: { dateTime: '2026-06-11T09:15:00Z' } }, { full: false }) as Record<string, unknown>;
+    expect(plain.start).toBe('2026-06-11T09:00:00Z');
+    expect(plain).not.toHaveProperty('startTimeZone');
+    const allDay = formatEvent({ id: 'a', start: { date: '2026-11-18', timeZone: 'America/Panama' },
+      end: { date: '2026-11-19' } }, { full: false }) as Record<string, unknown>;
+    expect(allDay.start).toBe('2026-11-18');
+    expect(allDay).not.toHaveProperty('startTimeZone');
+  });
+
+  it('handles DST, half-hour offsets, UTC zones and bad names', () => {
+    expect(inEventZone('2026-03-29T01:30:00Z', 'Europe/London')).toBe('2026-03-29T02:30:00+01:00');
+    expect(inEventZone('2026-03-29T00:30:00Z', 'Europe/London')).toBe('2026-03-29T00:30:00+00:00');
+    expect(inEventZone('2026-06-11T09:00:00Z', 'Asia/Kolkata')).toBe('2026-06-11T14:30:00+05:30');
+    expect(inEventZone('2026-06-11T09:00:00Z', 'Not/AZone')).toBe('2026-06-11T09:00:00Z');
   });
 });

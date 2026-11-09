@@ -2,9 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { timeRangeError } from '../src/tools/calendar.js';
 import { invalidParams } from '../src/tools/_errors.js';
 
-// events.list answers 200 with [] on a backwards window, which reads as
-// "nothing scheduled", while the sibling freebusy.query 400s on the identical
-// input. Deciding locally makes an empty list always mean empty.
+// events.list answers 200 with [] on a backwards window ("nothing scheduled")
+// while freebusy.query 400s on the identical input; deciding locally fixes that.
 describe('timeRangeError', () => {
   it('rejects an inverted window and names both bounds', () => {
     const e = timeRangeError('2026-09-22T00:00:00Z', '2026-09-21T00:00:00Z');

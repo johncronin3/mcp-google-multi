@@ -1,9 +1,5 @@
-// Transport selection + public-base-URL / Origin / host config plumbing (B11).
-// Pure, resolved once at boot; the HTTP host that consumes this lands in B12
-// (cc-transport-hosting) and the AS metadata in B13 (oauth-authorization-server).
-// Owns the canonicalization rule (cc-transport-hosting BR4): a single mismatch
-// between the advertised resource URI and the client's `resource`/`aud` = a
-// perpetual 401 loop (the #1 interop bug), so it is normalized exactly once.
+// Transport + public-base-URL / Origin / host config, pure and resolved once
+// at boot. A mismatch between the advertised URI and the client's `aud` is a perpetual 401 loop.
 
 export type Transport = 'stdio' | 'http' | 'both';
 
@@ -26,7 +22,7 @@ export interface HttpConfig {
   transport: Transport;
   host: string;
   port: number;
-  /** Canonical public base URL (BR4): lowercase scheme+host, no default port,
+  /** Canonical public base URL: lowercase scheme+host, no default port,
    *  no trailing slash, no fragment/query. The issuer and every advertised
    *  endpoint derive from this. */
   publicUrl: string;
@@ -57,9 +53,10 @@ export function resolveTransport(env: NodeJS.ProcessEnv = process.env): Transpor
 }
 
 /**
- * Canonicalize a public base URL per BR4. WHATWG `URL` already lowercases the
- * scheme+host and omits a default port from `.host`; this adds the HTTPS-only
- * scheme check, strips fragment/query/userinfo, and removes a trailing slash.
+ * Canonicalize a public base URL. WHATWG `URL` already lowercases the
+ * scheme+host and omits a default port from `.host`; this restricts the scheme
+ * to http(s), strips fragment/query/userinfo, and removes a trailing slash.
+ * `http:` stays accepted for a loopback single-owner setup (docs/internals.md).
  */
 export function canonicalizePublicUrl(raw: string): string {
   let u: URL;

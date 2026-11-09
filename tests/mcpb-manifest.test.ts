@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf-8'));
 
-describe('MCPB manifest (B18)', () => {
+describe('MCPB manifest', () => {
   it('declares manifest_version 0.3 and the required top-level fields', () => {
     expect(manifest.manifest_version).toBe('0.3');
     for (const key of ['name', 'version', 'description', 'author', 'server']) {
@@ -46,7 +46,7 @@ describe('MCPB manifest (B18)', () => {
   it('contains no plaintext secret-looking values', () => {
     const raw = readFileSync(path.join(root, 'manifest.json'), 'utf-8');
     // base64-32 keys, long hex, or an @-address would signal a leaked secret
-    expect(raw).not.toMatch(/[A-Za-z0-9+/]{43}=/); // base64 32-byte
+    expect(raw).not.toMatch(/[A-Za-z0-9+/]{43}=/);
     expect(raw).not.toMatch(/\b[a-f0-9]{40,}\b/i);
   });
 });

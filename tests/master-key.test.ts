@@ -25,7 +25,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('resolveMasterKey precedence (BR-2)', () => {
+describe('resolveMasterKey precedence', () => {
   it('env wins over keychain and file, trimmed', () => {
     const store = new Map([['MASTER_KEY', 'from-keychain']]);
     writeFileSync(path.join(dir, 'master.key'), 'from-file\n');
@@ -66,7 +66,7 @@ describe('resolveMasterKey precedence (BR-2)', () => {
   });
 });
 
-describe('generate-on-setup (BR-4)', () => {
+describe('generate-on-setup', () => {
   it('generates a 32-byte base64 key, ALWAYS writes the durable file, and copies to the keychain', () => {
     const store = new Map<string, string>();
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
@@ -136,7 +136,7 @@ describe('peekMasterKeyProvenance (diagnostics must be side-effect free)', () =>
   });
 });
 
-describe('BR-5 mirror (the path that once leaked a fixture key into a real keyring)', () => {
+describe('env->keychain mirror (the path that once leaked a fixture key into a real keyring)', () => {
   afterEach(() => {
     clearKeyCacheForTest();
     __setKeychainFactoryForTest(null);
@@ -208,7 +208,7 @@ describe('dispatch path never exits the process', () => {
   });
 });
 
-describe('hard guard token scan is recursive (S1.2 anti-brick)', () => {
+describe('hard guard token scan is recursive (anti-brick)', () => {
   // These cases OMIT deps.hasAnyToken on purpose: they exercise the real
   // scanner against the sandboxed TOKEN_STORE_PATH / XDG_CONFIG_HOME dirs.
   const realScanDeps = () => ({
@@ -253,7 +253,7 @@ describe('hard guard token scan is recursive (S1.2 anti-brick)', () => {
     }
   });
 
-  it('a tenant-namespaced .enc under configDir()/tenants refuses to mint (future S1.6 layout)', async () => {
+  it('a tenant-namespaced .enc under configDir()/tenants refuses to mint (tenant layout)', async () => {
     const { mkdirSync } = await import('node:fs');
     const tenantTokens = path.join(process.env.XDG_CONFIG_HOME!, 'mcp-google-multi', 'tenants', 'tenant-a', 'tokens');
     mkdirSync(tenantTokens, { recursive: true });
@@ -294,7 +294,7 @@ describe('hard guard token scan is recursive (S1.2 anti-brick)', () => {
   });
 });
 
-describe('hard guard (BR-3)', () => {
+describe('hard guard', () => {
   it('never generates while encrypted tokens exist: E_MASTER_KEY_MISSING_TOKENS_EXIST', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => {

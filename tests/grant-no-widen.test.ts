@@ -98,7 +98,7 @@ describe('upstream isolate does not widen fixture grants', () => {
     seen.push(alias);
     throw new Error(`stop-after-gate:${alias}`);
   });
-  let handlers: Record<string, Handler> = {};
+  const handlers: Record<string, Handler> = {};
   let registry: ToolRegistry;
   let listHandler: (() => Promise<{ tools: ListedTool[] }>) | null = null;
 
