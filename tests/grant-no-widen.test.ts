@@ -17,6 +17,7 @@ import { BASE_SCOPES, resolveScopesForAccount } from '../src/auth.js';
 import { buildRegistry } from '../src/compose.js';
 import type { IdentityContext } from '../src/identity.js';
 import { ToolRegistry } from '../src/registry.js';
+import { isAllowed } from '../src/write-control.js';
 import { BUNDLE_CATALOG } from '../src/scope-catalog.js';
 import { GENERATED_GATES } from '../src/services.js';
 import {
@@ -301,6 +302,28 @@ describe('upstream isolate does not widen fixture grants', () => {
       activate(name);
       const listed = await listHandler();
       expect(listed.tools.some((tool) => tool.name === 'gmail_search'), name).toBe(false);
+    }
+  });
+
+  it.skipIf(!hasHide)('calling a hidden service tool by name is not refused under either fixture grant', async () => {
+    const hide = (registry as unknown as { hideServices: (services: Iterable<string>) => void }).hideServices.bind(registry);
+    hide(['gmail']);
+    expect(
+      isAllowed(
+        { name: 'gmail_search', service: 'gmail', cud: 'read' },
+        { profile: 'full-writes', readOnly: false, allow: [], deny: ['tool:gmail_search'] },
+      ),
+    ).toBe(true);
+
+    for (const name of [SB2_NAME, PBG3_NAME]) {
+      const grant = activate(name);
+      const alias = grant.accounts[0];
+      const res = await call('gmail_search', { account: alias, query: 'in:inbox' });
+      const parsed = body(res);
+      expect(parsed.error, name).not.toBe('account_outside_grant');
+      expect(parsed.error, name).not.toBe('grant_required');
+      expect(JSON.stringify(parsed), name).not.toContain('service_hidden');
+      expect(seen, name).toEqual([alias]);
     }
   });
 });
