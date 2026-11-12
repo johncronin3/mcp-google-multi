@@ -11,11 +11,8 @@ import { registerDiagnoseTool } from '../src/doctor.js';
 import { registerAccountWizardTools } from '../src/tools/account-wizard.js';
 import type { Policy } from '../src/write-control.js';
 
-// S1.22: the #1001 failure mode (a tool argument, not the verified session,
-// selects whose identity/credentials to use) closed PERMANENTLY: no
-// registered tool - curated, generated, or meta - may declare an
-// identity-shaped input field. The verified JWT sub is the ONLY identity
-// carrier; `account` selects an alias WITHIN the authenticated context.
+// No tool argument may select whose identity/credentials to use; the verified JWT sub is the ONLY
+// identity carrier; `account` only selects an alias WITHIN that authenticated context.
 
 const FORBIDDEN = new Set([
   'tenantid', 'tenant_id', 'tenant',
@@ -28,9 +25,8 @@ const FORBIDDEN = new Set([
 
 const POLICY: Policy = { profile: 'read-only', readOnly: true, allow: [], deny: [] };
 
-// The surface-honesty pattern: register EVERY service directly, bypassing the
-// scope-bundle gates, so the guard scans the complete 900+ tool surface
-// regardless of what the sandbox env enables.
+// Register every service directly, bypassing scope-bundle gates, so the guard scans the complete
+// 900+ tool surface regardless of what the sandbox env enables.
 function fullRegistry(): ToolRegistry {
   const stub = { registerTool: () => 'ok', sendToolListChanged: vi.fn(), server: { setRequestHandler: () => {}, getClientCapabilities: () => undefined } };
   const registry = new ToolRegistry(stub as never, POLICY, 'eager');
@@ -44,11 +40,8 @@ function fullRegistry(): ToolRegistry {
   return registry;
 }
 
-// Google's OWN API parameters that happen to carry an identity-shaped name.
-// These are Discovery path/query params sent verbatim to the Google endpoint
-// (a resource selector WITHIN the caller's authorized account, gated by the
-// account token's scopes) - not an MCP-level identity override. Each entry is
-// tool.field exact; anything new must be justified here or it fails the guard.
+// Google's OWN params that look identity-shaped (Discovery path/query sent verbatim, gated by the
+// account token's scopes), not an identity override; new entries must be tool.field exact and justified here.
 const GOOGLE_API_PARAM_EXCEPTIONS = new Set([
   'workspaceevents_tasks_cancel.tenant',
   'workspaceevents_tasks_get.tenant',
@@ -59,10 +52,10 @@ const GOOGLE_API_PARAM_EXCEPTIONS = new Set([
   'workspaceevents_tasks_subscribe.tenant',
 ]);
 
-describe('static identity-field guard (S1.22, #1001)', () => {
+describe('static identity-field guard', () => {
   it('no registered tool declares an identity-shaped input field', () => {
     const registry = fullRegistry();
-    expect(registry.tools.length).toBeGreaterThan(900); // the FULL surface, nothing gated off
+    expect(registry.tools.length).toBeGreaterThan(900);
     const offenders: string[] = [];
     for (const tool of registry.tools) {
       for (const key of Object.keys(tool.inputShape)) {

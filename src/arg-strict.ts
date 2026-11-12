@@ -1,14 +1,5 @@
-// Unknown-argument screening (backlog item 14). zod strips undeclared keys
-// before a handler runs, so a misremembered argument name used to produce a
-// SUCCESS response with wrong behavior: `parentId` on drive_create_folder was
-// dropped and the folder landed in My Drive root. Field-reported, then
-// reproduced: the typo, the correct name and a wholly invented key all
-// returned byte-identical responses.
-//
-// This module is pure and holds no registry reference. It never rewrites a key
-// and never touches a VALUE: it only decides that a key is undeclared, and
-// suggests what the caller probably meant. Rewriting would risk sending a real
-// value to Google on a guess, which is strictly worse than refusing.
+// Unknown-argument screening: zod strips undeclared keys before a handler
+// runs, so a misremembered name used to produce a SUCCESS with wrong behavior. See docs/internals.md.
 
 import { editDistance, SUGGEST_MAX_INPUT } from './scope-catalog.js';
 import { sliceClean } from './trim.js';
@@ -29,13 +20,8 @@ export function unknownArgMode(env: NodeJS.ProcessEnv = process.env): UnknownArg
   return 'warn';
 }
 
-// The staged rollout is over: `warn` shipped first as pure observability, and
-// this is the flip it was staging for. An undeclared argument is dropped by
-// zod before the handler runs, so `warn` means the CLIENT sees a confident
-// success for a call the server did not perform: drive_list with a misspelled
-// folder key returned the My Drive root, byte-identical to no argument at all.
-// A wrong answer that reads as right is the failure mode agents recover from
-// worst, so the default refuses the call and says what it probably meant.
+// `warn` means the client sees a confident success for a call the server
+// didn't perform; a wrong answer that reads as right is the worst failure mode to recover from.
 const DEFAULT_MODE: UnknownArgMode = 'reject';
 
 /** Tools that legitimately accept open-ended top-level keys. Empty at 6.0.0:
@@ -43,12 +29,8 @@ const DEFAULT_MODE: UnknownArgMode = 'reject';
  * of queryParams/body, never in its six fixed top-level keys. */
 export const STRICT_EXEMPT_TOOLS: ReadonlySet<string> = new Set<string>();
 
-/** Keys a CLIENT adds on its own, not keys the model chose. `random_string`
- * is the long-standing probe some clients send to a tool they read as taking
- * no arguments; the others are call-plumbing that bridges and proxies have
- * been observed to fold into `arguments` instead of `params._meta`, where the
- * spec puts them. Rejecting these would fail a call the model got right.
- * Measured against the full 978-tool surface: none is a declared key. */
+// Keys a CLIENT adds on its own, not keys the model chose (a probe some
+// clients send to argument-less tools, plus call-plumbing bridges fold into `arguments`).
 const CLIENT_ARTIFACT_KEYS: ReadonlySet<string> = new Set([
   'random_string',
   'toolCallId',
@@ -141,6 +123,61 @@ export function suggestKeys(unknown: string, declared: readonly string[], limit 
     .map((e) => e.key);
 }
 
+/**
+ * First-guess names that models reach for and that ranking cannot connect to
+ * the declared key (no shared tokens, too far apart by edit distance). These
+ * only ever feed the "Did you mean" line: a call that uses one is still
+ * rejected, never rewritten, because a wrong guess would act on the wrong
+ * field. Keys are compared flattened (case and separators ignored) and an
+ * entry is offered only when the tool really declares the target.
+ */
+const COMMON_ALIASES: Record<string, string[]> = {
+  limit: ['maxResults'],
+  max: ['maxResults'],
+  count: ['maxResults'],
+  pagesize: ['maxResults'],
+  q: ['query'],
+  search: ['query', 'findText', 'find'],
+  find: ['findText'],
+  replace: ['replaceText', 'replacement'],
+  replacement: ['replaceText'],
+  oldtext: ['findText', 'find'],
+  newtext: ['replaceText', 'replacement'],
+};
+
+const TOOL_ALIASES: Record<string, Record<string, string[]>> = {
+  drive_list: { parent: ['folderId'], parentid: ['folderId'], folder: ['folderId'] },
+  drive_move: { parent: ['newParentFolderId'], parentid: ['newParentFolderId'], newparentid: ['newParentFolderId'], destination: ['newParentFolderId'], folderid: ['newParentFolderId'] },
+  drive_upload: { name: ['filename'], title: ['filename'], format: ['convertTo'], parent: ['parentFolderId'] },
+  drive_create_folder: { title: ['name'], parent: ['parentFolderId'] },
+  drive_export: { format: ['mimeType'] },
+  gmail_read_batch: { messageids: ['ids'], messages: ['ids'], id: ['ids'] },
+  gmail_read: { id: ['messageId'] },
+  gmail_search: { after: ['since'], before: ['until'], startdate: ['since'], enddate: ['until'], from: ['query'], subject: ['query'], label: ['query'] },
+  google_api_call: {
+    params: ['queryParams'],
+    parameters: ['queryParams'],
+    query: ['queryParams'],
+    requestbody: ['body'],
+    data: ['body'],
+    json: ['body'],
+    payload: ['body'],
+    method: ['methodId'],
+    methodname: ['methodId'],
+    path: ['pathParams'],
+    service: ['api'],
+    apiname: ['api'],
+  },
+  sheets_find_replace: { findtext: ['find'], replacetext: ['replacement'], replace: ['replacement'] },
+};
+
+function aliasSuggestions(tool: string, key: string, declaredSet: ReadonlySet<string>): string[] {
+  if (key.length > SUGGEST_MAX_INPUT) return [];
+  const f = flatten(key);
+  const wanted = [...(TOOL_ALIASES[tool]?.[f] ?? []), ...(COMMON_ALIASES[f] ?? [])];
+  return [...new Set(wanted)].filter((k) => declaredSet.has(k)).slice(0, 2);
+}
+
 export interface ScreenedKey {
   /** the key the caller sent; for stderr and the agent-facing hint only */
   sent: string;
@@ -162,17 +199,16 @@ export function screenArguments(tool: string, args: Record<string, unknown>, dec
   const out: ScreenResult = { unknown: [], redundant: [] };
   if (STRICT_EXEMPT_TOOLS.has(tool) || declared.length === 0) return out;
   const declaredSet = new Set(declared);
-  // Tier 0 (same key modulo case and separators) is a map lookup, so every key
-  // gets it and a redundant twin is recognised past the ranking budget too.
-  // A near-miss duplicate (a typo sent next to its declared key) is recognised
-  // only within the budget: a call needs 9 of them before one is refused.
+  // Tier 0 is a map lookup, so a redundant twin is recognised past the
+  // ranking budget too; a near-miss duplicate still needs that budget.
   const byFlat = new Map<string, string[]>();
   for (const k of declared) byFlat.set(flatten(k), [...(byFlat.get(flatten(k)) ?? []), k]);
   let ranked = 0;
   for (const key of Object.keys(args)) {
     if (declaredSet.has(key) || isExemptKey(key)) continue;
     const twins = key.length <= SUGGEST_MAX_INPUT ? byFlat.get(flatten(key)) : undefined;
-    const suggestions = twins ? twins.slice(0, 2) : ranked++ < MAX_SUGGESTED_KEYS ? suggestKeys(key, declared) : [];
+    let suggestions = twins ? twins.slice(0, 2) : ranked++ < MAX_SUGGESTED_KEYS ? suggestKeys(key, declared) : [];
+    if (suggestions.length === 0) suggestions = aliasSuggestions(tool, key, declaredSet);
     // The caller sent both spellings, so the declared one already won and the
     // outcome is what it has always been. Never fail a call that works today.
     if (suggestions.some((s) => s in args)) {

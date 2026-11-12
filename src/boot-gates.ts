@@ -1,7 +1,5 @@
-// S1.16: multi-tenant boot gates. The free core never sets these — every
-// helper reduces to today's single-owner behavior when no gates are
-// installed. Deliberately a side-effect-free module (accounts.ts/auth.ts
-// resolve env at import time) so the tenancy module can import it cheaply.
+// Multi-tenant boot gates: every helper reduces to single-owner behavior when
+// no gates are installed. Deliberately side-effect-free, unlike accounts.ts/auth.ts.
 
 import { failStartup } from './config-file.js';
 
@@ -30,7 +28,7 @@ export function isMultiTenantBoot(): boolean {
   return gates?.multiTenant === true;
 }
 
-/** BR-4 applies to stdio always, and to HTTP only when single-owner: a
+/** The empty-registry guard applies to stdio always, and to HTTP only when single-owner: a
  * multi-tenant HTTP deploy starts empty by design. */
 export function accountsAssertRequired(wantStdio: boolean, multiTenant: boolean): boolean {
   return wantStdio || !multiTenant;

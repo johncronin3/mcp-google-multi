@@ -3,12 +3,8 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import type { AddressInfo } from 'node:net';
 
-// Shared loopback OAuth consent (leg C of cc-auth), used by the account wizard
-// (B7) and the `auth --account` CLI. Live-server-safe: typed errors instead of
-// process.exit, and a timeout so a never-completed consent can't wedge a tool
-// call forever. The listener binds an EPHEMERAL loopback port (RFC 8252 §7.3;
-// Google Desktop clients accept any http://localhost:<port> redirect), so a
-// second local process on a fixed port can never break auth.
+// Shared loopback OAuth consent, used by the account wizard and `auth
+// --account`; a timeout keeps a never-completed consent from wedging a tool call forever.
 
 /** Google authorize-URL options for the owner's HTTP authorization server.
  * alias_reauth asks for the alias's scopes plus openid/email, which /callback
@@ -52,10 +48,8 @@ export class ConsentDeniedError extends Error {
   }
 }
 
-// Surfaced after every successful consent: the expiry is invisible until the
-// token dies a week later as reauth_required, so the moment of success is the
-// one place the warning is guaranteed to be seen. Full walkthrough in
-// docs/google-cloud-setup.md.
+// Surfaced after every successful consent: the moment of success is the one
+// place this warning is guaranteed to be seen, before the token dies a week later as reauth_required.
 export const TESTING_MODE_WARNING =
   'Heads-up: while your OAuth client\'s Publishing status is "Testing", Google expires refresh tokens after 7 days (weekly re-auth for every account). ' +
   'When your setup works, set it to "In production" at https://console.cloud.google.com/auth/audience. ' +

@@ -22,14 +22,14 @@ providers:
         args: ['dist/index.js']
         name: gmulti-contract
         env:
-          GOOGLE_ACCOUNTS: 'example:user@example.com'
           GOOGLE_CLIENT_ID: 'contract'
           GOOGLE_CLIENT_SECRET: 'contract'
           MASTER_KEY: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
           TOKEN_STORE_PATH: '/tmp/gmulti-contract-tokens'
-          # Legacy env is the one-line all-bundles grant for a throwaway
-          # fixture process; the E_LEGACY stderr warning is expected and inert.
-          GOOGLE_OPTIONAL_SCOPES: 'slides,forms,chat,gmail_settings,gmail_settings_sharing,classroom,cloudidentity,cloudsearch,vault,keep,driveactivity,drivelabels,script,postmaster,analytics,analytics_write,groupssettings,groupsmigration,licensing,reseller,appsmarket'
+          # Points config.json resolution at a fixture: a per-account scope
+          # profile granting every bundle, so the contract suite exercises the
+          # full tool surface (fixtures/xdg/mcp-google-multi/config.json).
+          XDG_CONFIG_HOME: 'eval/contract/fixtures/xdg'
           GOOGLE_TOOLSETS: 'all'
           GOOGLE_DISCOVERY: 'curated'
           GOOGLE_PROFILE: 'read-only'
@@ -52,7 +52,7 @@ tests:
     assert:
       - { type: javascript, value: 'file://asserts.mjs:gmailDiscoverFilter' }
 
-  - description: gmail_discover no-match query hints at retrying without it
+  - description: gmail_discover no-match query falls back to the full listing
     vars: { prompt: '{"tool": "gmail_discover", "args": {"query": "zzzznothing"}}' }
     assert:
       - { type: javascript, value: 'file://asserts.mjs:gmailDiscoverNoMatch' }
@@ -140,10 +140,10 @@ tests:
       - { type: javascript, value: 'file://asserts.mjs:writeDisabled' }
 
   # ── account wizard contract ──────────────────────────────────────────────
-  - description: account_add refuses in env-registry mode and names the migration path
+  - description: account_add with no arguments and no elicitation support names the explicit-args form
     vars: { prompt: '{"tool": "account_add", "args": {}}' }
     assert:
-      - { type: javascript, value: 'file://asserts.mjs:accountAddEnvMode' }
+      - { type: javascript, value: 'file://asserts.mjs:accountAddNoArgs' }
 
   - description: account_reauth with an unknown alias lists the known ones
     vars: { prompt: '{"tool": "account_reauth", "args": {"alias": "nope"}}' }

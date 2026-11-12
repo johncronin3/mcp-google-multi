@@ -1,7 +1,11 @@
 import { z } from 'zod';
+import type { ServerContext } from '@modelcontextprotocol/server';
 import { accountAliasSchema, accountAliasSchemaFor, accountArgLive } from '../../accounts.js';
 import { executeApiMethod, type ApiMethodRef, type ExecuteDeps, type QueryParams } from '../../executor.js';
 import type { Cud, ToolRegistry } from '../../registry.js';
+import { serviceOf } from '../../registry.js';
+import { escapeHatchNames } from '../google-api.js';
+import { escapeHatchGate } from '../_escape-hatch.js';
 
 export interface GeneratedParam {
   field: string;
@@ -46,7 +50,12 @@ interface GeneratedToolConfig {
 export function registerGeneratedTool(registry: ToolRegistry, def: GeneratedToolDef, deps: ExecuteDeps = {}): void {
   // Widened locally: `cud` is a registry extension the SDK config type doesn't
   // carry; the registry reads it before handing the config to the SDK.
-  const register = registry.registerTool as (name: string, config: GeneratedToolConfig, handler: (args: Record<string, unknown>) => unknown) => void;
+  const register = registry.registerTool as (
+    name: string,
+    config: GeneratedToolConfig & { escapeHatch?: boolean },
+    handler: (args: Record<string, unknown>, ctx?: ServerContext) => unknown,
+  ) => void;
+  const service = serviceOf(def.name);
   register(
     def.name,
     {
@@ -55,8 +64,12 @@ export function registerGeneratedTool(registry: ToolRegistry, def: GeneratedTool
       cud: def.cud,
       annotations: { openWorldHint: true },
       requiredScopes: def.method.scopes,
+      // Every generated per-method tool IS the escape hatch (same as
+      // google_api_call): write-control for a write runs inside the
+      // handler below, not the registry's own name-based gate.
+      escapeHatch: true,
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ServerContext) => {
       const pathParams: Record<string, string | number> = {};
       const queryParams: QueryParams = {};
       for (const p of def.params) {
@@ -73,6 +86,19 @@ export function registerGeneratedTool(registry: ToolRegistry, def: GeneratedTool
           if (value !== undefined) assembled[bp.api] = value;
         }
         body = assembled;
+      }
+      if (def.cud !== 'read') {
+        const names = escapeHatchNames(service, def.method.id);
+        const gate = await escapeHatchGate(registry, names.deny, names.primary, { service, cud: def.cud, scopes: def.method.scopes }, registry.policy, {
+          account: args.account as string,
+          accountEmail: registry.accountSet().configs[args.account as string]?.email,
+          methodId: def.method.id,
+          httpMethod: def.method.httpMethod,
+          pathParams,
+          queryParams,
+          body,
+        }, ctx);
+        if (gate) return gate;
       }
       return executeApiMethod(
         def.method,

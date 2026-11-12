@@ -57,7 +57,7 @@
     "google_profile": {
       "type": "string",
       "title": "Write profile",
-      "description": "Which mutations the server may perform: read-only (default, no writes), safe-writes (create/update, no permanent deletes or sends), or full-writes.",
+      "description": "Which mutations the server may perform: read-only (default, no writes), safe-writes (create and update, including sending mail; no deletes, no admin-level or push-registration writes), or full-writes.",
       "default": "read-only",
       "required": false
     }

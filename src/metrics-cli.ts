@@ -2,12 +2,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describeMetricsDir, mergeDay, type DayAgg } from './usage-metrics.js';
 
-// `metrics` CLI (spec section 5): reads LOCAL files only, works whether the
-// server runs or not, and data moves only when the operator moves it. Same
-// no-egress discipline as usage-metrics.ts: the import set is fs/path plus the
-// metrics module, enforced by the same allowlist test. The promotion join data
-// (generated method map + curated snapshot) is passed IN by the dispatcher so
-// this module never reaches into generated code or build scripts.
+// `metrics` CLI: reads LOCAL files only, same no-egress import allowlist as
+// usage-metrics.ts. Promotion join data is passed IN so this module never reaches into generated code.
 
 export interface PromotionData {
   methodMap: Record<string, string>;
@@ -107,7 +103,7 @@ const tail = (id: string) => id.split('.').slice(1).join('.');
 
 interface PromotionRow { methodId: string; tool?: string; calls: number; kind: 'curation-candidate' | 'visibility-failure' | 'generation-gap' }
 
-/** The promotion-queue view: ranked evidence, a human decides (spec section 5). */
+/** The promotion-queue view: ranked evidence, a human decides. */
 export function classifyPromotion(merged: DayAgg, data: PromotionData): PromotionRow[] {
   const curated = new Set<string>();
   for (const id of data.curatedIds) {

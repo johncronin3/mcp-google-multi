@@ -27,7 +27,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('openUrl (T7)', () => {
+describe('openUrl', () => {
   it('darwin uses open', async () => {
     setPlatform('darwin');
     const { openUrl } = await import('../src/open-url.js');

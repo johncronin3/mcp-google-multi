@@ -1,6 +1,6 @@
 import { CONFIG_VERSION, configFilePath, loadConfigFile, mutateConfigFile } from './config-file.js';
 import type { ConfigFile } from './config-file.js';
-import { closestBundle, isKnownBundle, resolveBundleAliases } from './scope-catalog.js';
+import { adminBundleGrantHint, closestBundle, isAdminBundle, isKnownBundle, resolveBundleAliases } from './scope-catalog.js';
 
 function parseCsv(value: string | undefined): string[] {
   return (value ?? '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -9,8 +9,7 @@ function parseCsv(value: string | undefined): string[] {
 /**
  * Synthesize config.json accounts{} from the v5 env (GOOGLE_ACCOUNTS +
  * GOOGLE_ADMIN_ACCOUNTS). Never deletes or edits env; idempotent (a re-run
- * that changes nothing says so). Scope-profile and preference fields are
- * migrated by their own slices' commands.
+ * that changes nothing says so).
  */
 export function runMigrateConfig(env: NodeJS.ProcessEnv = process.env): void {
   const raw = env.GOOGLE_ACCOUNTS;
@@ -38,16 +37,16 @@ export function runMigrateConfig(env: NodeJS.ProcessEnv = process.env): void {
     desired[alias] = { email };
   }
 
-  // Legacy global scopes (BC7) become an explicit named profile every account
+  // Legacy global scopes become an explicit named profile every account
   // points at, so removing the env var later changes nothing.
   const legacyNames = parseCsv(env.GOOGLE_OPTIONAL_SCOPES);
   let legacyProfile: { bundles: string[] } | undefined;
   if (legacyNames.length > 0) {
     const bundles = resolveBundleAliases(legacyNames);
     for (const bundle of bundles) {
-      if (bundle === 'admin') {
+      if (isAdminBundle(bundle)) {
         console.error(
-          'E_UNKNOWN_BUNDLE: "admin" is not a global bundle: use GOOGLE_ADMIN_ACCOUNTS or an "admin: true" scope profile. Nothing written.',
+          `E_UNKNOWN_BUNDLE: "${bundle}" is not a global bundle: ${adminBundleGrantHint(bundle)}. Nothing written.`,
         );
         process.exitCode = 1;
         return;
@@ -67,8 +66,7 @@ export function runMigrateConfig(env: NodeJS.ProcessEnv = process.env): void {
   const filePath = configFilePath(env);
   const before = loadConfigFile(filePath);
   // Merge per-alias: env owns the alias set and emails, but file-only fields
-  // (scopeProfile, admin) survive for retained aliases — mirroring runtime
-  // precedence, where unset GOOGLE_ADMIN_ACCOUNTS preserves file admin flags.
+  // (scopeProfile, admin) survive for retained aliases.
   const existing = before?.accounts ?? {};
   const dropped = Object.keys(existing).filter((a) => !(a in desired));
   for (const [alias, entry] of Object.entries(desired)) {

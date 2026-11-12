@@ -5,8 +5,11 @@ import {
   scopeHint,
   scopeHintForMethod,
   buildScopesReport,
+  summarizeToolScopes,
+  formatToolScopeLine,
 } from '../src/scope-observability.js';
 import { setHttpReauthLink } from '../src/reauth-hint.js';
+import { setHintProvider, type HintCase } from '../src/hint-provider.js';
 import { ADMIN_SCOPES, BUNDLE_CATALOG } from '../src/scope-catalog.js';
 import { deriveAccountHealth } from '../src/tools/accounts-tool.js';
 
@@ -72,7 +75,7 @@ describe('remediation hints (gh-CLI style, honest retriable)', () => {
     expect(h.retriable).toBe(true);
   });
 
-  it('requestable over HTTP: the hint becomes a clickable AS re-auth link (S1.18)', () => {
+  it('requestable over HTTP: the hint becomes a clickable AS re-auth link', () => {
     setHttpReauthLink((a) => `https://mcp.example.com/authorize?flow=alias_reauth&alias=${encodeURIComponent(a)}&exp=1&sig=s`);
     const h = scopeHint(FORMS_BODY, { state: 'requestable_not_granted' }, 'work');
     expect(h.hint).toContain('https://mcp.example.com/authorize?flow=alias_reauth&alias=work');
@@ -91,6 +94,76 @@ describe('remediation hints (gh-CLI style, honest retriable)', () => {
     const h = scopeHint('https://x/y', { state: 'not_requestable', reason: 'unknown_scope' }, 'work');
     expect(h.hint).toContain('Do not retry');
     expect(h.retriable).toBe(false);
+  });
+});
+
+describe('scopeHint provider routing', () => {
+  afterEach(() => setHintProvider(null));
+
+  function echo() {
+    const seen: HintCase[] = [];
+    setHintProvider({
+      render: (c) => {
+        seen.push(c);
+        return { hint: `kind:${c.kind}`, retriable: true };
+      },
+    });
+    return seen;
+  }
+
+  it('requestable_not_granted renders scope_not_granted with the scope and account', () => {
+    const seen = echo();
+    const h = scopeHint(FORMS_BODY, { state: 'requestable_not_granted' }, 'work');
+    expect(h.hint).toBe('kind:scope_not_granted');
+    expect(seen).toEqual([{ kind: 'scope_not_granted', account: 'work', scope: FORMS_BODY }]);
+  });
+
+  it('add_bundle renders scope_needs_bundle with scope and bundle', () => {
+    const seen = echo();
+    scopeHint(FORMS_BODY, { state: 'not_requestable', reason: 'add_bundle', bundle: 'forms' }, 'work');
+    expect(seen).toEqual([{ kind: 'scope_needs_bundle', account: 'work', scope: FORMS_BODY, bundle: 'forms' }]);
+  });
+
+  it('add_bundle "base" renders scope_base_excluded, never scope_needs_bundle', () => {
+    const seen = echo();
+    scopeHint(GMAIL_MODIFY, { state: 'not_requestable', reason: 'add_bundle', bundle: 'base' }, 'minimal');
+    expect(seen).toEqual([{ kind: 'scope_base_excluded', account: 'minimal', scope: GMAIL_MODIFY }]);
+  });
+
+  it('account_type renders scope_account_type', () => {
+    const seen = echo();
+    scopeHint(ADMIN_SCOPES[0], { state: 'not_requestable', reason: 'account_type' }, 'personal');
+    expect(seen).toEqual([{ kind: 'scope_account_type', account: 'personal', scope: ADMIN_SCOPES[0] }]);
+  });
+
+  it('unknown_scope renders scope_unknown_scope with no account fact', () => {
+    const seen = echo();
+    scopeHint('https://x/y', { state: 'not_requestable', reason: 'unknown_scope' }, 'work');
+    expect(seen).toEqual([{ kind: 'scope_unknown_scope', scope: 'https://x/y' }]);
+  });
+
+  it('the default unknown_scope hint opens with the instruction to stop', () => {
+    setHintProvider(null);
+    const h = scopeHint('https://x/y', { state: 'not_requestable', reason: 'unknown_scope' }, 'work');
+    expect(h.hint.startsWith('Do not retry')).toBe(true);
+    expect(h.retriable).toBe(false);
+  });
+
+  it('a provider may flip retriable on scope_not_granted (Decision 3)', () => {
+    setHintProvider({ render: () => ({ hint: 'go to the browser', retriable: false }) });
+    const h = scopeHint(FORMS_BODY, { state: 'requestable_not_granted' }, 'work');
+    expect(h.retriable).toBe(false);
+  });
+
+  it('the admin note still appends to the provider\'s scope_not_granted text', () => {
+    setHintProvider({ render: () => ({ hint: 'provider text', retriable: true }) });
+    const deps = {
+      readTokenFn: () => ({ scope: '', refresh_token: 'r' }),
+      profileFn: () => [ADMIN_SCOPES[0]],
+    };
+    const h = scopeHintForMethod([ADMIN_SCOPES[0]], 'maybe-workspace', deps);
+    expect(h?.hint).toContain('provider text');
+    expect(h?.hint).toContain('Workspace alias');
   });
 });
 
@@ -158,5 +231,60 @@ describe('buildScopesReport / account_list block', () => {
     expect(health.scopes.callable).toContain(GMAIL_MODIFY);
     expect(Array.isArray(health.scopes.requestable)).toBe(true);
     expect(health.scopes.notRequestable).toBeDefined();
+  });
+});
+
+describe('summarizeToolScopes (registered tools vs what the account can call)', () => {
+  const SLIDES = 'https://www.googleapis.com/auth/presentations';
+  const CHAT_BOT = 'https://www.googleapis.com/auth/chat.bot';
+  const tools = [
+    { requiredScopes: [GMAIL_MODIFY] },
+    { requiredScopes: [FORMS_BODY] },
+    { requiredScopes: [SLIDES] },
+    { requiredScopes: [SLIDES] },
+    { requiredScopes: [CHAT_BOT] },
+    {},
+    { requiredScopes: [] },
+  ];
+
+  it('splits tools into callable, re-auth, add-a-bundle and never-grantable', () => {
+    const sum = summarizeToolScopes(tools, new Set([GMAIL_MODIFY]), new Set([GMAIL_MODIFY, FORMS_BODY]));
+    expect(sum).toEqual({
+      total: 5,
+      callable: 1,
+      requestableNotGranted: 1,
+      byBundle: [{ bundle: 'slides', tools: 2 }],
+      neverRequestable: 1,
+    });
+  });
+
+  it('skips tools with no baked scopes instead of counting them as callable', () => {
+    const sum = summarizeToolScopes([{}, { requiredScopes: [] }], new Set(), new Set());
+    expect(sum.total).toBe(0);
+    expect(formatToolScopeLine('work', sum)).toBeNull();
+  });
+
+  it('formats one readable line, omitting parts that are zero', () => {
+    const all = summarizeToolScopes(tools, new Set([GMAIL_MODIFY]), new Set([GMAIL_MODIFY, FORMS_BODY]));
+    expect(formatToolScopeLine('work', all)).toBe(
+      'work: 1 of 5 tools callable; 1 need re-auth to grant a scope already in the profile; ' +
+        '2 need a bundle not in the profile (slides 2); 1 cannot be granted by any bundle',
+    );
+    const clean = summarizeToolScopes([{ requiredScopes: [GMAIL_MODIFY] }], new Set([GMAIL_MODIFY]), new Set([GMAIL_MODIFY]));
+    expect(formatToolScopeLine('work', clean)).toBe('work: 1 of 1 tools callable');
+  });
+
+  it('caps the bundle list and says how many more there are', () => {
+    // The narrowest bundle for a scope is catalog-derived, so take scopes only
+    // one bundle offers: six distinct bundles, whatever the catalog grows into.
+    const scopes = Object.values(BUNDLE_CATALOG)
+      .map((b) => b.scopes.find((sc) => Object.values(BUNDLE_CATALOG).filter((o) => o.scopes.includes(sc)).length === 1))
+      .filter((sc): sc is string => !!sc)
+      .slice(0, 6);
+    expect(scopes.length).toBe(6);
+    const sum = summarizeToolScopes(scopes.map((x) => ({ requiredScopes: [x] })), new Set(), new Set());
+    const line = formatToolScopeLine('work', sum)!;
+    expect(sum.byBundle.length).toBeGreaterThan(4);
+    expect(line).toMatch(/more bundles\)/);
   });
 });

@@ -48,9 +48,9 @@ describe('wizard failures are envelopes, not prose', () => {
   });
 
   it('carries the alias so a fan-out merge can attribute the failure', () => {
-    const r = validateAddForm({ alias: 'ic', email: 'a@b.com' }, ['ic']);
+    const r = validateAddForm({ alias: 'work', email: 'a@b.com' }, ['work']);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.alias).toBe('ic');
+    if (!r.ok) expect(r.alias).toBe('work');
   });
 });
 

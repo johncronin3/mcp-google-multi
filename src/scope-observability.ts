@@ -1,9 +1,10 @@
-import { ADMIN_SCOPES, BUNDLE_CATALOG } from './scope-catalog.js';
+import { ADMIN_READONLY_SCOPES, ADMIN_SCOPES, BUNDLE_CATALOG } from './scope-catalog.js';
 import { BASE_SCOPES, resolveScopesForAccount } from './auth.js';
 import { readToken } from './token-store.js';
 import { reauthHint } from './reauth-hint.js';
+import { hints } from './hint-provider.js';
 
-// The #114 three-state model: what action, if any, reaches a granted state.
+// Three-state model: what action, if any, reaches a granted state.
 export type ScopeState = 'callable' | 'requestable_not_granted' | 'not_requestable';
 export type NotRequestableReason = 'add_bundle' | 'account_type' | 'unknown_scope';
 
@@ -14,9 +15,8 @@ export interface ScopeClassification {
   alsoIn?: string[];
 }
 
-// Reverse index scope -> bundles offering it, narrowest bundle first (fewest
-// scopes) so the remediation names the smallest grant. BASE_SCOPES map to the
-// pseudo-bundle "base" (outside a profile only via includesBase:false).
+// Reverse index scope -> bundles offering it, narrowest first, so the
+// remediation names the smallest grant.
 let reverseIndex: Map<string, string[]> | null = null;
 
 function scopeIndex(): Map<string, string[]> {
@@ -94,43 +94,54 @@ export function classifyMethodScopes(
  */
 export function scopeHint(scope: string, c: ScopeClassification, alias: string): { hint: string; retriable: boolean } {
   switch (c.state) {
-    case 'requestable_not_granted':
+    case 'requestable_not_granted': {
+      const rendered = hints()?.render({ kind: 'scope_not_granted', account: alias, scope });
       return {
         hint:
-          `Scope ${scope} is in ${alias}'s profile but not granted (you unchecked it at consent). ` +
-          reauthHint(alias),
-        retriable: true,
+          rendered?.hint ??
+          (`Scope ${scope} is in ${alias}'s profile but not granted (you unchecked it at consent). ` +
+            reauthHint(alias)),
+        // The ONE kind whose retriable the host may flip, since the fix needs the user in a browser.
+        retriable: rendered?.retriable ?? true,
       };
+    }
     case 'not_requestable':
       if (c.reason === 'add_bundle') {
-        // "base" is a pseudo-bundle (BASE_SCOPES excluded by includesBase:
-        // false), NOT a catalog key — telling users to add it to bundles[]
-        // would fail boot with E_UNKNOWN_BUNDLE.
+        // "base" is a pseudo-bundle, not a catalog key: telling users to add
+        // it to bundles[] would fail boot with E_UNKNOWN_BUNDLE.
         if (c.bundle === 'base') {
+          const rendered = hints()?.render({ kind: 'scope_base_excluded', account: alias, scope });
           return {
             hint:
-              `Scope ${scope} is a base scope excluded by "includesBase": false in ${alias}'s profile. ` +
-              `Set includesBase back to true (or remove it) in config.json, then npx mcp-google-multi auth --account ${alias}`,
+              rendered?.hint ??
+              (`Scope ${scope} is a base scope excluded by "includesBase": false in ${alias}'s profile. ` +
+                `Set includesBase back to true (or remove it) in config.json, then npx mcp-google-multi auth --account ${alias}`),
             retriable: false,
           };
         }
+        const rendered = hints()?.render({ kind: 'scope_needs_bundle', account: alias, scope, bundle: c.bundle! });
         return {
           hint:
-            `Scope ${scope} needs the "${c.bundle}" bundle, which is not in ${alias}'s profile. ` +
-            `Add it: set ${alias}'s profile bundles to include "${c.bundle}" in config.json, then npx mcp-google-multi auth --account ${alias}`,
+            rendered?.hint ??
+            (`Scope ${scope} needs the "${c.bundle}" bundle, which is not in ${alias}'s profile. ` +
+              `Add it: set ${alias}'s profile bundles to include "${c.bundle}" in config.json, then npx mcp-google-multi auth --account ${alias}`),
           retriable: false,
         };
       }
       if (c.reason === 'account_type') {
+        const rendered = hints()?.render({ kind: 'scope_account_type', account: alias, scope });
         return {
-          hint: `Scope ${scope} requires a Google Workspace account; ${alias} is a personal account and will 403. Use a Workspace alias. Do not retry.`,
+          hint: rendered?.hint ?? `Scope ${scope} requires a Google Workspace account; ${alias} is a personal account and will 403. Use a Workspace alias. Do not retry.`,
           retriable: false,
         };
       }
-      return {
-        hint: `Scope ${scope} is not offered by this server (no bundle grants it). Not requestable. Do not retry.`,
-        retriable: false,
-      };
+      {
+        const rendered = hints()?.render({ kind: 'scope_unknown_scope', scope });
+        return {
+          hint: rendered?.hint ?? `Do not retry: scope ${scope} is not offered by this server (no bundle grants it), so no account can be granted it.`,
+          retriable: false,
+        };
+      }
     default:
       return { hint: '', retriable: true };
   }
@@ -178,10 +189,9 @@ export function scopeHintForMethod(
   const best = classifyMethodScopes(required, sets.granted, sets.profile);
   if (!best || best.state === 'callable') return null; // 403 despite grants: not a scope-classification problem
   const base = scopeHint(best.scope, best.classification, alias);
-  // Hedged, never fabricated: an in-profile admin scope that 403s is EITHER a
-  // Workspace account needing re-auth OR a personal account that can never be
-  // granted admin — the inputs cannot distinguish, so say both.
-  if (best.state === 'requestable_not_granted' && ADMIN_SCOPES.includes(best.scope)) {
+  // Hedged, never fabricated: the inputs can't distinguish a Workspace account
+  // needing re-auth from a personal account that can never grant admin, so say both.
+  if (best.state === 'requestable_not_granted' && (ADMIN_SCOPES.includes(best.scope) || ADMIN_READONLY_SCOPES.includes(best.scope))) {
     return {
       hint:
         `${base.hint} Note: personal (non-Workspace) accounts can never grant admin scopes — if ${alias} is a personal Gmail account, use a Workspace alias instead.`,
@@ -199,7 +209,7 @@ export interface ScopesReport {
   notRequestable: {
     addBundle: { scope: string; bundle: string }[];
     /** Runtime-signal bucket: static classification cannot prove account
-     * type; doctor (B9) fills it from observed persistent admin 403s. */
+     * type; doctor fills it from observed persistent admin 403s. */
     accountType: string[];
     unknown: string[];
   };
@@ -208,8 +218,7 @@ export interface ScopesReport {
 
 /**
  * The account_list / doctor block. Universe = profile ∪ granted ∪ the scopes
- * required by REGISTERED tools ("registered but not requestable" is the
- * original #114 ask).
+ * required by REGISTERED tools ("registered but not requestable" included).
  */
 export function buildScopesReport(
   granted: ReadonlySet<string>,
@@ -245,6 +254,65 @@ export function buildScopesReport(
     notRequestable: { addBundle, accountType, unknown },
     missing: [...requestable, ...addBundle.map((e) => e.scope), ...accountType, ...unknown],
   };
+}
+
+export interface ToolScopeSummary {
+  /** Tools whose scope requirements are known (curated tools without baked scopes are skipped). */
+  total: number;
+  /** Tools the account can call right now. */
+  callable: number;
+  /** In the account's profile but not granted: a re-auth fixes them. */
+  requestableNotGranted: number;
+  /** Not in the profile; each entry names the bundle that would grant them. */
+  byBundle: { bundle: string; tools: number }[];
+  /** No bundle grants them (account-type or unknown scopes): no config change helps. */
+  neverRequestable: number;
+}
+
+/**
+ * How many registered tools one account can actually call. Tools stay
+ * registered when their scope is missing (so the real scope error is reachable),
+ * which makes "tool listed" and "tool callable" differ: this counts the gap.
+ */
+export function summarizeToolScopes(
+  tools: Iterable<{ requiredScopes?: readonly string[] }>,
+  granted: ReadonlySet<string>,
+  profile: ReadonlySet<string>,
+): ToolScopeSummary {
+  const out: ToolScopeSummary = { total: 0, callable: 0, requestableNotGranted: 0, byBundle: [], neverRequestable: 0 };
+  const perBundle = new Map<string, number>();
+  for (const tool of tools) {
+    if (!tool.requiredScopes || tool.requiredScopes.length === 0) continue;
+    const best = classifyMethodScopes(tool.requiredScopes, granted, profile);
+    if (!best) continue;
+    out.total++;
+    if (best.state === 'callable') out.callable++;
+    else if (best.state === 'requestable_not_granted') out.requestableNotGranted++;
+    else if (best.classification.reason === 'add_bundle' && best.classification.bundle) {
+      perBundle.set(best.classification.bundle, (perBundle.get(best.classification.bundle) ?? 0) + 1);
+    } else out.neverRequestable++;
+  }
+  out.byBundle = [...perBundle.entries()]
+    .map(([bundle, n]) => ({ bundle, tools: n }))
+    .sort((a, b) => b.tools - a.tools || a.bundle.localeCompare(b.bundle));
+  return out;
+}
+
+const BUNDLE_LINE_LIMIT = 4;
+
+/** One doctor / config-check line for a summary; null when there is nothing to report. */
+export function formatToolScopeLine(alias: string, sum: ToolScopeSummary): string | null {
+  if (sum.total === 0) return null;
+  const parts = [`${sum.callable} of ${sum.total} tools callable`];
+  if (sum.requestableNotGranted > 0) parts.push(`${sum.requestableNotGranted} need re-auth to grant a scope already in the profile`);
+  const missing = sum.byBundle.reduce((n, b) => n + b.tools, 0);
+  if (missing > 0) {
+    const shown = sum.byBundle.slice(0, BUNDLE_LINE_LIMIT).map((b) => `${b.bundle} ${b.tools}`).join(', ');
+    const more = sum.byBundle.length > BUNDLE_LINE_LIMIT ? `, +${sum.byBundle.length - BUNDLE_LINE_LIMIT} more bundles` : '';
+    parts.push(`${missing} need a bundle not in the profile (${shown}${more})`);
+  }
+  if (sum.neverRequestable > 0) parts.push(`${sum.neverRequestable} cannot be granted by any bundle`);
+  return `${alias}: ${parts.join('; ')}`;
 }
 
 export function clearScopeIndexForTest(): void {

@@ -29,7 +29,6 @@ describe('path.basename sanitization', () => {
     for (const f of malicious) {
       const safe = path.basename(f);
       const dest = path.join(savePath, safe);
-      // Resolved dest must start with savePath + separator
       expect(path.resolve(dest).startsWith(path.resolve(savePath) + path.sep)).toBe(true);
     }
   });
