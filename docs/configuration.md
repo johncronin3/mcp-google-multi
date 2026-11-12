@@ -72,7 +72,8 @@ Each account can point at a named **scope profile** so consent is exactly what t
 | `reseller` | high | Reseller subscriptions and orders |
 | `appsmarket` | high | Marketplace license assignments |
 | `vault` | high (Workspace-only) | eDiscovery over the whole domain |
-| `admin` | high (Workspace-only) | Directory management + audit reports |
+| `admin` | high (Workspace-only) | Directory management (users, groups, org units: read and write) + audit reports |
+| `admin_readonly` | high (Workspace-only) | Read users, groups, group members, org units and audit reports. Set in a scope profile's `bundles`; never global |
 
 Google refuses the `keep` and `cloudidentity` scopes on a personal account's consent screen, and the refusal fails the whole sign-in. So for a `gmail.com` or `googlemail.com` address, `allBundles` leaves both out, and naming either one is refused with `E_VALIDATION`.
 
@@ -87,6 +88,7 @@ The same refusal applies to a Workspace account outside the organisation that ow
 | `GOOGLE_DEFAULT_ACCOUNT` | | Alias used when a tool call omits `account` (or set `"defaultAccount"` in config.json; env wins; note: while `GOOGLE_ACCOUNTS` is set, the whole registry — including the default — comes from env, so the config field is inert). Unset = `account` stays required per call (`E_NO_DEFAULT_ACCOUNT` hint on omission). An alias that is not configured fails startup with `E_DEFAULT_ACCOUNT_UNKNOWN`. Explicit aliases, `*` and CSV are never affected. A session grant still hides aliases outside the grant |
 | `GOOGLE_DISCOVERY` | | Tool-surface visibility: `lazy` (default on stdio — meta-tools only until `{service}_discover`), `curated` (curated tools advertised eagerly), `eager` (everything). An invalid value warns and falls back to `lazy`. House `dist/http.js` upgrades unset/`lazy` to `curated` on the connect-time `tools/list` (stateless; Grok does not rebind after discover). Bakissation `MCP_TRANSPORT=http` forces `curated`. `eager` is unchanged |
 | `MASTER_KEY` | | encrypts the token store. Optional: resolved as env > OS keychain > `master.key` (0600, in the config dir) > generated on first use. Keep it in env for deployments that may downgrade or move hosts. Never regenerated while encrypted tokens exist (`E_MASTER_KEY_MISSING_TOKENS_EXIST`) |
+| `MCP_SCRUB_KEY_ENV` | off | `1` deletes `MASTER_KEY` and `MCP_JWT_KEY` from `process.env` once the server has read them, so a child process or an in-process reader of `process.env` no longer sees them. The key stays in the process's memory. It does not clear the kernel's copy of the start-up environment (`/proc/<pid>/environ` keeps what the process started with), so keep a deployment's real protection (core dumps off, locked-down `/proc`) in place. Applies to the server process only (not `auth`, `doctor` or the other CLI commands). `MCP_JWT_KEY` is read in HTTP mode only, so it stays in the environment in stdio mode. The first successful decrypt may still mirror an env `MASTER_KEY` into the OS keychain |
 | `GOOGLE_HOME_DOMAINS` | — | CSV of your own Workspace domains; accounts outside them are not offered the org-only `keep` and `cloudidentity` bundles. Unset, only `gmail.com` / `googlemail.com` addresses are refused those bundles. A session grant does not add them |
 | `GOOGLE_PROFILE` | — | write policy: `read-only` (default) · `safe-writes` · `full-writes`; an invalid value warns and falls back to `read-only` |
 | `GOOGLE_READ_ONLY` | — | `true` (or `1`/`yes`) = hard kill-switch for all writes |
@@ -213,7 +215,9 @@ The rule is derived from each method's declared scopes and name, not from a hand
 
 `GOOGLE_WRITE_ALLOW` still wins over this, because naming a tool explicitly is a deliberate opt-in. `GOOGLE_WRITE_DENY` still wins over that.
 
-**Neither protection extends to the escape hatch.** The same underlying method is still reachable through `google_api_call` or its generated twin (`admin_users_update`'s raw method, say, or `gmail_users_watch`), which has no concept of "privileged scope" or "push-channel registration" at all: it follows the plain four-branch model in [Escape hatch](#escape-hatch-writes-ask-for-confirmation), so under `safe-writes` it ASKS a human rather than refusing outright. A privileged or push-registration write is therefore one ask away through the escape hatch even while its named curated tool stays hard-refused; `GOOGLE_WRITE_DENY` is the only way to hard-block it on both paths (see above).
+**Neither protection extends to the escape hatch.** The same underlying method is still reachable through `google_api_call` or its generated twin (`gmail_users_watch`, say), which has no concept of "privileged scope" or "push-channel registration" at all: it follows the plain four-branch model in [Escape hatch](#escape-hatch-writes-ask-for-confirmation), so under `safe-writes` it ASKS a human rather than refusing outright. A privileged or push-registration write is therefore one ask away through the escape hatch even while its named curated tool stays hard-refused; `GOOGLE_WRITE_DENY` is the only way to hard-block it on both paths (see above).
+
+**`admin_users_update` is the one curated admin write, and it asks.** It changes users org-wide (suspend, password reset, org unit move), so instead of the privileged-scope refusal it uses the same confirmation as the escape hatch: under `safe-writes` it asks a human first; under `full-writes` it runs, unless `GOOGLE_OUTBOUND_ALLOWLIST` is set, which asks again; `GOOGLE_READ_ONLY=true` or a matching `GOOGLE_WRITE_DENY` entry (`tool:admin_users_update`, `admin:update`) refuses it; the default `read-only` profile refuses it unless a `GOOGLE_WRITE_ALLOW` entry names the tool, in which case it asks. An allow entry never skips the ask. The prompt never shows the password. Over hosted HTTP the ask needs `input_required` confirmation support, otherwise the call is refused; with `MCP_HTTP_CONFIRM_TOKEN=on` the model, not a human, confirms (see above), so leave that off where this tool is exposed.
 
 ### Trash is the one delete-shaped exception
 
@@ -249,7 +253,7 @@ The token is not human consent. It proves the call was shown to the model and th
 
 Core services register by default: `gmail`, `drive`, `calendar`, `sheets`, `docs`, `contacts`, `searchconsole`, `tasks`, `meet`, `workspaceevents`.
 
-Optional services register when their bundle is enabled (below): `slides`, `forms`, `chat`, `analytics` (or `analytics_write`), `classroom`, `cloudidentity`, `cloudsearch`, `vault`, `keep`, `driveactivity`, `drivelabels`, `script`, `postmaster`, `groupssettings`, `groupsmigration`, `licensing`, `reseller`, `appsmarket` — plus `admin`, which requires `GOOGLE_ADMIN_ACCOUNTS`.
+Optional services register when their bundle is enabled (below): `slides`, `forms`, `chat`, `analytics` (or `analytics_write`), `classroom`, `cloudidentity`, `cloudsearch`, `vault`, `keep`, `driveactivity`, `drivelabels`, `script`, `postmaster`, `groupssettings`, `groupsmigration`, `licensing`, `reseller`, `appsmarket` — plus `admin`, which requires `GOOGLE_ADMIN_ACCOUNTS` (or `admin: true` in a scope profile), and its read-only form `admin_readonly`, which goes in an account's scope profile `bundles`.
 
 `GOOGLE_TOOLSETS` is a filter only: listing an optional service does not enable it without its bundle/admin gate.
 
