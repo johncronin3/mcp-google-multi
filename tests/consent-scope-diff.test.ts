@@ -142,13 +142,22 @@ describe('consent scopes at fe6161d and at this tree', () => {
     }
   });
 
-  it('admin re-consent adds the same four admin scopes and nothing else', () => {
+  // v6.4.0 (upstream #369) widens the full `admin` bundle by exactly these two write scopes.
+  const ADMIN_V64_ADDED = [
+    'https://www.googleapis.com/auth/admin.directory.group',
+    'https://www.googleapis.com/auth/admin.directory.orgunit',
+  ];
+
+  it('admin re-consent adds the four admin scopes plus exactly the two v6.4.0 group/orgunit scopes and nothing else', () => {
     for (const mode of ['personal', 'workspace', 'external']) {
       for (const home of ['', 'corp.example']) {
         const before = row(old, mode, home, 'admin');
         const after = row(head, mode, home, 'admin');
-        expect(after.deskCli).toEqual(before.deskCli);
-        expect(head.admin).toEqual(old.admin);
+        expect(after.deskCli.filter((u: string) => !before.deskCli.includes(u))).toEqual(ADMIN_V64_ADDED);
+        expect(before.deskCli.filter((u: string) => !after.deskCli.includes(u))).toEqual([]);
+        expect(after.deskCli.length).toBe(before.deskCli.length + ADMIN_V64_ADDED.length);
+        expect(head.admin.filter((u: string) => !old.admin.includes(u))).toEqual(ADMIN_V64_ADDED);
+        expect(old.admin.filter((u: string) => !head.admin.includes(u))).toEqual([]);
         for (const scope of NOT_ON_DEFAULT) expect(after.deskCli).not.toContain(scope);
       }
     }
@@ -157,10 +166,18 @@ describe('consent scopes at fe6161d and at this tree', () => {
   it('every bundle that existed at fe6161d still has the same scope URLs', () => {
     for (const [name, info] of Object.entries(old.bundles)) {
       expect(head.bundles[name], name).toBeDefined();
+      if (name === 'admin') {
+        // v6.4.0 (#369): admin gains group + orgunit write scopes; nothing removed.
+        expect(head.bundles[name].scopes.filter((u: string) => !info.scopes.includes(u)), name).toEqual(ADMIN_V64_ADDED);
+        expect(info.scopes.filter((u: string) => !head.bundles[name].scopes.includes(u)), name).toEqual([]);
+        continue;
+      }
       expect(head.bundles[name].scopes, name).toEqual(info.scopes);
     }
     const added = Object.keys(head.bundles).filter((name) => !old.bundles[name]);
-    expect(added).toEqual(['directory']);
+    expect(added.sort()).toEqual(['admin_readonly', 'directory']);
+    // admin_readonly is read-only scopes only, and org-gated like admin.
+    expect(head.bundles.admin_readonly.scopes.every((u: string) => /\.readonly$/.test(u))).toBe(true);
     expect(head.bundles.directory.scopes).toEqual([DIRECTORY]);
     expect(head.bundles.directory.orgOnly).toBe(false);
     expect(head.bundles.keep.orgOnly).toBe(true);
